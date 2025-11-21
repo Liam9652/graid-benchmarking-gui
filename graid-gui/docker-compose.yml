@@ -1,4 +1,4 @@
-version: '3.8'
+version: "3.8"
 
 services:
   backend:
@@ -17,7 +17,6 @@ services:
       - PYTHONUNBUFFERED=1
     networks:
       - graid-network
-    restart: unless-stopped
     privileged: true
     pid: "host"
     restart: unless-stopped
