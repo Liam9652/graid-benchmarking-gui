@@ -1,0 +1,29 @@
+[global]
+#filename=/dev/gvd0n1
+time_based=1
+randrepeat=0
+ioengine=libaio
+direct=1
+random_generator=tausworthe64
+cpus_allowed_policy=split
+offset_increment=0g
+size=0g
+group_reporting=1
+norandommap=1
+
+
+[graid-test]
+rw=read
+bs=1m
+iodepth=8
+# runtime=180
+# numjobs=128
+# cpus_allowed=0-127
+
+
+
+# [vd0]
+# filename=/dev/gdg0n1
+
+#[vd1]
+#filename=/dev/gdg1n1

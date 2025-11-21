@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "50071:5000"
+    volumes:
+      - ./scripts:/app/scripts
+      - ./results:/app/results
+      - ./logs:/app/logs
+      - ./graid-bench.conf:/app/graid-bench.conf
+    environment:
+      - FLASK_ENV=production
+      - PYTHONUNBUFFERED=1
+    networks:
+      - graid-network
+    restart: unless-stopped
+    privileged: true
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "50072:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:50071
+    depends_on:
+      - backend
+    networks:
+      - graid-network
+    restart: unless-stopped
+
+networks:
+  graid-network:
+    driver: bridge

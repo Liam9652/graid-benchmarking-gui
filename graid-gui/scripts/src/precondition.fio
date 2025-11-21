@@ -1,0 +1,17 @@
+[global]
+#filename=/dev/gvd0n1
+bs=1M
+numjobs=20
+randrepeat=0
+ioengine=libaio
+direct=1
+random_generator=tausworthe64
+cpus_allowed_policy=split
+#offset_increment=5%
+#size=5%
+#offset=50g
+group_reporting=1
+
+[precondition]
+iodepth=16
+rw=write

@@ -1,0 +1,16 @@
+#!/bin/bash
+echo "======================================"
+echo "GRAID Benchmark Web GUI"
+echo "======================================"
+echo ""
+echo "启动应用..."
+docker-compose up -d
+echo ""
+echo "✅ 应用已启动!"
+echo ""
+echo "访问地址:"
+echo "  前端: http://localhost:3000"
+echo "  API:  http://localhost:5000"
+echo ""
+echo "查看日志: docker-compose logs -f"
+echo "停止应用: docker-compose down"
