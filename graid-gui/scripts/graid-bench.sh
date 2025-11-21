@@ -405,6 +405,8 @@ main() {
 
     python_paser
     tar czPf "graid_bench_result_$(hostname)_$NVME_INFO_$timestamp.tar" ./$NVME_INFO* ./graid_log_* ./output.log
+    echo "Moving results to ../results/"
+    mv "$tar_name" ../results/
 
 
 }

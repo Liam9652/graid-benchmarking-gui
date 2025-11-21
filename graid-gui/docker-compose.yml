@@ -19,6 +19,8 @@ services:
       - graid-network
     restart: unless-stopped
     privileged: true
+    pid: "host"
+    restart: unless-stopped
 
   frontend:
     build:

@@ -66,6 +66,8 @@ class BenchmarkManager:
         try:
             ConfigManager.save_config(config)
             benchmark_running = True
+            target_config = SCRIPT_DIR / "graid-bench.conf"
+            shutil.copy(CONFIG_FILE, target_config)
             socketio.emit('status', {
                 'status': 'started',
                 'message': 'Benchmark started',

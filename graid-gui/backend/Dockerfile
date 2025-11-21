@@ -12,6 +12,9 @@ RUN apt-get update && apt-get install -y \
     util-linux \
     && rm -rf /var/lib/apt/lists/*
 
+
+RUN echo '#!/bin/bash\nnsenter --target 1 --mount --uts --ipc --net --pid -- graidctl "$@"' > /usr/local/bin/graidctl && \
+    chmod +x /usr/local/bin/graidctl    
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
