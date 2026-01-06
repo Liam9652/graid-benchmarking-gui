@@ -125,15 +125,16 @@ fi
 # --- 4. Install Python Dependencies ---
 echo -e "${YELLOW}Installing Python dependencies...${NC}"
 PIP_CMD="pip3"
+PIP_OPTS=""
 # Handle PEP 668 (externally-managed-environment) in newer distros
 if [[ -f /usr/lib/python3.12/EXTERNALLY-MANAGED ]] || [[ -f /usr/lib/python3.11/EXTERNALLY-MANAGED ]]; then
-    PIP_CMD="pip3 install --break-system-packages"
+    PIP_OPTS="--break-system-packages"
 fi
 
-$PIP_CMD install pandas || echo -e "${RED}Warning: Failed to install pandas via pip.${NC}"
+$PIP_CMD install $PIP_OPTS pandas || echo -e "${RED}Warning: Failed to install pandas via pip.${NC}"
 
 if [[ -f "src/requirements.txt" ]]; then
-    $PIP_CMD install -r src/requirements.txt || echo -e "${RED}Warning: Failed to install dependencies from src/requirements.txt${NC}"
+    $PIP_CMD install $PIP_OPTS -r src/requirements.txt || echo -e "${RED}Warning: Failed to install dependencies from src/requirements.txt${NC}"
 fi
 
 # --- 5. Verify Installation ---
@@ -146,6 +147,27 @@ for cmd in fio nvme jq docker python3 pip3 bc; do
     fi
 done
 
-echo -e "\n${GREEN}Environment setup complete!${NC}"
-echo -e "${YELLOW}Note: If you are a non-root user, you may need to run 'sudo usermod -aG docker \$USER' and re-login to use Docker without sudo.${NC}"
+# --- 6. Deploy with Docker Compose ---
+echo -e "\n${YELLOW}Deploying SupremeRAID Benchmarking GUI...${NC}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PARENT_DIR="$(dirname "$SCRIPT_DIR")"
+
+if [[ -f "$PARENT_DIR/docker-compose.yml" ]]; then
+    cd "$PARENT_DIR"
+    echo -e "${YELLOW}Running 'docker compose up --build -d' in $PARENT_DIR...${NC}"
+    docker compose up --build -d
+else
+    echo -e "${RED}Error: docker-compose.yml not found in $PARENT_DIR${NC}"
+fi
+
+# --- 7. Final Instructions ---
+IP_ADDR=$(hostname -I | awk '{print $1}')
+if [[ -z "$IP_ADDR" ]]; then
+    IP_ADDR="localhost"
+fi
+
+echo -e "\n${GREEN}Environment setup and deployment complete!${NC}"
+echo -e "${GREEN}You can access the SupremeRAID Benchmarking GUI at:${NC}"
+echo -e "${YELLOW}http://${IP_ADDR}:50072${NC}"
+echo -e "\n${YELLOW}Note: If you are a non-root user, you may need to run 'sudo usermod -aG docker \$USER' and re-login to use Docker without sudo.${NC}"
 echo -e "${YELLOW}Note: Please ensure 'graidctl' and SupremeRAID driver/license are installed separately.${NC}"

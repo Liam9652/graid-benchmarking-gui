@@ -12,6 +12,7 @@ services:
       - ./results:/app/results
       - ./logs:/app/logs
       - ./graid-bench.conf:/app/graid-bench.conf
+      - /dev:/dev
     environment:
       - FLASK_ENV=production
       - PYTHONUNBUFFERED=1

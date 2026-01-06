@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SupremeRAID Benchmark GUI</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --text-color: #e2e8f0;
+            --accent-color: #3b82f6;
+            --success-color: #10b981;
+            --danger-color: #ef4444;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: 'Inter', sans-serif;
+        }
+
+        .navbar {
+            background-color: var(--card-bg);
+            border-bottom: 1px solid #334155;
+        }
+
+        .navbar-brand {
+            color: var(--text-color) !important;
+            font-weight: 700;
+        }
+
+        .nav-link {
+            color: #94a3b8 !important;
+        }
+
+        .nav-link.active {
+            color: var(--accent-color) !important;
+            font-weight: 600;
+        }
+
+        .card {
+            background-color: var(--card-bg);
+            border: 1px solid #334155;
+            margin-bottom: 20px;
+        }
+
+        .card-header {
+            border-bottom: 1px solid #334155;
+            font-weight: 600;
+        }
+
+        .form-control,
+        .form-select {
+            background-color: #0f172a;
+            border: 1px solid #334155;
+            color: var(--text-color);
+        }
+
+        .form-control:focus,
+        .form-select:focus {
+            background-color: #0f172a;
+            border-color: var(--accent-color);
+            color: var(--text-color);
+            box-shadow: none;
+        }
+
+        .btn-primary {
+            background-color: var(--accent-color);
+            border: none;
+        }
+
+        .terminal {
+            background-color: #000;
+            color: #0f0;
+            font-family: monospace;
+            padding: 10px;
+            border-radius: 5px;
+            height: 400px;
+            overflow-y: auto;
+            white-space: pre;
+        }
+
+        .status-badge {
+            padding: 5px 10px;
+            border-radius: 15px;
+            font-size: 0.85em;
+            font-weight: 600;
+        }
+
+        .status-running {
+            background-color: var(--success-color);
+            color: white;
+        }
+
+        .status-stopped {
+            background-color: #64748b;
+            color: white;
+        }
+    </style>
+</head>
+
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark mb-4">
+        <div class="container">
+            <a class="navbar-brand" href="#">SupremeRAID Benchmarker</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item">
+                        <a class="nav-link active" href="#" onclick="showTab('config')">Configuration</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="#" onclick="showTab('benchmark')">Benchmark</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="#" onclick="showTab('results')">Results</a>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container">
+        <!-- Configuration Tab -->
+        <div id="config-tab" class="tab-content">
+            <div class="row">
+                <div class="col-md-8">
+                    <div class="card">
+                        <div class="card-header d-flex justify-content-between align-items-center">
+                            <span>Test Configuration</span>
+                            <button class="btn btn-primary btn-sm" onclick="saveConfig()">Save Config</button>
+                        </div>
+                        <div class="card-body">
+                            <form id="config-form">
+                                <div class="mb-3">
+                                    <label class="form-label">NVMe Info (Model)</label>
+                                    <input type="text" class="form-control" name="NVME_INFO">
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">RAID Controller</label>
+                                    <input type="text" class="form-control" name="RAID_CTRLR">
+                                </div>
+                                <div class="row">
+                                    <div class="col-md-6 mb-3">
+                                        <label class="form-label">PD Runtime (sec)</label>
+                                        <input type="number" class="form-control" name="PD_RUNTIME">
+                                    </div>
+                                    <div class="col-md-6 mb-3">
+                                        <label class="form-label">VD Runtime (sec)</label>
+                                        <input type="number" class="form-control" name="VD_RUNTIME">
+                                    </div>
+                                </div>
+                                <div class="mb-3">
+                                    <div class="form-check form-switch">
+                                        <input class="form-check-input" type="checkbox" name="RUN_PD">
+                                        <label class="form-check-label">Run PD Test</label>
+                                    </div>
+                                    <div class="form-check form-switch">
+                                        <input class="form-check-input" type="checkbox" name="RUN_VD">
+                                        <label class="form-check-label">Run VD Test</label>
+                                    </div>
+                                    <div class="form-check form-switch">
+                                        <input class="form-check-input" type="checkbox" name="QUICK_TEST">
+                                        <label class="form-check-label">Quick Test</label>
+                                    </div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">RAID Types</label>
+                                    <div id="raid-types-container">
+                                        <!-- Checkboxes will be generated here -->
+                                    </div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">NVMe List</label>
+                                    <textarea class="form-control" name="NVME_LIST" rows="3"
+                                        placeholder='["nvme0n1", "nvme1n1"]'></textarea>
+                                    <small class="text-muted">JSON array format</small>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="card">
+                        <div class="card-header">System Info</div>
+                        <div class="card-body" id="system-info">
+                            Loading...
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Benchmark Tab -->
+        <div id="benchmark-tab" class="tab-content" style="display: none;">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span>Benchmark Control</span>
+                    <span id="benchmark-status" class="status-badge status-stopped">Stopped</span>
+                </div>
+                <div class="card-body">
+                    <div class="d-flex gap-2 mb-4">
+                        <button id="start-btn" class="btn btn-success" onclick="startBenchmark()">Start
+                            Benchmark</button>
+                        <button id="stop-btn" class="btn btn-danger" onclick="stopBenchmark()" disabled>Stop
+                            Benchmark</button>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-12">
+                            <h5>Real-time Giostat Monitor</h5>
+                            <div id="giostat-terminal" class="terminal"></div>
+                        </div>
+                    </div>
+
+                    <div class="mt-4">
+                        <h5>Log Output</h5>
+                        <div id="log-terminal" class="terminal"
+                            style="height: 200px; color: #ccc; background-color: #111;"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Results Tab -->
+        <div id="results-tab" class="tab-content" style="display: none;">
+            <div class="card">
+                <div class="card-header">Results Dashboard</div>
+                <div class="card-body">
+                    <div class="row">
+                        <div class="col-md-3">
+                            <div class="list-group" id="results-list">
+                                <!-- Results will be loaded here -->
+                            </div>
+                        </div>
+                        <div class="col-md-9">
+                            <div id="result-details" class="p-3 border rounded bg-dark mb-3">
+                                <p class="text-muted">Select a result to view details</p>
+                            </div>
+                            <div id="chart-container" style="display: none;">
+                                <canvas id="performanceChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+    <script>
+        const socket = io();
+        let currentConfig = {};
+        let sessionId = 'session_' + Math.random().toString(36).substr(2, 9);
+        let performanceChart = null;
+
+        // Socket.IO Events
+        socket.on('connect', () => {
+            console.log('Connected to server');
+            socket.emit('join_session', { session_id: sessionId });
+        });
+
+        socket.on('status', (data) => {
+            updateStatus(data.status);
+            appendLog(`[${data.timestamp}] Status: ${data.message}`);
+        });
+
+        socket.on('progress', (data) => {
+            // appendLog(`[${data.timestamp}] ${data.message}`);
+        });
+
+        socket.on('error', (data) => {
+            appendLog(`[${data.timestamp}] ERROR: ${data.message}`);
+            alert('Error: ' + data.message);
+        });
+
+        socket.on('giostat_data', (data) => {
+            const term = document.getElementById('giostat-terminal');
+            term.textContent += data.line;
+            if (term.textContent.length > 10000) {
+                term.textContent = term.textContent.slice(-10000);
+            }
+            term.scrollTop = term.scrollHeight;
+        });
+
+        // Initialization
+        document.addEventListener('DOMContentLoaded', () => {
+            loadConfig();
+            loadSystemInfo();
+            loadResults();
+            checkStatus();
+        });
+
+        // Navigation
+        function showTab(tabName) {
+            document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
+            document.getElementById(`${tabName}-tab`).style.display = 'block';
+            document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active'));
+            event.target.classList.add('active');
+
+            if (tabName === 'results') {
+                loadResults();
+            }
+        }
+
+        // Config Functions
+        async function loadConfig() {
+            try {
+                const res = await fetch('/api/config');
+                const data = await res.json();
+                if (data.success) {
+                    currentConfig = data.data;
+                    populateForm(data.data);
+                }
+            } catch (e) {
+                console.error('Failed to load config', e);
+            }
+        }
+
+        function populateForm(config) {
+            const form = document.getElementById('config-form');
+            form.elements['NVME_INFO'].value = config.NVME_INFO || '';
+            form.elements['RAID_CTRLR'].value = config.RAID_CTRLR || '';
+            form.elements['PD_RUNTIME'].value = config.PD_RUNTIME || 10;
+            form.elements['VD_RUNTIME'].value = config.VD_RUNTIME || 10;
+            form.elements['RUN_PD'].checked = config.RUN_PD;
+            form.elements['RUN_VD'].checked = config.RUN_VD;
+            form.elements['QUICK_TEST'].checked = config.QUICK_TEST;
+            form.elements['NVME_LIST'].value = JSON.stringify(config.NVME_LIST || [], null, 2);
+
+            // RAID Types
+            const container = document.getElementById('raid-types-container');
+            container.innerHTML = '';
+            const allTypes = ['RAID0', 'RAID1', 'RAID5', 'RAID6', 'RAID10'];
+            allTypes.forEach(type => {
+                const div = document.createElement('div');
+                div.className = 'form-check form-check-inline';
+                div.innerHTML = `
+                    <input class="form-check-input" type="checkbox" value="${type}" 
+                        ${(config.RAID_TYPE || []).includes(type) ? 'checked' : ''}>
+                    <label class="form-check-label">${type}</label>
+                `;
+                container.appendChild(div);
+            });
+        }
+
+        async function saveConfig() {
+            const form = document.getElementById('config-form');
+            const newConfig = { ...currentConfig };
+
+            newConfig.NVME_INFO = form.elements['NVME_INFO'].value;
+            newConfig.RAID_CTRLR = form.elements['RAID_CTRLR'].value;
+            newConfig.PD_RUNTIME = parseInt(form.elements['PD_RUNTIME'].value);
+            newConfig.VD_RUNTIME = parseInt(form.elements['VD_RUNTIME'].value);
+            newConfig.RUN_PD = form.elements['RUN_PD'].checked;
+            newConfig.RUN_VD = form.elements['RUN_VD'].checked;
+            newConfig.QUICK_TEST = form.elements['QUICK_TEST'].checked;
+
+            try {
+                newConfig.NVME_LIST = JSON.parse(form.elements['NVME_LIST'].value);
+            } catch (e) {
+                alert('Invalid JSON for NVMe List');
+                return;
+            }
+
+            // RAID Types
+            const selectedTypes = [];
+            document.querySelectorAll('#raid-types-container input:checked').forEach(cb => {
+                selectedTypes.push(cb.value);
+            });
+            newConfig.RAID_TYPE = selectedTypes;
+
+            try {
+                const res = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(newConfig)
+                });
+                const data = await res.json();
+                if (data.success) {
+                    alert('Configuration saved!');
+                } else {
+                    alert('Failed to save: ' + data.error);
+                }
+            } catch (e) {
+                alert('Error saving config');
+            }
+        }
+
+        async function loadSystemInfo() {
+            try {
+                const res = await fetch('/api/system-info');
+                const data = await res.json();
+                if (data.success) {
+                    const info = data.data;
+                    document.getElementById('system-info').innerHTML = `
+                        <ul class="list-unstyled">
+                            <li><strong>CPU Cores:</strong> ${info.cpu_cores}</li>
+                            <li><strong>Memory:</strong> ${info.memory_gb.toFixed(1)} GB</li>
+                            <li><strong>NVMe Devices:</strong> ${info.nvme_devices.join(', ')}</li>
+                        </ul>
+                    `;
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        // Benchmark Functions
+        async function startBenchmark() {
+            try {
+                const res = await fetch('/api/benchmark/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sessionId })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    updateStatus('started');
+                    document.getElementById('giostat-terminal').textContent = ''; // Clear terminal
+                } else {
+                    alert('Failed to start: ' + data.error);
+                }
+            } catch (e) {
+                alert('Error starting benchmark');
+            }
+        }
+
+        async function stopBenchmark() {
+            try {
+                await fetch('/api/benchmark/stop', { method: 'POST' });
+                updateStatus('stopped');
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        async function checkStatus() {
+            const res = await fetch('/api/benchmark/status');
+            const data = await res.json();
+            if (data.success && data.data.running) {
+                updateStatus('started');
+            } else {
+                updateStatus('stopped');
+            }
+        }
+
+        function updateStatus(status) {
+            const badge = document.getElementById('benchmark-status');
+            const startBtn = document.getElementById('start-btn');
+            const stopBtn = document.getElementById('stop-btn');
+
+            if (status === 'started' || status === 'running') {
+                badge.className = 'status-badge status-running';
+                badge.textContent = 'Running';
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+            } else {
+                badge.className = 'status-badge status-stopped';
+                badge.textContent = 'Stopped';
+                startBtn.disabled = false;
+                stopBtn.disabled = true;
+            }
+        }
+
+        function appendLog(msg) {
+            const term = document.getElementById('log-terminal');
+            term.textContent += msg + '\n';
+            term.scrollTop = term.scrollHeight;
+        }
+
+        // Results Functions
+        async function loadResults() {
+            try {
+                const res = await fetch('/api/results');
+                const data = await res.json();
+                if (data.success) {
+                    const list = document.getElementById('results-list');
+                    list.innerHTML = '';
+                    data.data.forEach(item => {
+                        const a = document.createElement('a');
+                        a.className = 'list-group-item list-group-item-action bg-dark text-white border-secondary';
+                        a.innerHTML = `
+                            <div class="d-flex w-100 justify-content-between">
+                                <h6 class="mb-1">${item.name}</h6>
+                                <small>${new Date(item.created).toLocaleString()}</small>
+                            </div>
+                        `;
+                        a.onclick = () => showResultDetails(item);
+                        list.appendChild(a);
+                    });
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        function showResultDetails(item) {
+            const details = document.getElementById('result-details');
+            const chartContainer = document.getElementById('chart-container');
+            chartContainer.style.display = 'none';
+
+            let html = `<h5>${item.name}</h5>`;
+
+            if (item.type === 'archive') {
+                html += `<p>Archive file. Download to view contents.</p>`;
+                html += `<a href="/api/results/${item.name}" class="btn btn-sm btn-primary" download>Download Tarball</a>`;
+            } else {
+                html += `<p>Files:</p><ul>`;
+                item.files.forEach(f => {
+                    html += `<li><a href="/api/results/${f.path}" target="_blank" class="text-info">${f.name}</a> (${(f.size / 1024).toFixed(1)} KB)`;
+                    if (f.name.endsWith('.csv')) {
+                        html += ` <button class="btn btn-xs btn-outline-info ms-2" onclick="loadChart('${f.path}')">View Chart</button>`;
+                    }
+                    html += `</li>`;
+                });
+                html += `</ul>`;
+            }
+            details.innerHTML = html;
+        }
+
+        async function loadChart(filePath) {
+            try {
+                const res = await fetch(`/api/results/${filePath}`);
+                const csvText = await res.text();
+
+                Papa.parse(csvText, {
+                    header: true,
+                    dynamicTyping: true,
+                    complete: function (results) {
+                        renderChart(results.data);
+                    }
+                });
+            } catch (e) {
+                console.error('Error loading CSV', e);
+                alert('Error loading CSV data');
+            }
+        }
+
+        function renderChart(data) {
+            const ctx = document.getElementById('performanceChart').getContext('2d');
+            document.getElementById('chart-container').style.display = 'block';
+
+            if (performanceChart) {
+                performanceChart.destroy();
+            }
+
+            // Group data by Ben_type (PD vs VD)
+            const pdData = data.filter(r => r.Ben_type === 'PD');
+            const vdData = data.filter(r => r.Ben_type === 'VD');
+
+            // Extract labels (e.g. Type or BlockSize)
+            // Assuming comparison by Type (randread, seqread etc)
+            const labels = [...new Set(data.map(r => r.Type).filter(Boolean))];
+
+            const datasets = [
+                {
+                    label: 'PD (Baseline) IOPS',
+                    data: labels.map(l => {
+                        const r = pdData.find(d => d.Type === l);
+                        return r ? r['IOPS(K)'] : 0;
+                    }),
+                    backgroundColor: 'rgba(255, 99, 132, 0.5)',
+                    borderColor: 'rgba(255, 99, 132, 1)',
+                    borderWidth: 1
+                },
+                {
+                    label: 'VD (GRAID) IOPS',
+                    data: labels.map(l => {
+                        const r = vdData.find(d => d.Type === l);
+                        return r ? r['IOPS(K)'] : 0;
+                    }),
+                    backgroundColor: 'rgba(54, 162, 235, 0.5)',
+                    borderColor: 'rgba(54, 162, 235, 1)',
+                    borderWidth: 1
+                }
+            ];
+
+            performanceChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: datasets
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: { display: true, text: 'IOPS (K)' }
+                        }
+                    },
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: 'Performance Comparison: PD vs VD'
+                        }
+                    }
+                }
+            });
+        }
+    </script>
+</body>
+
+</html>

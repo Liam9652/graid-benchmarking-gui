@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+build/
+dist/
+
+# Logs and Results
+logs/
+results/
+graid-gui/logs/
+graid-gui/results/
+graid-gui/backend/logs/
+graid-gui/backend/results/
+backend/scripts/
+graid-gui/backend/scripts
+graid-gui/scripts/QEMU-result/
+*.log
+*.tar.gz
+*.md5
+
+# Misc
+.DS_Store
+.env
+.flaskenv
+.vscode/
+.idea/
