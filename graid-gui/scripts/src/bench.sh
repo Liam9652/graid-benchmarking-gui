@@ -212,11 +212,11 @@ function collect_log() {
             #echo "smart-log $DEV_NAME"
             if [[ $DEV_NAME == "VD" ]]; then
                 for d in /dev/gpd*; do
-                    echo "$d - $(sudo nvme smart-log $d | grep -i '^temperature')" >> ${output_fio_dir}/ssd_tmp/$output_name.log
+                    echo "$d - $(nvme smart-log $d | grep -i '^temperature')" >> ${output_fio_dir}/ssd_tmp/$output_name.log
                 done
             else
                 for d in /dev/nvme*n1; do
-                    echo "$d - $(sudo nvme smart-log $d | grep -i '^temperature')" >> ${output_fio_dir}/ssd_tmp/$output_name.log
+                    echo "$d - $(nvme smart-log $d | grep -i '^temperature')" >> ${output_fio_dir}/ssd_tmp/$output_name.log
                 done
             fi
         elif [[ $device == sd* ]]; then
@@ -495,9 +495,9 @@ function create_vd(){
     elif [[ $DEV_NAME == "MD" ]]; then
 
         if [[ $RAID != 1  ]]; then
-            yes | sudo mdadm  --create /dev/$MD_NAME --auto=yes --chunk=${MD_BS}K --verbose  --level=$RAID --assume-clean -n $PD_NUMBER $MD_NVME_LIST
+            yes | mdadm  --create /dev/$MD_NAME --auto=yes --chunk=${MD_BS}K --verbose  --level=$RAID --assume-clean -n $PD_NUMBER $MD_NVME_LIST
         else
-            yes | sudo mdadm  --create /dev/$MD_NAME --auto=yes --verbose  --level=$RAID --assume-clean -n $PD_NUMBER $MD_NVME_LIST
+            yes | mdadm  --create /dev/$MD_NAME --auto=yes --verbose  --level=$RAID --assume-clean -n $PD_NUMBER $MD_NVME_LIST
         fi
         wait_for_device "/dev/$MD_NAME"
 	    sleep 15
@@ -548,7 +548,7 @@ function get_disk_size() {
             size=$((nvme_sector / 512))
             runsize=$((size / (20 * 1000 * 1000)))
         elif [[ "$device" == sd* ]]; then
-            runsize=$(($(sudo sg_readcap "/dev/$device" | grep Device | awk '{print $3}') / (20 * 1024 * 1024 * 1024)))
+            runsize=$(($(sg_readcap "/dev/$device" | grep Device | awk '{print $3}') / (20 * 1024 * 1024 * 1024)))
         fi
     fi
     
@@ -730,8 +730,8 @@ function discard_device() {
         exit 1
     fi
     if [[ $device == *nvme* ]]; then
-        sudo nvme format -f "$device"
-        sudo nvme sanitize -a 2 "$device"
+        nvme format -f "$device"
+        nvme sanitize -a 2 "$device"
         check_sanitize_done "$device"
     fi
     

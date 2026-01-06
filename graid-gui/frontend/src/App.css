@@ -13,7 +13,9 @@
   box-sizing: border-box;
 }
 
-html, body, #root {
+html,
+body,
+#root {
   height: 100%;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
   background-color: var(--bg-color);
@@ -56,8 +58,15 @@ html, body, #root {
 }
 
 @keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.5;
+  }
 }
 
 .error-banner {
@@ -86,8 +95,13 @@ html, body, #root {
 }
 
 @keyframes slideDown {
-  from { transform: translateY(-100%); }
-  to { transform: translateY(0); }
+  from {
+    transform: translateY(-100%);
+  }
+
+  to {
+    transform: translateY(0);
+  }
 }
 
 .app-container {
@@ -136,63 +150,19 @@ html, body, #root {
 }
 
 @keyframes fadeIn {
-  from { opacity: 0; }
-  to { opacity: 1; }
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
 }
 
-.config-panel, .benchmark-panel, .results-panel {
+.config-panel,
+.benchmark-panel,
+.results-panel {
   min-height: 300px;
-}
-
-.config-info {
-  background-color: var(--bg-color);
-  padding: 1rem;
-  border-radius: 4px;
-  margin: 1rem 0;
-}
-
-.config-info pre {
-  background-color: white;
-  padding: 1rem;
-  border-radius: 4px;
-  overflow-x: auto;
-  font-size: 0.9rem;
-  border: 1px solid var(--light-color);
-}
-
-.config-actions, .control-buttons {
-  display: flex;
-  gap: 1rem;
-  margin-top: 1rem;
-  flex-wrap: wrap;
-}
-
-.test-status {
-  background-color: var(--bg-color);
-  padding: 1rem;
-  border-radius: 4px;
-  margin: 1rem 0;
-}
-
-.status-item {
-  display: flex;
-  justify-content: space-between;
-  padding: 0.5rem 0;
-  border-bottom: 1px solid var(--light-color);
-}
-
-.status-item label {
-  font-weight: 600;
-  min-width: 100px;
-}
-
-.status-item .running {
-  color: var(--success-color);
-  font-weight: 600;
-}
-
-.status-item .idle {
-  color: var(--text-color);
 }
 
 .btn {
@@ -239,565 +209,164 @@ html, body, #root {
   border: 1px solid var(--text-color);
 }
 
-.empty-message {
-  text-align: center;
-  padding: 3rem;
-  color: var(--text-color);
-  opacity: 0.7;
-  font-style: italic;
+.config-panel {
+  min-height: 300px;
 }
 
-.results-list {
-  display: grid;
-  gap: 1rem;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+.config-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 2rem;
+  border-bottom: 2px solid var(--primary-color);
+  padding-bottom: 0.5rem;
 }
 
-.result-item {
-  background-color: var(--bg-color);
+.config-actions-top {
+  display: flex;
+  gap: 0.5rem;
+}
+
+/* ND Scanner Table */
+.nd-scanner {
+  overflow-x: auto;
+  margin-bottom: 1rem;
+  border: 1px solid #dee2e6;
+  border-radius: 4px;
+}
+
+.nd-scanner table {
+  width: 100%;
+  border-collapse: collapse;
+  background: white;
+}
+
+.nd-scanner th,
+.nd-scanner td {
+  padding: 12px;
+  text-align: left;
+  border-bottom: 1px solid #eee;
+}
+
+.nd-scanner th {
+  background-color: #f8f9fa;
+  font-weight: 600;
+  color: #495057;
+}
+
+.nd-scanner tr {
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.nd-scanner tr:hover {
+  background-color: #f1f8ff;
+}
+
+.nd-scanner tr.selected {
+  background-color: #e7f3ff;
+}
+
+/* Controller Info Box */
+.controller-info-box {
+  background: #e9ecef;
   padding: 1rem;
   border-radius: 4px;
-  border: 1px solid var(--light-color);
+  border-left: 4px solid var(--primary-color);
+  font-family: monospace;
 }
 
-.result-item h3 {
-  margin-bottom: 0.5rem;
+/* Button Group Multi-Select */
+.button-group-select {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.selection-btn {
+  padding: 10px 20px;
+  border: 1px solid #ced4da;
+  background: white;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 500;
+  transition: all 0.2s;
+}
+
+.selection-btn:hover {
+  border-color: var(--primary-color);
+  color: var(--primary-color);
+  background: #f0f7ff;
+}
+
+.selection-btn.active {
+  background-color: var(--primary-color);
+  color: white;
+  border-color: var(--primary-color);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+/* Advanced Options Toggle */
+.section-header-toggle {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  cursor: pointer;
+  user-select: none;
+}
+
+.section-header-toggle:hover h3 {
   color: var(--primary-color);
 }
 
-.result-item p {
-  font-size: 0.9rem;
-  margin-bottom: 0.25rem;
-  opacity: 0.7;
+.advanced-content {
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px dashed #ccc;
+  animation: slideDown 0.3s ease-out;
 }
 
-.app-footer {
+/* Form Layouts */
+.grid-2-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+}
+
+.switches-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 15px;
+  margin-top: 15px;
+}
+
+.switch-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.switch-label input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+}
+
+.section-desc {
+  font-size: 0.9rem;
+  color: #666;
+  margin-bottom: 1rem;
+}
+
+.empty-info {
   text-align: center;
-  padding: 1rem;
-  border-top: 1px solid var(--light-color);
-  background-color: white;
-  margin-top: auto;
-  font-size: 0.9rem;
-  color: var(--text-color);
-  opacity: 0.7;
-}
-
-@media (max-width: 768px) {
-  .app-header {
-    flex-direction: column;
-    gap: 1rem;
-  }
-
-  .app-container {
-    padding: 1rem;
-  }
-
-  .tabs {
-    overflow-x: auto;
-  }
-
-  .tab-button {
-    padding: 0.75rem 1rem;
-    font-size: 0.9rem;
-    white-space: nowrap;
-  }
-
-  .config-actions, .control-buttons {
-    flex-direction: column;
-  }
-
-  .btn {
-    width: 100%;
-    justify-content: center;
-  }
-}
-
-/* 添加到现有的 App.css 中 */
-
-/* 配置表单样式 */
-.config-form {
-  max-width: 1200px;
-  margin: 0 auto;
-}
-
-.config-section {
-  background: #f8f9fa;
-  border-radius: 8px;
   padding: 20px;
-  margin-bottom: 20px;
-}
-
-.config-section h3 {
-  margin-top: 0;
-  margin-bottom: 15px;
-  color: #333;
-  border-bottom: 2px solid #007bff;
-  padding-bottom: 10px;
-}
-
-.form-group {
-  margin-bottom: 15px;
-}
-
-.form-group label {
-  display: block;
-  font-weight: 600;
-  margin-bottom: 5px;
-  color: #555;
-}
-
-.form-group input[type="text"],
-.form-group input[type="number"] {
-  width: 100%;
-  padding: 10px;
-  border: 1px solid #ddd;
-  border-radius: 4px;
-  font-size: 14px;
-  box-sizing: border-box;
-  transition: border-color 0.3s;
-}
-
-.form-group input[type="text"]:focus,
-.form-group input[type="number"]:focus {
-  outline: none;
-  border-color: #007bff;
-  box-shadow: 0 0 0 3px rgba(0, 123, 255, 0.1);
-}
-
-.checkbox-group {
-  display: flex;
-  align-items: center;
-}
-
-.checkbox-group label {
-  display: flex;
-  align-items: center;
-  cursor: pointer;
-  font-weight: normal;
-  margin-bottom: 0;
-}
-
-.checkbox-group input[type="checkbox"] {
-  width: 18px;
-  height: 18px;
-  margin-right: 8px;
-  cursor: pointer;
-}
-
-.config-actions {
-  display: flex;
-  gap: 10px;
-  margin-top: 20px;
-  padding: 20px 0;
-  border-top: 2px solid #eee;
-}
-
-.config-raw {
-  margin-top: 20px;
-  padding: 15px;
-  background: #f8f9fa;
-  border-radius: 4px;
-}
-
-.config-raw summary {
-  cursor: pointer;
-  font-weight: 600;
-  color: #007bff;
-  padding: 10px;
-}
-
-.config-raw summary:hover {
-  background: #e9ecef;
-  border-radius: 4px;
-}
-
-.config-raw pre {
-  margin-top: 15px;
-  background: #fff;
-  border: 1px solid #ddd;
-  border-radius: 4px;
-  padding: 15px;
-  overflow-x: auto;
-  font-size: 12px;
-}
-
-/* 按钮样式增强 */
-.btn {
-  padding: 12px 24px;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-  font-size: 16px;
-  font-weight: 600;
-  transition: all 0.3s;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.btn-primary {
-  background-color: #007bff;
-  color: white;
-}
-
-.btn-primary:hover:not(:disabled) {
-  background-color: #0056b3;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 8px rgba(0, 123, 255, 0.3);
-}
-
-.btn-secondary {
-  background-color: #6c757d;
-  color: white;
-}
-
-.btn-secondary:hover:not(:disabled) {
-  background-color: #545b62;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 8px rgba(108, 117, 125, 0.3);
-}
-
-.btn-success {
-  background-color: #28a745;
-  color: white;
-}
-
-.btn-success:hover:not(:disabled) {
-  background-color: #218838;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 8px rgba(40, 167, 69, 0.3);
-}
-
-.btn-danger {
-  background-color: #dc3545;
-  color: white;
-}
-
-.btn-danger:hover:not(:disabled) {
-  background-color: #c82333;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 8px rgba(220, 53, 69, 0.3);
-}
-
-/* 状态横幅样式 */
-.status-banner {
-  background-color: #d4edda;
-  color: #155724;
-  padding: 15px;
-  margin: 20px;
-  border-radius: 4px;
-  border: 1px solid #c3e6cb;
-  animation: slideDown 0.3s ease-out;
-}
-
-.error-banner {
-  background-color: #f8d7da;
-  color: #721c24;
-  padding: 15px;
-  margin: 20px;
-  border-radius: 4px;
-  border: 1px solid #f5c6cb;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  animation: slideDown 0.3s ease-out;
-}
-
-.error-banner button {
-  background: transparent;
-  border: 1px solid #721c24;
-  color: #721c24;
-  padding: 5px 15px;
-  border-radius: 4px;
-  cursor: pointer;
-}
-
-.error-banner button:hover {
-  background: #721c24;
-  color: white;
-}
-
-@keyframes slideDown {
-  from {
-    opacity: 0;
-    transform: translateY(-20px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-/* 响应式设计 */
-@media (max-width: 768px) {
-  .config-section {
-    padding: 15px;
-  }
-
-  .config-actions {
-    flex-direction: column;
-  }
-
-  .config-actions button {
-    width: 100%;
-  }
-
-  .form-group input[type="text"],
-  .form-group input[type="number"] {
-    font-size: 16px; /* 防止 iOS 自动缩放 */
-  }
-}
-
-/* 添加到现有的 App.css 中 */
-
-/* 配置表单样式 */
-.config-form {
-  max-width: 1200px;
-  margin: 0 auto;
-}
-
-.config-section {
-  background: #f8f9fa;
-  border-radius: 8px;
-  padding: 20px;
-  margin-bottom: 20px;
-}
-
-.config-section h3 {
-  margin-top: 0;
-  margin-bottom: 15px;
-  color: #333;
-  border-bottom: 2px solid #007bff;
-  padding-bottom: 10px;
-}
-
-.form-group {
-  margin-bottom: 15px;
-}
-
-.form-group label {
-  display: block;
-  font-weight: 600;
-  margin-bottom: 5px;
-  color: #555;
-}
-
-.form-group input[type="text"],
-.form-group input[type="number"] {
-  width: 100%;
-  padding: 10px;
-  border: 1px solid #ddd;
-  border-radius: 4px;
-  font-size: 14px;
-  box-sizing: border-box;
-  transition: border-color 0.3s;
-}
-
-.form-group input[type="text"]:focus,
-.form-group input[type="number"]:focus {
-  outline: none;
-  border-color: #007bff;
-  box-shadow: 0 0 0 3px rgba(0, 123, 255, 0.1);
-}
-
-.checkbox-group {
-  display: flex;
-  align-items: center;
-}
-
-.checkbox-group label {
-  display: flex;
-  align-items: center;
-  cursor: pointer;
-  font-weight: normal;
-  margin-bottom: 0;
-}
-
-.checkbox-group input[type="checkbox"] {
-  width: 18px;
-  height: 18px;
-  margin-right: 8px;
-  cursor: pointer;
-}
-
-.config-actions {
-  display: flex;
-  gap: 10px;
-  margin-top: 20px;
-  padding: 20px 0;
-  border-top: 2px solid #eee;
-}
-
-.config-raw {
-  margin-top: 20px;
-  padding: 15px;
-  background: #f8f9fa;
-  border-radius: 4px;
-}
-
-.config-raw summary {
-  cursor: pointer;
-  font-weight: 600;
-  color: #007bff;
-  padding: 10px;
-}
-
-.config-raw summary:hover {
-  background: #e9ecef;
-  border-radius: 4px;
-}
-
-.config-raw pre {
-  margin-top: 15px;
-  background: #fff;
-  border: 1px solid #ddd;
-  border-radius: 4px;
-  padding: 15px;
-  overflow-x: auto;
-  font-size: 12px;
-}
-
-/* 按钮样式增强 */
-.btn {
-  padding: 12px 24px;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-  font-size: 16px;
-  font-weight: 600;
-  transition: all 0.3s;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.btn-primary {
-  background-color: #007bff;
-  color: white;
-}
-
-.btn-primary:hover:not(:disabled) {
-  background-color: #0056b3;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 8px rgba(0, 123, 255, 0.3);
-}
-
-.btn-secondary {
-  background-color: #6c757d;
-  color: white;
-}
-
-.btn-secondary:hover:not(:disabled) {
-  background-color: #545b62;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 8px rgba(108, 117, 125, 0.3);
-}
-
-.btn-success {
-  background-color: #28a745;
-  color: white;
-}
-
-.btn-success:hover:not(:disabled) {
-  background-color: #218838;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 8px rgba(40, 167, 69, 0.3);
-}
-
-.btn-danger {
-  background-color: #dc3545;
-  color: white;
-}
-
-.btn-danger:hover:not(:disabled) {
-  background-color: #c82333;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 8px rgba(220, 53, 69, 0.3);
-}
-
-/* 状态横幅样式 */
-.status-banner {
-  background-color: #d4edda;
-  color: #155724;
-  padding: 15px;
-  margin: 20px;
-  border-radius: 4px;
-  border: 1px solid #c3e6cb;
-  animation: slideDown 0.3s ease-out;
-}
-
-.error-banner {
-  background-color: #f8d7da;
-  color: #721c24;
-  padding: 15px;
-  margin: 20px;
-  border-radius: 4px;
-  border: 1px solid #f5c6cb;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  animation: slideDown 0.3s ease-out;
-}
-
-.error-banner button {
-  background: transparent;
-  border: 1px solid #721c24;
-  color: #721c24;
-  padding: 5px 15px;
-  border-radius: 4px;
-  cursor: pointer;
-}
-
-.error-banner button:hover {
-  background: #721c24;
-  color: white;
-}
-
-@keyframes slideDown {
-  from {
-    opacity: 0;
-    transform: translateY(-20px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-/* 响应式设计 */
-@media (max-width: 768px) {
-  .config-section {
-    padding: 15px;
-  }
-
-  .config-actions {
-    flex-direction: column;
-  }
-
-  .config-actions button {
-    width: 100%;
-  }
-
-  .form-group input[type="text"],
-  .form-group input[type="number"] {
-    font-size: 16px; /* 防止 iOS 自动缩放 */
-  }
+  color: #999;
+  font-style: italic;
 }
 
 .validation-errors {
-  background-color: #fff3cd;
-  border: 1px solid #ffc107;
-  border-radius: 8px;
   padding: 15px;
   margin: 20px;
   color: #856404;
@@ -1085,6 +654,7 @@ label .hint {
     opacity: 0;
     transform: translateY(-20px);
   }
+
   to {
     opacity: 1;
     transform: translateY(0);

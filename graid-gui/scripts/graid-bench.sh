@@ -76,8 +76,8 @@ function check_dependencies() {
     fi
 
 
-    for name in fio jq nvme graidctl atop nvidia-smi pip3
-    do
+    for name in fio jq nvme graidctl atop nvidia-smi pip3 bc
+        do
         if [[ $(which $name 2>/dev/null) ]]; then
             continue
         fi
@@ -102,9 +102,9 @@ function check_dependencies() {
                             *) echo "";;
                         esac)
                         if [[ "$name" == "pip3" ]]; then
-                            pack='sudo dnf install'
+                            pack='dnf install'
                         else    
-                            pack='sudo yum install'
+                            pack='yum install'
                         fi
                         ;;
                     ubuntu|debian)
@@ -117,7 +117,7 @@ function check_dependencies() {
                             pip3) echo "python3-pip";;
                             *) echo "";;
                         esac)
-                        pack='sudo apt install'
+                        pack='apt install'
                         ;;
                     sled|sles|opensuse-leap)
                         package_name=$(case $name in
@@ -127,9 +127,10 @@ function check_dependencies() {
                             atop) echo "atop";;
                             nvidia-smi) echo "nvidia-smi";;
                             pip3) echo "python3-pip";;
+                            bc) echo "bc";;
                             *) echo "";;
                         esac)
-                        pack='sudo zpper install'
+                        pack='zpper install'
                         ;;
                     *)
                         msg="Distro '$DISTRO_ID' not supported."
@@ -228,10 +229,20 @@ function get_basic_para() {
 
     . graid-bench.conf
 
+    # Initialize missing variables with defaults if not set in config
+    SCAN=${SCAN:-"false"}
+    LS_JB=${LS_JB:-"false"}
+    LS_BS=${LS_BS:-"false"}
+    LS_CUST=${LS_CUST:-"false"}
+    LS_CS=${LS_CS:-"false"}
+    WCD=${WCD:-"false"}
+    DUMMY=${DUMMY:-"false"}
+    TEMP=${TEMP:-"75"}
+
     export CPU_ALLOWED_SEQ="0-$(($CPU_JOBS - 1))"
     export CPU_ALLOWED_RAND="0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124"
     timestamp=$(date '+%Y-%m-%d-%s')
-    result="$NVME_INFO-result-$timestamp"
+    result="$NVME_INFO-result"
     killall -q atop fio
 
 }
@@ -278,8 +289,8 @@ function discard_device() {
         exit 1
     fi
     if [[ $device == *nvme* ]]; then
-        sudo nvme format -f "$device"
-        sudo nvme sanitize -a 2 "$device"
+        nvme format -f "$device"
+        nvme sanitize -a 2 "$device"
         check_sanitize_done "$device"
     fi
     
@@ -395,7 +406,7 @@ main() {
     #pip3 install pandas
     #pip3 install pathlib
     #python3 parser.py
-    bash ./src/graid_log_script.sh
+    bash ./src/graid-log-collector.sh -y -U
 
 	# Find files smaller than 100MB and store their paths in the temporary file
 	#find "./$NVME_INFO-result-*" -type f -size -100M > "$temp_file"
@@ -404,7 +415,8 @@ main() {
 	#tar -czvf archive.tar.gz -T "$temp_file"
 
     python_paser
-    tar czPf "graid_bench_result_$(hostname)_$NVME_INFO_$timestamp.tar" ./$NVME_INFO* ./graid_log_* ./output.log
+    tar_name="graid_bench_result_$(hostname)_$NVME_INFO_$timestamp.tar"
+    tar czPf "$tar_name" ./$NVME_INFO* ./graid_log_* ./output.log
     echo "Moving results to ../results/"
     mv "$tar_name" ../results/
 
