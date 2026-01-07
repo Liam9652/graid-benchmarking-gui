@@ -8,6 +8,7 @@ import subprocess
 import json
 import os
 import shutil
+import base64
 import threading
 import time
 from datetime import datetime
@@ -17,6 +18,14 @@ import tarfile
 import re
 import shlex
 import csv
+import selectors
+
+WORKLOAD_MAP = {
+    '00-randread': '4k Random Read',
+    '01-seqread': '1M Sequential Read',
+    '02-seqwrite': '1M Sequential Write',
+    '09-randwrite': '4k Random Write'
+}
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 CORS(app)
@@ -101,19 +110,101 @@ class BenchmarkManager:
             venv_bin = BASE_DIR / 'venv' / 'bin'
             env['PATH'] = str(venv_bin) + os.pathsep + env['PATH']
 
+            # Open log file for writing
             with open(log_file, 'w') as log:
                 self.process = subprocess.Popen(
-                    cmd, stdout=log, stderr=subprocess.STDOUT, cwd=str(SCRIPT_DIR), env=env
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                    cwd=str(SCRIPT_DIR), env=env, text=True, bufsize=1
                 )
                 benchmark_process = self.process
+                
+                current_base_label = "Initializing..."
 
-                while self.process.poll() is None:
-                    socketio.emit('progress', {
-                        'status': 'running',
-                        'message': 'Benchmark running...',
-                        'timestamp': datetime.now().isoformat()
-                    }, room=session_id)
-                    time.sleep(5)
+                # Use selectors for non-blocking I/O
+                sel = selectors.DefaultSelector()
+                sel.register(self.process.stdout, selectors.EVENT_READ)
+
+                while True:
+                    # Check for new data with a timeout
+                    events = sel.select(timeout=0.5)
+                    line = None
+                    if events:
+                        for key, mask in events:
+                            line = key.fileobj.readline()
+                    
+                    if line:
+                        # Write to log file
+                        log.write(line)
+                        log.flush() # Ensure it's written immediately
+                        
+                        # Debug: print to docker logs
+                        print(f"BENCH_LOG: {line.strip()}", flush=True)
+
+                            
+                        # Parse status markers
+                        msg = line.strip()
+
+                        # Detect STATUS: STATE:
+                        if "STATUS: STATE:" in msg:
+                             try:
+                                 state = msg.split("STATUS: STATE:")[1].strip()
+                                 print(f"DETECTED STATE: {state}", flush=True)
+                                 socketio.emit('run_status_update', {
+                                    'status': state,
+                                    'timestamp': datetime.now().isoformat()
+                                 }, room=session_id)
+                             except Exception as e:
+                                 print(f"Error parsing state: {e}", flush=True)
+
+                        if "STATUS: STAGE_PD_START" in msg:
+                             print("DETECTED STAGE PD START", flush=True)
+                             current_base_label = 'Baseline Performance Test\n'
+                             socketio.emit('status_update', {
+                                'stage': 'PD',
+                                'label': current_base_label,
+                                'timestamp': datetime.now().isoformat()
+                            }, room=session_id)
+                        elif "STATUS: STAGE_VD_START" in msg:
+                             print("DETECTED STAGE VD START", flush=True)
+                             current_base_label = 'RAID Performance Test\n'
+                             socketio.emit('status_update', {
+                                'stage': 'VD',
+                                'label': current_base_label,
+                                'timestamp': datetime.now().isoformat()
+                            }, room=session_id)
+                        elif "STATUS: WORKLOAD:" in msg:
+                            # Format: STATUS: WORKLOAD: 00-randread-graid
+                            try:
+                                filename = msg.split("STATUS: WORKLOAD:")[1].strip()
+                                friendly_name = filename
+                                for key, val in WORKLOAD_MAP.items():
+                                    if key in filename:
+                                        friendly_name = val
+                                        break
+                                
+                                new_label = f"{current_base_label} - {friendly_name}"
+                                print(f"DETECTED WORKLOAD: {filename} -> {new_label}", flush=True)
+                                
+                                # Determine stage code based on label
+                                stage_code = 'PD' if 'Baseline' in current_base_label else 'VD'
+                                
+                                socketio.emit('status_update', {
+                                    'stage': stage_code,
+                                    'label': new_label,
+                                    'timestamp': datetime.now().isoformat()
+                                }, room=session_id)
+                            except Exception as e:
+                                print(f"Error parsing workload: {e}", flush=True)
+                    else:
+                        # No data or EOF
+                        if self.process.poll() is not None:
+                             # Process ended
+                             break
+                
+                # Wait for completion
+                self.process.wait()
+                print(f"BENCH_PROCESS_EXIT: rc={self.process.returncode}", flush=True)
+
 
             if self.process.returncode == 0:
                 socketio.emit('status', {
@@ -215,7 +306,11 @@ def get_system_info():
         try:
             result = subprocess.run(['graidctl', 'ls', 'nd', '--format', 'json'], capture_output=True, text=True)
             if result.returncode == 0:
-                nvme_info = json.loads(result.stdout).get('Result', [])
+                stdout = result.stdout.strip()
+                # Find the start of the JSON object
+                start_idx = stdout.find('{')
+                if start_idx != -1:
+                    nvme_info = json.loads(stdout[start_idx:]).get('Result', [])
         except Exception as e:
             print(f"Error getting graidctl nd info: {e}")
 
@@ -224,7 +319,11 @@ def get_system_info():
         try:
             result = subprocess.run(['graidctl', 'ls', 'cx', '--format', 'json'], capture_output=True, text=True)
             if result.returncode == 0:
-                controller_info = json.loads(result.stdout).get('Result', [])
+                stdout = result.stdout.strip()
+                # Find the start of the JSON object
+                start_idx = stdout.find('{')
+                if start_idx != -1:
+                    controller_info = json.loads(stdout[start_idx:]).get('Result', [])
         except Exception as e:
             print(f"Error getting graidctl cx info: {e}")
 
@@ -282,6 +381,77 @@ def stop_benchmark():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/benchmark/trigger_snapshot', methods=['POST'])
+def trigger_snapshot():
+    try:
+        if not benchmark_running:
+            print("Snapshot trigger ignored: Benchmark is not running", flush=True)
+            return jsonify({'success': True, 'message': 'Snapshot ignored: Benchmark stopped'})
+
+        data = request.json
+        test_name = data.get('test_name', 'unknown_test')
+        output_dir = data.get('output_dir', '')
+        
+        # Emit event to frontend to take snapshot
+        print(f"Triggering snapshot for {test_name}", flush=True)
+        socketio.emit('snapshot_request', {
+            'test_name': test_name,
+            'output_dir': output_dir
+        })
+        
+        return jsonify({'success': True, 'message': 'Snapshot requested'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/benchmark/save_snapshot', methods=['POST'])
+def save_snapshot():
+    try:
+        data = request.json
+        image_data = data.get('image')
+        test_name = data.get('test_name')
+        output_dir = data.get('output_dir') # Relative path from results dir
+
+        if not image_data or not test_name:
+            return jsonify({'success': False, 'error': 'Missing data'}), 400
+
+        # Decode base64 image
+        if ',' in image_data:
+            header, encoded = image_data.split(',', 1)
+        else:
+            encoded = image_data
+
+        image_binary = base64.b64decode(encoded)
+
+        # Determine save path
+        if output_dir:
+             if output_dir.startswith('./'):
+                 output_dir = output_dir[2:]
+             
+             # Security check: ensure no '..' to escape results dir
+             if '..' in output_dir:
+                 return jsonify({'success': False, 'error': 'Invalid path'}), 400
+                 
+             save_dir = SCRIPT_DIR / output_dir / 'report_view'
+        else:
+             save_dir = RESULTS_DIR / 'report_view'
+             
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        filename = f"{test_name}_report_view.png"
+        file_path = save_dir / filename
+        
+        with open(file_path, 'wb') as f:
+            f.write(image_binary)
+            
+        print(f"Snapshot saved to {file_path}", flush=True)
+
+        return jsonify({'success': True, 'message': 'Snapshot saved'})
+    except Exception as e:
+        print(f"Error saving snapshot: {e}", flush=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/benchmark/status', methods=['GET'])
 def get_benchmark_status():
     return jsonify({'success': True, 'data': {'running': benchmark_running, 'timestamp': datetime.now().isoformat()}})
@@ -319,8 +489,23 @@ def get_result_file(filename):
 def get_result_data(result_name):
     try:
         result_path = RESULTS_DIR / result_name
-        if not result_path.exists():
+        
+        # Check if it's a special model path in scripts dir
+        # User requirement: ./script/<model name>-result/<model name>/
+        model_result_path = SCRIPT_DIR / f"{result_name}-result" / result_name
+        
+
+
+        target_path = None
+        if result_path.exists():
+            target_path = result_path
+        elif model_result_path.exists():
+            target_path = model_result_path
+            
+        if not target_path:
             return jsonify({'success': False, 'error': 'Result not found'}), 404
+            
+        result_path = target_path
 
         csv_data = []
         
@@ -334,51 +519,158 @@ def get_result_data(result_name):
             return data
 
         if result_path.is_dir():
-            # Search for CSV files
-            # Priority: Look for files with 'fio-test' or 'diskspd-test' in name
+            # Search for CSV files recursively
             csv_files = list(result_path.rglob('*.csv'))
-            target_csv = None
+
+            # Filter based on type param if present
+            req_type = request.args.get('type')
             
-            # Simple heuristic to find the summary CSV
-            for csv_file in csv_files:
-                if 'fio-test' in csv_file.name or 'diskspd-test' in csv_file.name:
-                    target_csv = csv_file
-                    break
+            filtered_files = []
+            if req_type == 'baseline':
+                filtered_files = [f for f in csv_files if '/PD/' in str(f) or '/pd/' in str(f)]
+            elif req_type == 'graid':
+                filtered_files = [f for f in csv_files if '/VD/' in str(f) or '/vd/' in str(f)]
             
-            if not target_csv and csv_files:
-                target_csv = csv_files[0]
+            # If explicit filter yielded nothing, or no filter, use all found (maybe filter for test results)
+            if not filtered_files:
+                 # If we had a type but found nothing, maybe fallback? or return empty?
+                 # If user specified baseline but no PD found, likely no PD data.
+                 # But let's be safe and fallback to all if no specific filter matches (only if type not specified?)
+                 if not req_type:
+                    filtered_files = csv_files
+                 # If req_type was set but empty, we return empty list essentially
             
-            if target_csv:
-                csv_data = parse_csv(target_csv)
+            # Further filter for fio/diskspd files to avoid random csvs
+            target_csvs = [f for f in filtered_files if 'fio-test' in f.name or 'diskspd-test' in f.name]
+             
+            # If no target csvs found, but we have filtered files, take them
+            if not target_csvs and filtered_files:
+                target_csvs = filtered_files
+            
+
+
+            # Parse all target CSVs and aggregate
+            if target_csvs:
+                for csv_file in target_csvs:
+                    try:
+                        file_data = parse_csv(csv_file)
+                        
+                        # Deduce workload from filename
+                        fname = csv_file.name
+                        workload = "Unknown"
+                        if 'randread' in fname:
+                            if '00-' in fname or '4k' in fname or 'BSALL-00' in fname: workload = "4k Random Read"
+                            else: workload = "Random Read"
+                        elif 'randwrite' in fname:
+                            if '09-' in fname or '4k' in fname or 'BSALL-09' in fname: workload = "4k Random Write"
+                            else: workload = "Random Write"
+                        elif 'seqread' in fname:
+                             if '01-' in fname or '1M' in fname or 'BSALL-01' in fname: workload = "1M Sequential Read"
+                             else: workload = "Sequential Read"
+                        elif 'seqwrite' in fname:
+                             if '02-' in fname or '1M' in fname or 'BSALL-02' in fname: workload = "1M Sequential Write"
+                             else: workload = "Sequential Write"
+                        
+                        # Add workload to each row
+                        for row in file_data:
+                            row['Workload'] = workload
+                            
+                        # Optional: Add source file info if needed, but schema might need to match
+                        csv_data.extend(file_data)
+                    except Exception as e:
+                        print(f"Error parsing {csv_file}: {e}")
             else:
-                return jsonify({'success': False, 'error': 'No CSV data found'}), 404
+                 return jsonify({'success': False, 'error': 'No CSV data found'}), 404
 
         elif result_path.is_file() and result_path.name.endswith('.tar'):
             # Handle tar file
             import tarfile
             with tarfile.open(result_path, 'r') as tar:
-                # Find CSV in tar
-                csv_member = None
+                # Find Summary CSV in tar
+                # Pattern: Look for *result/fio-test-r-*.csv
+                summary_csv_member = None
                 for member in tar.getmembers():
-                    if member.name.endswith('.csv') and ('fio-test' in member.name or 'diskspd-test' in member.name):
-                        csv_member = member
+                    if 'result/fio-test-r-' in member.name and member.name.endswith('.csv'):
+                        summary_csv_member = member
                         break
                 
-                if not csv_member:
-                     # Fallback to any csv
-                    for member in tar.getmembers():
-                        if member.name.endswith('.csv'):
-                            csv_member = member
-                            break
-                
-                if csv_member:
-                    f = tar.extractfile(csv_member)
+                if summary_csv_member:
+                    # Parse summary CSV
+                    f = tar.extractfile(summary_csv_member)
                     content = f.read().decode('utf-8')
                     reader = csv.DictReader(content.splitlines())
+                    
+                    req_type = request.args.get('type')
+                    
                     for row in reader:
+                        filename_col = row.get('filename', '')
+                        
+                        # Filtering Logic
+                        # Baseline -> SingleTest
+                        # Graid -> RAID
+                        if req_type == 'baseline':
+                            if 'SingleTest' not in filename_col:
+                                continue
+                        elif req_type == 'graid':
+                            if 'RAID' not in filename_col:
+                                continue
+                                
+                        # Inject Workload
+                        workload = "Unknown"
+                        
+                        # Helper to check block size if available
+                        bs = row.get('BlockSize', '')
+                        try:
+                            bs_float = float(bs)
+                        except ValueError:
+                            bs_float = 0
+                        
+                        is_4k = bs_float == 4.0
+                        is_1m = bs_float == 1024.0
+                        
+                        if 'randread' in filename_col:
+                            if is_4k or '00-' in filename_col or '4k' in filename_col or 'BSALL-00' in filename_col: 
+                                workload = "4k Random Read"
+                            else: 
+                                workload = "Random Read"
+                        elif 'randwrite' in filename_col:
+                            if is_4k or '09-' in filename_col or '4k' in filename_col or 'BSALL-09' in filename_col:
+                                workload = "4k Random Write"
+                            else: 
+                                workload = "Random Write"
+                        elif 'seqread' in filename_col:
+                             if is_1m or '01-' in filename_col or '1M' in filename_col or 'BSALL-01' in filename_col:
+                                 workload = "1M Sequential Read"
+                             else: 
+                                 workload = "Sequential Read"
+                        elif 'seqwrite' in filename_col:
+                             if is_1m or '02-' in filename_col or '1M' in filename_col or 'BSALL-02' in filename_col:
+                                 workload = "1M Sequential Write"
+                             else: 
+                                 workload = "Sequential Write"
+                        
+                        row['Workload'] = workload
                         csv_data.append(row)
+
                 else:
-                     return jsonify({'success': False, 'error': 'No CSV data found in archive'}), 404
+                    # Fallback to old behavior: Find any CSV (maybe individual results?)
+                    # Scan for all CSVs if summary not found?
+                    # For now, let's just stick to the requested behavior or error out if critical?
+                    # But better to support fallback if summary is missing but individual files exist.
+                    
+                    for member in tar.getmembers():
+                         if member.name.endswith('.csv') and ('fio-test' in member.name or 'diskspd-test' in member.name):
+                                # Extract and check type
+                                # This is harder because we need to parse many files.
+                                # Let's just try to find *any* csv for now as fallback
+                                f = tar.extractfile(member)
+                                # ... (simple valid csv check)
+                                content = f.read().decode('utf-8')
+                                reader = csv.DictReader(content.splitlines())
+                                for row in reader:
+                                    # Very basic fallback, likely won't match the filtering needs perfectly without duplicate logic
+                                    # But given user request, the summary file SHOULD exist.
+                                    csv_data.append(row)
 
         return jsonify({'success': True, 'data': csv_data})
     except Exception as e:
@@ -424,5 +716,6 @@ def on_join_session(data):
 
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5000,
+    socketio.run(app, host='0.0.0.0', port=50071,
                  debug=True, allow_unsafe_werkzeug=True)
+

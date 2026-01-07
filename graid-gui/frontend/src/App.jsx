@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
+import html2canvas from 'html2canvas';
 import './App.css';
 import io from 'socket.io-client';
 import RealTimeDashboard from './components/RealTimeDashboard';
@@ -72,9 +73,13 @@ const validateConfig = (cfg) => {
 
 function App() {
   const [activeTab, setActiveTab] = useState('config');
+  const [activeViewMode, setActiveViewMode] = useState('chart'); // Lifted state
   const [config, setConfig] = useState({});
+  const [configRef, setConfigRef] = useState(config); // Ref to access latest config in callbacks (Use state for reactivity if needed, or useRef)
+  const configRefObj = React.useRef(config); // Renamed to avoid confusion with useState
   const [benchmarkRunning, setBenchmarkRunning] = useState(false);
   const [status, setStatus] = useState('');
+  const [currentStage, setCurrentStage] = useState(null); // { stage: 'PD'|'VD', label: '...' }
   const [error, setError] = useState('');
   const [validationErrors, setValidationErrors] = useState([]);
   const [results, setResults] = useState([]);
@@ -84,6 +89,7 @@ function App() {
   const [comparisonData, setComparisonData] = useState({ baseline: null, graid: null });
   const [systemInfo, setSystemInfo] = useState({ nvme_info: [], controller_info: [] });
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [activeDevices, setActiveDevices] = useState(new Set());
 
   useEffect(() => {
     const newSocket = io(API_BASE_URL);
@@ -99,21 +105,52 @@ function App() {
       setStatus(`[${data.timestamp}] ${data.message}`);
       if (data.status === 'completed' || data.status === 'failed') {
         setBenchmarkRunning(false);
+        setCurrentStage(null);
       } else if (data.status === 'started') {
         setBenchmarkRunning(true);
+        setCurrentStage({ stage: 'INIT', label: 'Initializing...' });
         setRealTimeData([]); // Clear old data
+        setActiveDevices(new Set()); // Clear old devices
       }
+    });
+
+    newSocket.on('status_update', (data) => {
+      setCurrentStage({ stage: data.stage, label: data.label });
     });
 
     newSocket.on('giostat_data', (data) => {
       parseGiostatLine(data.line);
     });
 
+    // Listen for snapshot trigger
+    newSocket.on('snapshot_request', (data) => {
+      console.log('Received snapshot request:', data);
+      handleSnapshot(data);
+    });
+
     loadConfig();
     loadSystemInfo();
+    checkBenchmarkStatus();
 
     return () => newSocket.close();
   }, []);
+
+  // Set default values for controller and VD name
+  useEffect(() => {
+    setConfig(prev => {
+      const updates = {};
+      let changed = false;
+      if (!prev.RAID_CTRLR && systemInfo.controller_info.length > 0) {
+        updates.RAID_CTRLR = systemInfo.controller_info[0].Name;
+        changed = true;
+      }
+      if (!prev.VD_NAME) {
+        updates.VD_NAME = 'gdg0n1';
+        changed = true;
+      }
+      return changed ? { ...prev, ...updates } : prev;
+    });
+  }, [systemInfo.controller_info]);
 
   const loadSystemInfo = async () => {
     try {
@@ -128,37 +165,111 @@ function App() {
 
   const parseGiostatLine = (line) => {
     // Basic parsing for iostat -xmcd 1 output
-    // Assuming columns: Device r/s rMB/s ... w/s wMB/s ... r_await ... w_await
-    // We filter for the target device (VD or specific NVMe)
-    // For now, let's just take the first line that looks like a device stats line
-    // and isn't the header or CPU line.
-
     const parts = line.trim().split(/\s+/);
     if (parts.length < 12) return; // Not a valid data line
     if (parts[0] === 'Device' || parts[0] === 'avg-cpu:') return; // Header
 
     // Check if it matches our target device
-    // If running VD test, look for VD_NAME. If PD, maybe look for nvme*
-    // For simplicity, we'll try to match the configured VD_NAME or just take the first nvme/dm device
-
     const targetDevice = config.VD_NAME || 'nvme';
+    const devName = parts[0];
 
-    if (parts[0].includes(targetDevice) || (targetDevice === 'nvme' && parts[0].startsWith('nvme'))) {
+    // Strict filter based on test configuration
+    let isMatch = false;
+
+    // Determine which devices are relevant for the current test config
+    // Use configRef.current to get the latest config inside local closure
+    const currentConfig = configRef.current || {};
+    const runPD = currentConfig.RUN_PD !== false; // Default to true if undefined
+    const runVD = currentConfig.RUN_VD !== false; // Default to true if undefined
+    const nvmeList = currentConfig.NVME_LIST || [];
+    const vdName = currentConfig.VD_NAME || 'gdg0n1';
+
+    // If RUN_PD is active, check against NVME_LIST
+    if (runPD) {
+      if (nvmeList.length > 0) {
+        // Exact or includes match for selected devices
+        if (nvmeList.some(d => devName.includes(d))) isMatch = true;
+      } else {
+        // Fallback: if list empty but PD test active, maybe show all nvme?
+        // But user asked for "tested devices only". If empty, arguably nothing is tested.
+        // We'll keep the old behavior of accepting all nvme if list is empty to be safe, 
+        // OR better: strict match only if list exists.
+        // Let's stick to strict if list exists. If list empty, we ignore PDs to avoid clutter?
+        // Actually, if list is empty, the benchmark script might select ALL. 
+        // Let's assume emptiness means "all" or "none". 
+        // Usage pattern implies user selects devices.
+        if (devName.startsWith('nvme')) isMatch = true;
+      }
+    }
+
+    // If RUN_VD is active, check against VD_NAME
+    if (runVD) {
+      if (devName.includes(vdName)) isMatch = true;
+    }
+
+    // Special case: if NO specific filtering (default state), show nvme and gdg/md to be helpful
+    if (!currentConfig.RUN_PD && !currentConfig.RUN_VD && !currentConfig.NVME_LIST) {
+      // Only if config is truly empty/default, to avoid noise at start
+      if (Object.keys(currentConfig).length === 0 && (devName.startsWith('nvme') || devName.startsWith('gdg'))) {
+        isMatch = true;
+      }
+    }
+
+    if (isMatch) {
+      setActiveDevices(prev => new Set(prev).add(devName));
+
       const timestamp = new Date().toLocaleTimeString();
-      const newData = {
-        timestamp,
-        iops_read: parseFloat(parts[1]),
-        bw_read: parseFloat(parts[2]),
-        lat_read: parseFloat(parts[5]),
-        iops_write: parseFloat(parts[7]),
-        bw_write: parseFloat(parts[8]),
-        lat_write: parseFloat(parts[11]),
-      };
+      const iops_read = parseFloat(parts[1]);
+      const bw_read = parseFloat(parts[2]);
+      const lat_read = parseFloat(parts[5]);
+      const iops_write = parseFloat(parts[7]);
+      const bw_write = parseFloat(parts[8]);
+      const lat_write = parseFloat(parts[11]);
 
       setRealTimeData(prev => {
-        const newDataArray = [...prev, newData];
-        if (newDataArray.length > 50) newDataArray.shift(); // Keep last 50 points
-        return newDataArray;
+        const last = prev[prev.length - 1];
+
+        // If we have a last entry and this device is NOT yet in it, merge it.
+        // Otherwise (device already matches or no last entry), create new entry.
+        // We assume "timestamp" is close enough for grouping.
+        // Better heuristic: Check if `devName` data is already present in `last`.
+        let shouldMerge = false;
+
+        if (last) {
+          // Check if this device is already in the last record
+          const alreadyHasDevice = Object.keys(last).some(k => k.startsWith(`${devName}_`));
+          if (!alreadyHasDevice) {
+            shouldMerge = true;
+          }
+        }
+
+        if (shouldMerge) {
+          const updatedLast = {
+            ...last,
+            [`${devName}_iops_read`]: iops_read,
+            [`${devName}_bw_read`]: bw_read,
+            [`${devName}_lat_read`]: lat_read,
+            [`${devName}_iops_write`]: iops_write,
+            [`${devName}_bw_write`]: bw_write,
+            [`${devName}_lat_write`]: lat_write,
+          };
+          // Replace last entry
+          return [...prev.slice(0, -1), updatedLast];
+        } else {
+          // Create new entry
+          const newData = {
+            timestamp,
+            [`${devName}_iops_read`]: iops_read,
+            [`${devName}_bw_read`]: bw_read,
+            [`${devName}_lat_read`]: lat_read,
+            [`${devName}_iops_write`]: iops_write,
+            [`${devName}_bw_write`]: bw_write,
+            [`${devName}_lat_write`]: lat_write,
+          };
+          const newDataArray = [...prev, newData];
+          if (newDataArray.length > 50) newDataArray.shift(); // Keep last 50 points
+          return newDataArray;
+        }
       });
     }
   };
@@ -169,6 +280,7 @@ function App() {
       const response = await axios.get(`${API_BASE_URL}/api/config`);
       if (response.data.success) {
         setConfig(response.data.data);
+        configRef.current = response.data.data; // Sync ref
         setError('');
       }
     } catch (err) {
@@ -198,6 +310,14 @@ function App() {
       }
     });
 
+    // Sanitize NVME_LIST against currently detected devices
+    if (systemInfo.nvme_info.length > 0) {
+      const validDevices = systemInfo.nvme_info.map(d => d.DevPath.split('/').pop());
+      if (Array.isArray(processed.NVME_LIST)) {
+        processed.NVME_LIST = processed.NVME_LIST.filter(dev => validDevices.includes(dev));
+      }
+    }
+
     return processed;
   };
 
@@ -225,7 +345,8 @@ function App() {
         setValidationErrors([]);
       }
     } catch (err) {
-      setError('❌ Starting benchmark failed: ' + err.message);
+      const errorMsg = err.response?.data?.error || err.message;
+      setError('❌ Starting benchmark failed: ' + errorMsg);
     }
   };
 
@@ -252,6 +373,57 @@ function App() {
     }
   };
 
+  const handleSnapshot = async (data) => {
+    try {
+      // 1. Ensure we are on the Benchmark tab
+      setActiveTab('benchmark');
+
+      // 2. Force "Report View" (cdm)
+      setActiveViewMode('cdm');
+
+      // 3. Wait for React to render the new view
+      await new Promise(resolve => setTimeout(resolve, 800));
+
+      // 4. Capture
+      // Target the Metric View specifically
+      let element = document.querySelector('.cdm-grid');
+
+      if (!element) {
+        console.warn('.cdm-grid not found, trying .realtime-dashboard');
+        element = document.querySelector('.realtime-dashboard');
+      }
+
+      if (!element) {
+        console.warn('.realtime-dashboard not found, falling back to body');
+        element = document.body;
+      }
+
+      if (!element) return;
+
+      const canvas = await html2canvas(element, {
+        useCORS: true,
+        logging: false,
+        backgroundColor: '#1a1a1a', // Dark background for dark mode theme
+        scale: 2 // High resolution
+      });
+
+      const imageData = canvas.toDataURL('image/png');
+
+      await axios.post(`${API_BASE_URL}/api/benchmark/save_snapshot`, {
+        image: imageData,
+        test_name: data.test_name,
+        output_dir: data.output_dir
+      });
+
+      console.log('Snapshot uploaded successfully');
+      setStatus('📸 Snapshot saved');
+      setTimeout(() => setStatus(''), 2000);
+
+    } catch (err) {
+      console.error('Snapshot capture failed:', err);
+    }
+  };
+
   const handleConfigChange = (key, value) => {
     setConfig(prev => {
       const newConfig = { ...prev, [key]: value };
@@ -260,6 +432,7 @@ function App() {
         const firstDev = systemInfo.nvme_info.find(d => d.DevPath.includes(value[0]));
         if (firstDev) newConfig.NVME_INFO = firstDev.Model.replace(/\s+/g, '-');
       }
+      configRef.current = newConfig; // Update ref
       return newConfig;
     });
     setValidationErrors([]); // 清除验证错误
@@ -271,19 +444,44 @@ function App() {
       const next = current.includes(value)
         ? current.filter(v => v !== value)
         : [...current, value];
-      return { ...prev, [key]: next };
+
+      const newConfig = { ...prev, [key]: next };
+      configRef.current = newConfig; // Sync ref
+
+      // Auto-update NVME_INFO when NVME_LIST changes
+      if (key === 'NVME_LIST') {
+        if (next.length > 0) {
+          // Find the model of the first selected device
+          const firstDevName = next[0];
+          const device = systemInfo.nvme_info.find(d => d.DevPath.endsWith(firstDevName));
+          if (device) {
+            // Replace spaces with hyphens to avoid script issues
+            newConfig.NVME_INFO = device.Model.replace(/\s+/g, '-');
+          }
+        }
+      }
+
+      return newConfig;
     });
     setValidationErrors([]);
   };
 
   const handleArrayChange = (key, value) => {
-    setConfig(prev => ({ ...prev, [key]: value }));
+    setConfig(prev => {
+      const next = { ...prev, [key]: value };
+      configRef.current = next;
+      return next;
+    });
     setValidationErrors([]);
   };
 
   const handleArrayBlur = (key, value) => {
     const array = value.split(',').map(s => s.trim()).filter(s => s);
-    setConfig(prev => ({ ...prev, [key]: array }));
+    setConfig(prev => {
+      const next = { ...prev, [key]: array };
+      configRef.current = next;
+      return next;
+    });
   };
 
   const getArrayDisplayValue = (value) => {
@@ -305,6 +503,7 @@ function App() {
       const response = await axios.post(`${API_BASE_URL}/api/config`, processed);
       if (response.data.success) {
         setConfig(processed);
+        configRef.current = processed; // Sync ref
         setStatus('✅ Config saved successfully');
         setError('');
         setValidationErrors([]);
@@ -335,8 +534,8 @@ function App() {
       // Let's assume we added an endpoint /api/results/:name/data
 
       const [res1, res2] = await Promise.all([
-        axios.get(`${API_BASE_URL}/api/results/${selectedResults[0]}/data`),
-        axios.get(`${API_BASE_URL}/api/results/${selectedResults[1]}/data`)
+        axios.get(`${API_BASE_URL}/api/results/${selectedResults[0]}/data?type=baseline`),
+        axios.get(`${API_BASE_URL}/api/results/${selectedResults[1]}/data?type=graid`)
       ]);
 
       if (res1.data.success && res2.data.success) {
@@ -494,8 +693,6 @@ function App() {
                       <p>Detecting controller...</p>
                     )}
                   </div>
-                  <input type="hidden" value={config.RAID_CTRLR = systemInfo.controller_info[0]?.Name || 'SR1000'} />
-                  <input type="hidden" value={config.VD_NAME = 'gdg0n1'} />
                 </div>
 
                 {/* 4. RAID Type Selection */}
@@ -663,17 +860,28 @@ function App() {
                 return null;
               })()}
 
-              <div className="test-status">
-                <div className="status-item">
-                  <label>Running Status:</label>
-                  <span className={benchmarkRunning ? 'running' : 'idle'}>
-                    {benchmarkRunning ? 'Benchmarking' : 'Not Running'}
-                  </span>
-                </div>
-                <div className="status-item">
-                  <label>Final Status:</label>
-                  <span>{status || 'No Status'}</span>
-                </div>
+
+              <div className="test-status-container">
+                {benchmarkRunning ? (
+                  <div className="status-split-container">
+                    <div className="status-box status-general-running">
+                      <div className="status-label">RUN STATUS</div>
+                      <div className="status-value">
+                        BENCHMARKING
+                        <div className="status-spinner-small"></div>
+                      </div>
+                    </div>
+                    <div className={`status-box ${currentStage?.stage === 'PD' ? 'status-stage-pd' : currentStage?.stage === 'VD' ? 'status-stage-vd' : 'status-stage-init'}`}>
+                      <div className="status-label">CURRENT STAGE</div>
+                      <div className="status-value">{currentStage?.label || 'Initializing...'}</div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="status-box status-idle">
+                    <div className="status-label">RUN STATUS</div>
+                    <div className="status-value">READY</div>
+                  </div>
+                )}
               </div>
               <div className="control-buttons">
                 <button
@@ -694,7 +902,12 @@ function App() {
 
               <div className="realtime-dashboard">
                 <h3>Real-time Monitor</h3>
-                <RealTimeDashboard data={realTimeData} />
+                <RealTimeDashboard
+                  data={realTimeData}
+                  devices={Array.from(activeDevices)}
+                  viewMode={activeViewMode}
+                  setViewMode={setActiveViewMode}
+                />
               </div>
             </div>
           )}
@@ -761,7 +974,7 @@ function App() {
       <footer className="app-footer">
         <p>SupremeRAID Benchmark Web GUI v1.0.0 | API: {API_BASE_URL}</p>
       </footer>
-    </div>
+    </div >
   );
 }
 

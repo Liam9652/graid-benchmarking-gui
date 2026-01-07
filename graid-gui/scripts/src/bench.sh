@@ -16,27 +16,20 @@ echo $DEV_NAME
 
 . graid-bench.conf
 
-trap ctrl_c INT
+trap cleanup INT TERM EXIT
 
-if [[ $DUMMY == "true" ]]; then
-        # Set the runtime for testing physical drives
-        PD_RUNTIME=10 # 3 minutes
-        VD_RUNTIME=10
-        pd_jobs=(1 32)
-        JOB_LS=(1 4)
-fi
-
-
-function ctrl_c() {
-        echo "** Trapped CTRL-C"
-        kill -9 ${fio_pid_list} 2>/dev/null
-        wait ${fio_pid_list} 2>/dev/null
-        kill -9 ${iostat_pid_list} 2>/dev/null
-        wait ${iostat_pid_list} 2>/dev/null
-        kill -9 ${atop_pid_list} 2>/dev/null
-        wait ${atop_pid_list} 2>/dev/null
-        kill -9 ${cpu_pid_list} 2>/dev/null
-        wait ${cpu_pid_list} 2>/dev/null
+function cleanup() {
+        echo "** Trapped Signal, Cleaning up..."
+        # Disable trap to avoid recursion
+        trap - INT TERM EXIT
+        
+        kill_pid "${fio_pid_list}"
+        kill_pid "${iostat_pid_list}"
+        kill_pid "${atop_pid_list}"
+        kill_pid "${cpu_pid_list}"
+        kill_pid "${ssd_pid_list}"
+        kill_pid "${gpu_pid_list}"
+        
         raid_cleanup
         exit 1
 }
@@ -227,10 +220,13 @@ function collect_log() {
     done &
     ssd_pid_list="${ssd_pid_list} $!"
 
-    echo "timestamp,index,name,serial,pcie.link.gen.current,pcie.link.width.current,utilization.gpu,memory.total,memory.used,power.draw,temperature.gpu,temperature.memory,clocks.max.sm,clocks.current.sm,,clocks.max.memory,clocks.current.memory,clocks.max.graphics,clocks.current.graphics,clocks.current.video,ecc.mode.current,clocks_throttle_reasons.applications_clocks_setting,clocks_throttle_reasons.sw_power_cap,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown" > query-item 
+    echo "timestamp,index,name,serial,pcie.link.gen.current,pcie.link.width.current,utilization.gpu,memory.total,memory.used,power.draw,temperature.gpu,temperature.memory,clocks.max.sm,clocks.current.sm,clocks.max.memory,clocks.current.memory,clocks.max.graphics,clocks.current.graphics,clocks.current.video,ecc.mode.current,clocks_throttle_reasons.applications_clocks_setting,clocks_throttle_reasons.sw_power_cap,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown" > query-item 
     if [[ $DEV_NAME == "VD" ]]; then
-        nvidia-smi -l 5 --format=csv  --query-gpu=`cat query-item` -f ${output_fio_dir}/gpu_tmp/$output_name.log &
+        query_item_path=$(readlink -f query-item)
+        pushd ${output_fio_dir}/gpu_tmp > /dev/null
+        nvidia-smi -l 5 --format=csv  --query-gpu=`cat $query_item_path` -f $output_name.log &
         gpu_pid_list="${gpu_pid_list} $!" 
+        popd > /dev/null
         graidctl ls pd 2>/dev/null > ${output_fio_dir}/raid_config/$output_name.log
         graidctl ls dg 2>/dev/null >> ${output_fio_dir}/raid_config/$output_name.log
         graidctl ls vd 2>/dev/null >> ${output_fio_dir}/raid_config/$output_name.log
@@ -472,10 +468,10 @@ handle_nvme_devices() {
 }
 
 handle_sd_devices() {
-    for I in "${NVME_LIST[@]}"; do
-        discard_device "/dev/$I"
-        wait
-    done
+    # for I in "${NVME_LIST[@]}"; do
+    #     discard_device "/dev/$I"
+    #     wait
+    # done
 
     create_raid_group "$RAID_MODE" "$PD_NUMBER" "$STRIP_SIZE" "-f"
     create_virtual_disk "$VD_NAME"
@@ -561,7 +557,7 @@ function list_file(){
         # echo $runsize $offsetsize
         if [[ $QUICK_TEST == "true" ]]; then
             src_path=src/fio-loop
-            # 
+            # echo "$DUMMY"
             if [[ $DUMMY == "false" ]]; then
                 task_list=(${src_path}/00-randread-graid ${src_path}/01-seqread-graid ${src_path}/02-seqwrite-graid ${src_path}/09-randwrite-graid)
             	cp ${src_path}/01-seqread-graid ${src_path}/01-seqread-graid.bak
@@ -569,7 +565,7 @@ function list_file(){
             	sed -i 's/size=\([0-9]*\)g/size='"$offsetsize"'g/' ${src_path}/01-seqread-graid
 
             else
-                task_list=(${src_path}/00-randread-graid ${src_path}/01-seqread-graid)
+                task_list=(${src_path}/00-randread-graid ${src_path}/01-seqread-graid ${src_path}/02-seqwrite-graid ${src_path}/09-randwrite-graid)
             	cp ${src_path}/01-seqread-graid ${src_path}/01-seqread-graid.bak
             	sed -i 's/offset_increment=\([0-9]*\)g/offset_increment=1g/' ${src_path}/01-seqread-graid
             	sed -i 's/size=\([0-9]*\)g/size=1g/' ${src_path}/01-seqread-graid
@@ -585,11 +581,11 @@ function list_file(){
     else
         if [[ $QUICK_TEST == "true" ]]; then
             src_path=src/fio-loop-pd
-            # 
+             
             if [[ $DUMMY == "false" ]]; then
                 task_list=(${src_path}/00-randread-graid ${src_path}/01-seqread-graid ${src_path}/02-seqwrite-graid ${src_path}/013-seqread-graid ${src_path}/03-randrw73-graid ${src_path}/06-randrw55-graid ${src_path}/09-randwrite-graid)
             else
-                task_list=(${src_path}/00-randread-graid  ${src_path}/01-seqread-graid)
+                task_list=(${src_path}/00-randread-graid  ${src_path}/01-seqread-graid ${src_path}/02-seqwrite-graid ${src_path}/09-randwrite-graid)
             fi
             sleep_time=5
         elif [[ $QUICK_TEST == "false" ]]; then
@@ -627,6 +623,8 @@ function prestat() {
     
     if [[ "${STAG}" == "afterprecondition" ]];  then
             echo "----precondition(1st)----"
+            echo "STATUS: STATE: PRECONDITIONING"
+            echo "STATUS: WORKLOAD: Precondition"
         if [[ "$DEV_NAME" != "PD" ]]; then
             fio src/precondition.fio --filename="/dev/$FIO_NAME" $common_args --output="$out_dir/$OUTPUT_NAME-precondition.log"
             sleep 5
@@ -646,6 +644,8 @@ function prestat() {
     # if [[ "${STAG}" == "aftersustain" ]] && [[ "$vid" != '' ]]; then
     if [[ "${STAG}" == "aftersustain" ]] && [[ "$vid" != "$tvid" ]]; then
         echo "----precondition----"
+        echo "STATUS: STATE: PRECONDITIONING"
+        echo "STATUS: WORKLOAD: Precondition"
         if [[ "$DEV_NAME" != "PD" ]]; then
             fio src/precondition.fio --filename="/dev/$FIO_NAME" $common_args --output="$out_dir/$OUTPUT_NAME-precondition.log"
             sleep 5
@@ -684,6 +684,8 @@ function prestat() {
     # if [[ "${STAG}" == "aftersustain" ]] && [[ "$vid" == '0x1af4' ]]; then
     if [[ "${STAG}" == "aftersustain" ]] && [[ "$vid" == "$tvid" ]]; then
         echo "----aftersustain----"
+        echo "STATUS: STATE: SUSTAINING"
+        echo "STATUS: WORKLOAD: Sustain Write"
         if [[ "$DEV_NAME" != "PD" ]]; then
             fio src/fio-loop/09-randwrite-graid --filename="/dev/$FIO_NAME" --runtime=$sustain_time --numjobs="$CPUJOBS" --cpus_allowed="$CPU_ALLOWED_SEQ" --output="$out_dir/$OUTPUT_NAME-sustain.log"
             sleep 5
@@ -808,6 +810,12 @@ function run_task(){
         
         # echo ${iostat_pid_list}
 
+        # Trigger Snapshot
+        # Snapshot time = ramp_time (10) + runtime - 10 = runtime
+        sleep $run_time
+        # Call backend to take snapshot
+        curl -X POST -H "Content-Type: application/json" -d "{\"test_name\": \"$of_name\", \"output_dir\": \"$fio_dir\"}" http://localhost:50071/api/benchmark/trigger_snapshot >/dev/null 2>&1
+        
         wait ${fio_pid_list}
         sync
         if [[ "$LOG_COMPACT" == "false" ]]; then
@@ -835,6 +843,8 @@ function run_test(){
                 rm -rf tfie 
                 create_vd
                 prestat ${task}
+                echo "STATUS: STATE: BENCHMARKING"
+                echo "STATUS: WORKLOAD: $(basename $task)"
                 for QD in  "${QD_LS[@]}"; do
                     for JOBS in "${JOB_LS[@]}"; do
                         cp $task tfie
@@ -878,6 +888,8 @@ function run_test(){
                 rm -rf tfie 
                 create_vd
                 prestat ${task}
+                echo "STATUS: STATE: BENCHMARKING"
+                echo "STATUS: WORKLOAD: $(basename $task)"
                 for bs in  "${BS_LS[@]}"; do
                     cp $task tfie
                     sed -i "s/^bs=.*/bs="$bs"k/" tfie
@@ -895,6 +907,8 @@ function run_test(){
             create_vd
             prestat ${task}
             for task in "${task_list[@]}"; do 
+                echo "STATUS: STATE: BENCHMARKING"
+                echo "STATUS: WORKLOAD: $(basename $task)"
                 echo "---$NVME_INFO-${STAS}-$RAID_MODE-${PD_NUMBER}PD-${task}---"
                 OUTPUT_NAME_NEW="$OUTPUT_NAME-${task:16:-1}-${STAS}"
                 collect_log $OUTPUT_NAME_NEW $fio_dir
@@ -904,6 +918,7 @@ function run_test(){
         elif [[ $LS_CUST == "true" ]]; then
 
             for task in "${task_list[@]}"; do 
+                echo "STATUS: WORKLOAD: $(basename $task)"
                 echo "---$NVME_INFO-${STAS}-$RAID_MODE-${PD_NUMBER}PD-${task}---"
                 rm -rf tfie 
                 create_vd
@@ -963,6 +978,8 @@ function run_test(){
 		        declare -A LAST_END_CPU_BY_NUMA
                 discard_dev
                 prestat ${task}
+                echo "STATUS: STATE: BENCHMARKING"
+                echo "STATUS: WORKLOAD: $(basename $task)"
                 rm -rf tfie
                 for QD in  "${QD_LS[@]}"; do
                     unset LAST_END_CPU_BY_NUMA
@@ -1049,6 +1066,8 @@ function run_test(){
                 # echo $PD_NAME
                 discard_dev
                 prestat ${task}
+                echo "STATUS: STATE: BENCHMARKING"
+                echo "STATUS: WORKLOAD: $(basename $task)"
                 if [[ $RUN_PD_ALL == "true" ]]; then
                     rm -rf tfie
 		    unset LAST_END_CPU_BY_NUMA
@@ -1222,6 +1241,8 @@ function detect_dev(){
 
 function discard_dev(){
     echo $DEV_NAME
+    echo "STATUS: STATE: DISCARDING"
+    echo "STATUS: WORKLOAD: Initializing..."
     if [[ "$DEV_NAME" == "PD" ]]; then
         if [[ $RUN_PD_ALL == "true" ]]; then
             PD_NAME=""
@@ -1229,22 +1250,23 @@ function discard_dev(){
             echo ${NVME_LIST[@]}
             for PD_NAME in "${NVME_LIST[@]}"
             do
-                discard_device /dev/$PD_NAME
-                wait
+                discard_device /dev/$PD_NAME &
             done
+            wait
         else
             # blkdiscard $PD_NAME
             discard_device /dev/$PD_NAME
             wait
         fi
 
-    elif [[ "$DEV_NAME" == "MD" ]]; then
+    elif [[ "$DEV_NAME" == "MD" ]] || [[ "$DEV_NAME" == "VD" ]]; then
         MD_NVME_LIST=""
         for I in "${NVME_LIST[@]}"; 
         do
             MD_NVME_LIST=${MD_NVME_LIST:+$MD_NVME_LIST }/dev/$I
-            discard_device /dev/$I
+            discard_device /dev/$I &
         done
+        wait
     fi
 }
 
@@ -1260,9 +1282,11 @@ graid_bench
 
 
 
-if [[ $QUICK_TEST == "true" ]]; then
-    mv src/fio-loop/01-seqread-graid.bak src/fio-loop/01-seqread-graid
-elif [[ $QUICK_TEST == "false" ]]; then
-    mv 01-seqread-graid.bak src/fio-loop/01-seqread-graid
+if [[ "$DEV_NAME" != "PD" ]]; then
+    if [[ $QUICK_TEST == "true" ]]; then
+        mv src/fio-loop/01-seqread-graid.bak src/fio-loop/01-seqread-graid
+    elif [[ $QUICK_TEST == "false" ]]; then
+        mv 01-seqread-graid.bak src/fio-loop/01-seqread-graid
+    fi
 fi
 

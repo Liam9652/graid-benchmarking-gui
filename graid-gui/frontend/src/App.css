@@ -744,3 +744,193 @@ label .hint {
     grid-template-columns: 1fr;
   }
 }
+/* Status Block Styles */
+.test-status-container {
+  margin: 20px 0;
+  display: flex;
+  justify-content: center;
+  width: 100%;
+}
+
+.status-split-container {
+  display: flex;
+  gap: 20px;
+  width: 100%;
+  max-width: 800px;
+}
+
+.status-box {
+  flex: 1;
+  padding: 25px;
+  border-radius: 8px;
+  color: white;
+  text-align: center;
+  box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  min-height: 120px;
+}
+
+.status-label {
+  font-size: 0.9rem;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  opacity: 0.9;
+  margin-bottom: 8px;
+}
+
+.status-value {
+  font-size: 1.4rem;
+  font-weight: 800;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Colors */
+.status-general-running {
+  background: linear-gradient(135deg, #e74c3c, #c0392b); /* Red for "Benchmarking" action */
+}
+
+.status-stage-pd {
+  background: linear-gradient(135deg, #27ae60, #219150); /* Green for Baseline */
+}
+
+.status-stage-vd {
+  background: linear-gradient(135deg, #2980b9, #3498db); /* Blue for RAID */
+}
+
+.status-stage-init {
+  background: linear-gradient(135deg, #f39c12, #d35400); /* Orange for Init */
+}
+
+.status-idle {
+  background: linear-gradient(135deg, #7f8c8d, #95a5a6); /* Gray for Idle */
+  width: 100%;
+  max-width: 400px;
+}
+
+/* Small Spinner */
+.status-spinner-small {
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  border: 3px solid rgba(255,255,255,0.3);
+  border-radius: 50%;
+  border-top-color: white;
+  animation: spin 1s ease-in-out infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Responsive */
+@media (max-width: 600px) {
+  .status-split-container {
+    flex-direction: column;
+  }
+}
+
+/* CDM View Styles */
+.dashboard-header-toggle {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 20px;
+  gap: 10px;
+}
+
+.view-toggle-btn {
+  padding: 8px 16px;
+  background: white;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 600;
+  color: #666;
+  transition: all 0.2s;
+}
+
+.view-toggle-btn.active {
+  background: var(--primary-color);
+  color: white;
+  border-color: var(--primary-color);
+}
+
+.cdm-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+  max-width: 800px;
+  margin: 0 auto;
+  background: white;
+  padding: 30px;
+  border-radius: 12px;
+  box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+}
+
+.cdm-row {
+  display: flex;
+  gap: 15px;
+  align-items: center;
+}
+
+.cdm-cell {
+  flex: 1;
+  padding: 15px;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-end; /* Align numbers to right like CDM */
+  position: relative;
+  min-height: 100px; /* Increase height */
+  width: 0; /* Fix flex layout */
+}
+
+.label-cell {
+  flex: 0 0 150px; /* Fixed width for labels, increased */
+  background: #f0f0f0;
+  color: #333;
+  font-weight: 700;
+  align-items: center; /* Center label */
+  font-size: 1.1rem;
+  justify-content: center; /* Center vertically */
+  text-align: center;
+}
+
+.value-cell {
+  background: #f8f9fa;
+  border: 1px solid #e9ecef;
+  font-size: 2.5rem; /* Big numbers */
+  font-weight: 800;
+  color: #2c3e50;
+  font-family: 'Roboto Mono', monospace; /* Monospace for alignment */
+}
+
+.value-cell-header {
+  min-height: auto;
+  align-items: center;
+  color: white;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+
+.read-header {
+  background: #2ecc71; /* Green for Read */
+}
+
+.write-header {
+  background: #e74c3c; /* Red for Write */
+}
+
+.unit-label {
+  font-size: 0.8rem;
+  color: #888;
+  font-weight: 500;
+  position: absolute;
+  top: 5px;
+  right: 10px;
+}

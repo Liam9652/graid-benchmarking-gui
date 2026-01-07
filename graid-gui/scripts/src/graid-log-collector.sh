@@ -387,8 +387,13 @@ function check_dependencies() {
         esac
         
         
-        read -p "Do you want to install these tools? (y/n) " -n 1 -r
-        echo
+        if [ "$accept_disclaimer" == "1" ]; then
+             REPLY="y"
+        else
+             read -p "Do you want to install these tools? (y/n) " -n 1 -r
+             echo
+        fi
+
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             echo "Installing dependencies with: $install_command $tools_to_install"
             

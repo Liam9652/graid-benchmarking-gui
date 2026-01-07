@@ -3,13 +3,15 @@
 export LC_ALL=C
 
 LOG_FILE="./output.log"
-exec > >(tee -a "$LOG_FILE") 2>&1
+# exec > >(tee -a "$LOG_FILE") 2>&1
 
 # Check the running shell and re-run with bash if necessary
 if [ "$BASH" != "/bin/bash" ]; then
 	    /bin/bash "$0" "$@"
 	        exit $?
 fi
+
+trap "trap - SIGTERM && kill -- -$$" SIGINT SIGTERM EXIT
 
 
 Help()
@@ -99,6 +101,7 @@ function check_dependencies() {
                             atop) echo "atop";;
                             nvidia-smi) echo "nvidia-smi";;
                             pip3) echo "python3-pip";;
+                            bc) echo "bc";;
                             *) echo "";;
                         esac)
                         if [[ "$name" == "pip3" ]]; then
@@ -115,6 +118,7 @@ function check_dependencies() {
                             atop) echo "atop";;
                             nvidia-smi) echo "nvidia-smi";;
                             pip3) echo "python3-pip";;
+                            bc) echo "bc";;
                             *) echo "";;
                         esac)
                         pack='apt install'
@@ -227,20 +231,28 @@ function get_basic_para() {
     cout=`lscpu | grep ^Core | uniq |  awk '{print $4}'`
     let CPU_JOBS=${socket}*${cout}
 
+    
+    # Load Advanced Configuration
+    if [ -f "graid-bench-advanced.conf" ]; then
+        . graid-bench-advanced.conf
+    fi
+    
     . graid-bench.conf
 
     # Initialize missing variables with defaults if not set in config
-    SCAN=${SCAN:-"false"}
-    LS_JB=${LS_JB:-"false"}
-    LS_BS=${LS_BS:-"false"}
-    LS_CUST=${LS_CUST:-"false"}
-    LS_CS=${LS_CS:-"false"}
-    WCD=${WCD:-"false"}
-    DUMMY=${DUMMY:-"false"}
-    TEMP=${TEMP:-"75"}
+    export SCAN=${SCAN:-"false"}
+    export LS_JB=${LS_JB:-"false"}
+    export LS_BS=${LS_BS:-"false"}
+    export LS_CUST=${LS_CUST:-"false"}
+    export LS_CS=${LS_CS:-"false"}
+    export WCD=${WCD:-"false"}
+    export DUMMY=${DUMMY:-"false"}
+    export TEMP=${TEMP:-"75"}
 
     export CPU_ALLOWED_SEQ="0-$(($CPU_JOBS - 1))"
-    export CPU_ALLOWED_RAND="0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124"
+    if [[ -z "$CPU_ALLOWED_RAND" ]]; then
+        export CPU_ALLOWED_RAND="0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124"
+    fi
     timestamp=$(date '+%Y-%m-%d-%s')
     result="$NVME_INFO-result"
     killall -q atop fio
@@ -305,6 +317,10 @@ main() {
     # mkdir -p $result/$NVME_INFO/vd
     NVME_COUNT=${#NVME_LIST[@]}
     bash src/est_time.sh
+    
+    if [[ $RUN_PD == "true" ]]; then
+        echo "STATUS: STAGE_PD_START"
+    fi
 
     if [[ $RUN_PD == "true" && $RUN_PD_ALL == "false" ]]; then
         for STAG in  "${TS_LS[@]}"; do
@@ -333,6 +349,7 @@ main() {
     fi
 
     if [[ $RUN_VD == "true" ]]; then
+        echo "STATUS: STAGE_VD_START"
         echo $NVME_INFO
         for NVME_DEVICE in "${NVME_LIST[@]}"
             do

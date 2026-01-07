@@ -6,7 +6,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     ports:
-      - "50071:5000"
+      - "50071:50071"
     volumes:
       - ./scripts:/app/scripts
       - ./results:/app/results

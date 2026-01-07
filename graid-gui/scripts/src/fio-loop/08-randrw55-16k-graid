@@ -1,4 +1,5 @@
 [global]
+ramp_time=10
 #filename=/dev/gvd0n1
 time_based=1
 randrepeat=0
