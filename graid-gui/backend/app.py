@@ -518,6 +518,66 @@ def get_result_data(result_name):
                     data.append(row)
             return data
 
+        # Helper to deduce workload from row data
+        def get_workload_name(row):
+            workload = "Unknown"
+            try:
+                # Special Case: Baseline 128k Seq Read -> 1M Sequential Read
+                # User Requirement: use *SingleTest*01-seqread* as baseline for comparison
+                filename_col = row.get('filename', '')
+                if 'SingleTest' in filename_col:
+                    if '01-seqread' in filename_col:
+                        return "1M Sequential Read"
+                    elif '02-seqwrite' in filename_col:
+                        return "1M Sequential Write"
+                
+                # Special Case: 4k Random Read/Write Mix(70/30)
+                if 'randrw73' in filename_col:
+                     return "4k Random Read/Write Mix(70/30)"
+
+                # Parse BlockSize
+                bs_str = row.get('BlockSize', '0')
+                try:
+                    bs_float = float(bs_str)
+                except ValueError:
+                    bs_float = 0.0
+                
+                size_label = ""
+                if bs_float == 4.0:
+                    size_label = "4k"
+                elif bs_float == 1024.0:
+                    size_label = "1M"
+                else:
+                    # Fallback or other sizes
+                    size_label = f"{bs_str}"
+
+                # Parse Type
+                # randread => Random Read 
+                # read => Sequential Read 
+                # randwrite => Random Write
+                # write => Sequential Write
+                row_type = row.get('Type', '').lower()
+                type_label = ""
+                
+                if row_type == 'randread':
+                    type_label = "Random Read"
+                elif row_type == 'read':
+                    type_label = "Sequential Read"
+                elif row_type == 'randwrite':
+                    type_label = "Random Write"
+                elif row_type == 'write':
+                    type_label = "Sequential Write"
+                else:
+                    type_label = row_type # Fallback
+                
+                if size_label and type_label:
+                    workload = f"{size_label} {type_label}"
+                
+            except Exception as e:
+                print(f"Error parsing workload: {e}")
+            
+            return workload
+
         if result_path.is_dir():
             # Search for CSV files recursively
             csv_files = list(result_path.rglob('*.csv'))
@@ -547,33 +607,15 @@ def get_result_data(result_name):
             if not target_csvs and filtered_files:
                 target_csvs = filtered_files
             
-
-
             # Parse all target CSVs and aggregate
             if target_csvs:
                 for csv_file in target_csvs:
                     try:
                         file_data = parse_csv(csv_file)
                         
-                        # Deduce workload from filename
-                        fname = csv_file.name
-                        workload = "Unknown"
-                        if 'randread' in fname:
-                            if '00-' in fname or '4k' in fname or 'BSALL-00' in fname: workload = "4k Random Read"
-                            else: workload = "Random Read"
-                        elif 'randwrite' in fname:
-                            if '09-' in fname or '4k' in fname or 'BSALL-09' in fname: workload = "4k Random Write"
-                            else: workload = "Random Write"
-                        elif 'seqread' in fname:
-                             if '01-' in fname or '1M' in fname or 'BSALL-01' in fname: workload = "1M Sequential Read"
-                             else: workload = "Sequential Read"
-                        elif 'seqwrite' in fname:
-                             if '02-' in fname or '1M' in fname or 'BSALL-02' in fname: workload = "1M Sequential Write"
-                             else: workload = "Sequential Write"
-                        
                         # Add workload to each row
                         for row in file_data:
-                            row['Workload'] = workload
+                            row['Workload'] = get_workload_name(row)
                             
                         # Optional: Add source file info if needed, but schema might need to match
                         csv_data.extend(file_data)
@@ -614,42 +656,8 @@ def get_result_data(result_name):
                         elif req_type == 'graid':
                             if 'RAID' not in filename_col:
                                 continue
-                                
-                        # Inject Workload
-                        workload = "Unknown"
                         
-                        # Helper to check block size if available
-                        bs = row.get('BlockSize', '')
-                        try:
-                            bs_float = float(bs)
-                        except ValueError:
-                            bs_float = 0
-                        
-                        is_4k = bs_float == 4.0
-                        is_1m = bs_float == 1024.0
-                        
-                        if 'randread' in filename_col:
-                            if is_4k or '00-' in filename_col or '4k' in filename_col or 'BSALL-00' in filename_col: 
-                                workload = "4k Random Read"
-                            else: 
-                                workload = "Random Read"
-                        elif 'randwrite' in filename_col:
-                            if is_4k or '09-' in filename_col or '4k' in filename_col or 'BSALL-09' in filename_col:
-                                workload = "4k Random Write"
-                            else: 
-                                workload = "Random Write"
-                        elif 'seqread' in filename_col:
-                             if is_1m or '01-' in filename_col or '1M' in filename_col or 'BSALL-01' in filename_col:
-                                 workload = "1M Sequential Read"
-                             else: 
-                                 workload = "Sequential Read"
-                        elif 'seqwrite' in filename_col:
-                             if is_1m or '02-' in filename_col or '1M' in filename_col or 'BSALL-02' in filename_col:
-                                 workload = "1M Sequential Write"
-                             else: 
-                                 workload = "Sequential Write"
-                        
-                        row['Workload'] = workload
+                        row['Workload'] = get_workload_name(row)
                         csv_data.append(row)
 
                 else:
@@ -670,6 +678,7 @@ def get_result_data(result_name):
                                 for row in reader:
                                     # Very basic fallback, likely won't match the filtering needs perfectly without duplicate logic
                                     # But given user request, the summary file SHOULD exist.
+                                    row['Workload'] = get_workload_name(row)
                                     csv_data.append(row)
 
         return jsonify({'success': True, 'data': csv_data})
