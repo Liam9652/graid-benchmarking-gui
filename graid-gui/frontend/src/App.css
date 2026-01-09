@@ -1414,3 +1414,35 @@ label .hint {
   color: #ecf0f1;
   line-height: 1.6;
 }
+/* Connection & Dependency Styles */
+.connection-message {
+  padding: 10px 15px;
+  border-radius: 4px;
+  font-size: 13px;
+  margin-top: 10px;
+  white-space: pre-wrap;
+}
+
+.connection-message.success {
+  background-color: rgba(39, 174, 96, 0.1);
+  border-left: 3px solid #27ae60;
+  color: #27ae60;
+}
+
+.connection-message.error {
+  background-color: rgba(231, 76, 60, 0.1);
+  border-left: 3px solid #e74c3c;
+  color: #e74c3c;
+}
+
+.dependency-check {
+  background: rgba(255, 255, 255, 0.05);
+  padding: 15px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.dependency-check h4 {
+  color: #fff;
+  opacity: 0.9;
+}

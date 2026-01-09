@@ -1,3 +1,4 @@
+# Build stage
 FROM node:18-alpine AS builder
 
 WORKDIR /app
@@ -11,14 +12,16 @@ COPY public ./public
 
 RUN npm run build
 
-FROM node:18-alpine
+# Production stage
+FROM nginx:alpine
 
-WORKDIR /app
+LABEL maintainer="SupremeRAID Developer" \
+      description="Frontend for GRAID Benchmarking GUI" \
+      version="1.0"
 
-RUN npm install -g serve
-
-COPY --from=builder /app/build ./build
+COPY --from=builder /app/build /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
 
 EXPOSE 3000
 
-CMD ["serve", "-s", "build", "-l", "3000"]
+CMD ["nginx", "-g", "daemon off;"]

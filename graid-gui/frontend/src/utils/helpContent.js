@@ -5,7 +5,8 @@ export const helpContent = {
             sections: [
                 { header: "NVMe 設備選擇", content: "從列表中選擇要用於測試的 NVMe 設備。請注意授權限制（License Limit）。" },
                 { header: "RAID 類型選擇", content: "您可以選擇多個 RAID 級別。系統將針對每個選定的級別運行單獨的測試。" },
-                { header: "高級選項", content: "設置測試狀態（如 Normal/Rebuild）、測試階段以及運行時間等高級參數。" },
+                { header: "高級選項", content: "設置測試階段以及運行時間等高級參數。" },
+                { header: "遠端測試機設定", content: "配置遠端 DUT 連接。請確保使用具備 root 權限的帳號。若非 root 使用者，系統將嘗試使用提供的 SSH 密碼透過 sudo 執行硬體指令。測試前需點擊『Connect』驗證權限並獲取設備資訊。" },
                 { header: "操作提示", content: "修改配置後，請務必點擊『Save Configuration』以保存更改。點擊『Reset』可清除現有的 Graid 資源（VD/DG/PD）。" }
             ]
         },
@@ -40,7 +41,8 @@ export const helpContent = {
             sections: [
                 { header: "NVMe 设备选择", content: "从列表中选择要用于测试的 NVMe 设备。请注意授权限制（License Limit）。" },
                 { header: "RAID 类型选择", content: "您可以选择多个 RAID 级别。系统将针对每个选定的级别运行单独的测试。" },
-                { header: "高级选项", content: "设置测试状态（如 Normal/Rebuild）、测试阶段以及运行时间等高级参数。" },
+                { header: "高级选项", content: "设置测试阶段以及运行时间等高级参数。" },
+                { header: "远端测试机设定", content: "配置远端 DUT 连接。请确保使用具备 root 权限的账号。若非 root 用户，系统将尝试使用提供的 SSH 密码通过 sudo 执行硬件指令。测试前需点击『Connect』验证权限并获取设备信息。" },
                 { header: "操作提示", content: "修改配置后，请务必点击『Save Configuration』以保存更改。点击『Reset』可清除现有的 Graid 资源（VD/DG/PD）。" }
             ]
         },
@@ -75,7 +77,8 @@ export const helpContent = {
             sections: [
                 { header: "NVMe Device Selection", content: "Select NVMe devices from the list for testing. Please note the License Limit." },
                 { header: "RAID Type Selection", content: "You can select multiple RAID levels. The system will run individual tests for each selected level." },
-                { header: "Advanced Options", content: "Set advanced parameters such as test status (e.g., Normal/Rebuild), test stages, and run time." },
+                { header: "Advanced Options", content: "Set advanced parameters such as test stages and run time." },
+                { header: "Remote DUT Setup", content: "Configure remote DUT connection. Ensure you use an account with root privileges. If not root, the system will attempt to use the provided SSH password for sudo. Click 'Connect' to verify and fetch info." },
                 { header: "Operational Tips", content: "After modifying the configuration, be sure to click 'Save Configuration'. Click 'Reset' to clear existing Graid resources (VD/DG/PD)." }
             ]
         },

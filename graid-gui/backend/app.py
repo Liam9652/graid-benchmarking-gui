@@ -19,6 +19,8 @@ import re
 import shlex
 import csv
 import selectors
+import paramiko
+from scp import SCPClient
 
 WORKLOAD_MAP = {
     '00-randread': '4k Random Read',
@@ -55,6 +57,200 @@ giostat_process = None
 giostat_thread = None
 stop_giostat_event = threading.Event()
 
+class RemoteExecutor:
+    """Handles command execution locally or remotely via SSH."""
+    def __init__(self, config=None):
+        self.config = config or {}
+        self.is_remote = self.config.get('REMOTE_MODE', False)
+        self.ssh = None
+        
+    def _get_ssh_client(self):
+        if self.ssh:
+            return self.ssh
+        
+        hostname = self.config.get('DUT_IP')
+        if not hostname:
+            raise ValueError("Remote mode enabled but DUT IP Address is missing in configuration.")
+            
+        username = self.config.get('DUT_USER', 'root')
+        password = self.config.get('DUT_PASSWORD')
+        port = int(self.config.get('DUT_PORT', 22))
+        
+        print(f"DEBUG: Connecting to remote DUT {hostname} as {username}...", flush=True)
+        try:
+            self.ssh = paramiko.SSHClient()
+            self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            self.ssh.connect(hostname, port=port, username=username, password=password, timeout=10)
+            
+            # Check permissions
+            self.is_root = False
+            self.has_sudo = False
+            self.need_sudo_password = False
+            
+            _, stdout, _ = self.ssh.exec_command('id -u')
+            uid = stdout.read().decode().strip()
+            if uid == '0':
+                self.is_root = True
+            else:
+                # 1. Try passwordless sudo first
+                print(f"DEBUG: Checking passwordless sudo for {username}...", flush=True)
+                stdin, stdout, stderr = self.ssh.exec_command('sudo -n id -u')
+                if stdout.channel.recv_exit_status() == 0:
+                    sudo_uid = stdout.read().decode().strip()
+                    if sudo_uid == '0':
+                        self.has_sudo = True
+                
+                # 2. If passwordless fails, try sudo with password if we have one
+                if not self.has_sudo and password:
+                    print(f"DEBUG: Passwordless sudo failed, trying with password for {username}...", flush=True)
+                    # Using sudo -S to read password from stdin
+                    stdin, stdout, stderr = self.ssh.exec_command('sudo -S id -u')
+                    stdin.write(password + '\n')
+                    stdin.flush()
+                    if stdout.channel.recv_exit_status() == 0:
+                        sudo_uid = stdout.read().decode().strip()
+                        if sudo_uid == '0':
+                            self.has_sudo = True
+                            self.need_sudo_password = True
+                            print(f"DEBUG: Sudo with password verified for {username}", flush=True)
+                
+                if not self.has_sudo:
+                    self.ssh.close()
+                    self.ssh = None
+                    raise PermissionError(f"User '{username}' does not have root privileges or sudo access on {hostname}. Hardware control requires root access.")
+            
+            return self.ssh
+        except Exception as e:
+            if self.ssh:
+                try: self.ssh.close()
+                except: pass
+            self.ssh = None
+            print(f"DEBUG: SSH Connection or Permission check failed: {e}", flush=True)
+            raise ConnectionError(f"Failed to connect or verify permissions on remote DUT {hostname}: {str(e)}")
+
+    def run(self, cmd, cwd=None, env=None, capture_output=True, text=True):
+        if not self.is_remote:
+            return subprocess.run(cmd, cwd=cwd, env=env, capture_output=capture_output, text=text)
+        
+        ssh = self._get_ssh_client()
+        password = self.config.get('DUT_PASSWORD')
+        
+        # Prepare command
+        actual_cmd = list(cmd)
+        target_cmd = []
+        if not self.is_root and self.has_sudo:
+            if self.need_sudo_password:
+                target_cmd = ['sudo', '-S'] + actual_cmd
+            else:
+                target_cmd = ['sudo', '-n'] + actual_cmd
+        else:
+            target_cmd = actual_cmd
+            
+        cmd_str = " ".join(shlex.quote(str(c)) for c in target_cmd)
+        if cwd:
+            cmd_str = f"cd {shlex.quote(str(cwd))} && {cmd_str}"
+            
+        stdin, stdout, stderr = ssh.exec_command(cmd_str, environment=env)
+        
+        if self.need_sudo_password and password:
+            stdin.write(password + '\n')
+            stdin.flush()
+            
+        exit_status = stdout.channel.recv_exit_status()
+        
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=exit_status,
+            stdout=stdout.read().decode('utf-8') if text else stdout.read(),
+            stderr=stderr.read().decode('utf-8') if text else stderr.read()
+        )
+
+    def Popen(self, cmd, cwd=None, env=None, **kwargs):
+        if not self.is_remote:
+            return subprocess.Popen(cmd, cwd=cwd, env=env, **kwargs)
+        
+        ssh = self._get_ssh_client()
+        password = self.config.get('DUT_PASSWORD')
+        
+        # Prepare command
+        actual_cmd = list(cmd)
+        target_cmd = []
+        if not self.is_root and self.has_sudo:
+            if self.need_sudo_password:
+                target_cmd = ['sudo', '-S'] + actual_cmd
+            else:
+                target_cmd = ['sudo', '-n'] + actual_cmd
+        else:
+            target_cmd = actual_cmd
+            
+        cmd_str = " ".join(shlex.quote(str(c)) for c in target_cmd)
+        if cwd:
+            cmd_str = f"cd {shlex.quote(str(cwd))} && {cmd_str}"
+            
+        # For remote Popen, we use a different approach since we need to stream output
+        # Paramiko's exec_command returns channels that act like pipes
+        stdin, stdout, stderr = ssh.exec_command(cmd_str, environment=env, get_pty=True)
+        
+        if self.need_sudo_password and password:
+            stdin.write(password + '\n')
+            stdin.flush()
+            
+        class RemoteProcess:
+            def __init__(self, stdin, stdout, stderr):
+                self.stdin = stdin
+                self.stdout = stdout
+                self.stderr = stderr
+                self.returncode = None
+            def poll(self):
+                if self.stdout.channel.exit_status_ready():
+                    self.returncode = self.stdout.channel.recv_exit_status()
+                    return self.returncode
+                return None
+            def wait(self, timeout=None):
+                self.returncode = self.stdout.channel.recv_exit_status()
+                return self.returncode
+            def terminate(self):
+                self.stdout.channel.close()
+            def kill(self):
+                self.stdout.channel.close()
+
+        return RemoteProcess(stdin, stdout, stderr)
+
+    def check_dependencies(self):
+        if not self.is_remote:
+            # Local mode dependencies are assumed to be managed by the container
+            return {"success": True, "dependencies": {}}
+            
+        deps = ['fio', 'jq', 'nvme', 'bc', 'python3', 'graidctl']
+        results = {}
+        for dep in deps:
+            res = self.run(['which', dep], capture_output=True)
+            results[dep] = res.returncode == 0
+        
+        # Check pandas
+        res = self.run(['python3', '-c', 'import pandas; print(True)'], capture_output=True)
+        results['pandas'] = res.returncode == 0
+        
+        return results
+
+    def sync_to_remote(self, local_path, remote_path):
+        if not self.is_remote:
+            return
+        ssh = self._get_ssh_client()
+        with SCPClient(ssh.get_transport()) as scp:
+            scp.put(local_path, remote_path, recursive=True)
+
+    def sync_from_remote(self, remote_path, local_path):
+        if not self.is_remote:
+            return
+        ssh = self._get_ssh_client()
+        with SCPClient(ssh.get_transport()) as scp:
+            scp.get(remote_path, local_path, recursive=True)
+
+    def __del__(self):
+        if self.ssh:
+            self.ssh.close()
+
 class ConfigManager:
     @staticmethod
     def load_config():
@@ -86,10 +282,22 @@ class BenchmarkManager:
         global benchmark_running, benchmark_process
         try:
             ConfigManager.save_config(config)
+            executor = RemoteExecutor(config)
             benchmark_running = True
             
             # Start giostat monitoring
-            start_giostat_monitoring(session_id)
+            start_giostat_monitoring(session_id, executor)
+
+            # Sync scripts to remote if in remote mode
+            if executor.is_remote:
+                socketio.emit('status', {
+                    'status': 'syncing',
+                    'message': 'Syncing scripts to remote DUT...',
+                    'timestamp': datetime.now().isoformat()
+                }, room=session_id)
+                # Ensure remote SCRIPT_DIR exists
+                executor.run(['mkdir', '-p', str(SCRIPT_DIR)])
+                executor.sync_to_remote(str(SCRIPT_DIR), str(SCRIPT_DIR.parent))
 
             # Convert JSON config to Bash format
             target_config = SCRIPT_DIR / "graid-bench.conf"
@@ -105,6 +313,10 @@ class BenchmarkManager:
                     else:
                         f.write(f'{key}="{value}"\n')
             
+            # Sync generated config to remote
+            if executor.is_remote:
+                executor.sync_to_remote(str(target_config), str(target_config))
+
             socketio.emit('status', {
                 'status': 'started',
                 'message': 'Benchmark started',
@@ -131,7 +343,7 @@ class BenchmarkManager:
             total_est_seconds = 0
             try:
                 est_cmd = ['bash', str(SCRIPT_DIR / 'est_time.sh')]
-                result = subprocess.run(est_cmd, cwd=str(SCRIPT_DIR), env=env, capture_output=True, text=True)
+                result = executor.run(est_cmd, cwd=str(SCRIPT_DIR), env=env)
                 if result.returncode == 0:
                     # Parse "Estimated Completion Time: 00:00:15 (dd:hh:mm)"
                     match = re.search(r'Estimated Completion Time: (\d+):(\d+):(\d+)', result.stdout)
@@ -146,7 +358,7 @@ class BenchmarkManager:
 
             # Open log file for writing
             with open(log_file, 'w') as log:
-                self.process = subprocess.Popen(
+                self.process = executor.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
                     cwd=str(SCRIPT_DIR), env=env, text=True, bufsize=1
                 )
@@ -301,16 +513,24 @@ class BenchmarkManager:
                 'timestamp': datetime.now().isoformat()
             }, room=session_id)
         finally:
+            if executor.is_remote:
+                # Sync results and logs back from remote
+                try:
+                    executor.sync_from_remote(str(RESULTS_DIR), str(RESULTS_DIR.parent))
+                    executor.sync_from_remote(str(LOGS_DIR), str(LOGS_DIR.parent))
+                except Exception as e:
+                    print(f"Error syncing back results: {e}", flush=True)
+
             benchmark_running = False
             stop_giostat_monitoring()
 
 
 benchmark_manager = BenchmarkManager()
 
-def start_giostat_monitoring(session_id):
+def start_giostat_monitoring(session_id, executor=None):
     global giostat_thread, stop_giostat_event
     stop_giostat_event.clear()
-    giostat_thread = threading.Thread(target=monitor_giostat, args=(session_id,))
+    giostat_thread = threading.Thread(target=monitor_giostat, args=(session_id, executor))
     giostat_thread.daemon = True
     giostat_thread.start()
 
@@ -318,12 +538,15 @@ def stop_giostat_monitoring():
     global stop_giostat_event
     stop_giostat_event.set()
 
-def monitor_giostat(session_id):
+def monitor_giostat(session_id, executor=None):
     global giostat_process
     try:
+        if executor is None:
+            executor = RemoteExecutor(ConfigManager.load_config())
+            
         # Run giostat -xmcd 1
         cmd = ['giostat', '-xmcd', '1']
-        giostat_process = subprocess.Popen(
+        giostat_process = executor.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
         )
         
@@ -371,17 +594,26 @@ def update_config():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-@app.route('/api/system-info', methods=['GET'])
+@app.route('/api/system-info', methods=['GET', 'POST'])
 def get_system_info():
     try:
         cpu_count = psutil.cpu_count(logical=False)
         cpu_freq = psutil.cpu_freq()
         memory = psutil.virtual_memory()
         
+        config = None
+        if request.method == 'POST':
+            config = request.json.get('config')
+            
+        if not config:
+            config = ConfigManager.load_config()
+            
+        executor = RemoteExecutor(config)
+        
         # Get NVMe info via graidctl
         nvme_info = []
         try:
-            result = subprocess.run(['graidctl', 'ls', 'nd', '--format', 'json'], capture_output=True, text=True)
+            result = executor.run(['graidctl', 'ls', 'nd', '--format', 'json'], capture_output=True, text=True)
             if result.returncode == 0:
                 stdout = result.stdout.strip()
                 # Find the start of the JSON object
@@ -394,7 +626,7 @@ def get_system_info():
         # Get Controller info via graidctl
         controller_info = []
         try:
-            result = subprocess.run(['graidctl', 'ls', 'cx', '--format', 'json'], capture_output=True, text=True)
+            result = executor.run(['graidctl', 'ls', 'cx', '--format', 'json'], capture_output=True, text=True)
             if result.returncode == 0:
                 stdout = result.stdout.strip()
                 # Find the start of the JSON object
@@ -419,12 +651,20 @@ def get_system_info():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-@app.route('/api/license-info', methods=['GET'])
+@app.route('/api/license-info', methods=['GET', 'POST'])
 def get_license_info():
     try:
+        config = None
+        if request.method == 'POST':
+            config = request.json.get('config')
+            
+        if not config:
+            config = ConfigManager.load_config()
+            
+        executor = RemoteExecutor(config)
         license_info = {}
         try:
-            result = subprocess.run(['graidctl', 'desc', 'lic', '--format', 'json'], capture_output=True, text=True)
+            result = executor.run(['graidctl', 'desc', 'lic', '--format', 'json'], capture_output=True, text=True)
             if result.returncode == 0:
                 stdout = result.stdout.strip()
                 # Find the start of the JSON object
@@ -435,6 +675,69 @@ def get_license_info():
             print(f"Error getting license info: {e}")
 
         return jsonify({'success': True, 'data': license_info})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/benchmark/test-connection', methods=['POST'])
+def test_connection():
+    try:
+        data = request.json
+        config = request.json.get('config')
+        if not config:
+            return jsonify({'success': False, 'error': 'No configuration provided'}), 400
+            
+        executor = RemoteExecutor(config)
+        # Test basic connection and permission
+        res = executor.run(['echo', 'success'], capture_output=True, text=True)
+        if res.returncode == 0:
+            # Also check dependencies
+            dep_results = executor.check_dependencies()
+            missing = [d for d, present in dep_results.items() if not present]
+            
+            msg = 'Connection established and permissions verified.'
+            if missing:
+                msg += f" However, some dependencies are missing: {', '.join(missing)}. Please run 'Setup DUT' to install them."
+                
+            return jsonify({
+                'success': True, 
+                'message': msg,
+                'dependencies': dep_results
+            })
+        else:
+            return jsonify({'success': False, 'error': f"Connection test failed: {res.stderr}"})
+            
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/benchmark/setup-dut', methods=['POST'])
+def setup_dut():
+    try:
+        config = request.json.get('config')
+        if not config:
+            return jsonify({'success': False, 'error': 'No configuration provided'}), 400
+            
+        executor = RemoteExecutor(config)
+        if not executor.is_remote:
+            return jsonify({'success': False, 'error': 'Target is local. No remote setup needed.'})
+
+        # 1. Sync setup_env.sh to remote
+        setup_script_path = os.path.join(os.path.dirname(__file__), 'scripts', 'setup_env.sh')
+        if not os.path.exists(setup_script_path):
+             return jsonify({'success': False, 'error': f'Setup script not found on host at {setup_script_path}.'})
+             
+        executor.run(['mkdir', '-p', '/tmp/graid-setup'])
+        executor.sync_to_remote(setup_script_path, '/tmp/graid-setup/setup_env.sh')
+        
+        # 2. Run setup_env.sh --dut-mode
+        # We use Popen-like behavior or just run with a long timeout
+        res = executor.run(['bash', '/tmp/graid-setup/setup_env.sh', '--dut-mode'], capture_output=True, text=True)
+        
+        if res.returncode == 0:
+            return jsonify({'success': True, 'message': 'Remote DUT environment setup successfully.', 'details': res.stdout})
+        else:
+            return jsonify({'success': False, 'error': f"Setup failed: {res.stderr}", 'details': res.stdout})
+
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -477,14 +780,23 @@ def parse_graidctl_json(output):
     return json.loads(json_str)
 
 
-@app.route('/api/graid/check', methods=['GET'])
+@app.route('/api/graid/check', methods=['GET', 'POST'])
 def check_graid_resources():
     try:
         has_resources = False
         findings = []
         
+        config = None
+        if request.method == 'POST':
+            config = request.json.get('config')
+            
+        if not config:
+            config = ConfigManager.load_config()
+            
+        executor = RemoteExecutor(config)
+        
         # Check VDs
-        res = subprocess.run(['graidctl', 'ls', 'vd', '--format', 'json'], capture_output=True, text=True)
+        res = executor.run(['graidctl', 'ls', 'vd', '--format', 'json'], capture_output=True, text=True)
         if res.returncode == 0:
             vds = parse_graidctl_json(res.stdout).get('Result', [])
             if vds:
@@ -492,7 +804,7 @@ def check_graid_resources():
                 findings.append(f"{len(vds)} VDs")
         
         # Check DGs
-        res = subprocess.run(['graidctl', 'ls', 'dg', '--format', 'json'], capture_output=True, text=True)
+        res = executor.run(['graidctl', 'ls', 'dg', '--format', 'json'], capture_output=True, text=True)
         if res.returncode == 0:
             dgs = parse_graidctl_json(res.stdout).get('Result', [])
             if dgs:
@@ -500,7 +812,7 @@ def check_graid_resources():
                 findings.append(f"{len(dgs)} DGs")
 
         # Check PDs
-        res = subprocess.run(['graidctl', 'ls', 'pd', '--format', 'json'], capture_output=True, text=True)
+        res = executor.run(['graidctl', 'ls', 'pd', '--format', 'json'], capture_output=True, text=True)
         if res.returncode == 0:
             pds = parse_graidctl_json(res.stdout).get('Result', [])
             if pds:
@@ -519,12 +831,20 @@ def reset_graid_resources():
         return jsonify({'success': False, 'error': 'Cannot reset while benchmark is running'}), 400
         
     try:
+        config = None
+        if request.json:
+            config = request.json.get('config')
+            
+        if not config:
+            config = ConfigManager.load_config()
+            
+        executor = RemoteExecutor(config)
         results = []
         print("DEBUG: Starting Graid resources reset...", flush=True)
         
         # 1. Delete VDs
         print("DEBUG: Checking VDs...", flush=True)
-        res_vd = subprocess.run(['graidctl', 'ls', 'vd', '--format', 'json'], capture_output=True, text=True)
+        res_vd = executor.run(['graidctl', 'ls', 'vd', '--format', 'json'], capture_output=True, text=True)
         if res_vd.returncode == 0:
             try:
                 vds = parse_graidctl_json(res_vd.stdout).get('Result', [])
@@ -535,7 +855,7 @@ def reset_graid_resources():
                     if dg_id is not None and vd_id is not None:
                         cmd = ['graidctl', 'del', 'vd', str(dg_id), str(vd_id), '--confirm-to-delete']
                         print(f"DEBUG: Executing: {' '.join(cmd)}", flush=True)
-                        del_res = subprocess.run(cmd, capture_output=True, text=True)
+                        del_res = executor.run(cmd, capture_output=True, text=True)
                         print(f"DEBUG: VD Delete output: stdout='{del_res.stdout.strip()}', stderr='{del_res.stderr.strip()}'", flush=True)
                         results.append(f"Deleted VD {vd_id} in DG {dg_id}")
             except Exception as e:
@@ -543,7 +863,7 @@ def reset_graid_resources():
 
         # 2. Delete DGs
         print("DEBUG: Checking DGs...", flush=True)
-        res_dg = subprocess.run(['graidctl', 'ls', 'dg', '--format', 'json'], capture_output=True, text=True)
+        res_dg = executor.run(['graidctl', 'ls', 'dg', '--format', 'json'], capture_output=True, text=True)
         if res_dg.returncode == 0:
             try:
                 dgs = parse_graidctl_json(res_dg.stdout).get('Result', [])
@@ -553,7 +873,7 @@ def reset_graid_resources():
                     if dg_id is not None:
                         cmd = ['graidctl', 'del', 'dg', str(dg_id), '--confirm-to-delete']
                         print(f"DEBUG: Executing: {' '.join(cmd)}", flush=True)
-                        del_res = subprocess.run(cmd, capture_output=True, text=True)
+                        del_res = executor.run(cmd, capture_output=True, text=True)
                         print(f"DEBUG: DG Delete output: stdout='{del_res.stdout.strip()}', stderr='{del_res.stderr.strip()}'", flush=True)
                         results.append(f"Deleted DG {dg_id}")
             except Exception as e:
@@ -561,7 +881,7 @@ def reset_graid_resources():
 
         # 3. Delete PDs
         print("DEBUG: Checking PDs...", flush=True)
-        res_pd = subprocess.run(['graidctl', 'ls', 'pd', '--format', 'json'], capture_output=True, text=True)
+        res_pd = executor.run(['graidctl', 'ls', 'pd', '--format', 'json'], capture_output=True, text=True)
         if res_pd.returncode == 0:
             try:
                 pds = parse_graidctl_json(res_pd.stdout).get('Result', [])
@@ -574,7 +894,7 @@ def reset_graid_resources():
                         pd_range = f"{min_pd}-{max_pd}"
                         cmd = ['graidctl', 'del', 'pd', pd_range]
                         print(f"DEBUG: Executing: {' '.join(cmd)}", flush=True)
-                        del_res = subprocess.run(cmd, capture_output=True, text=True)
+                        del_res = executor.run(cmd, capture_output=True, text=True)
                         print(f"DEBUG: PD Delete output: stdout='{del_res.stdout.strip()}', stderr='{del_res.stderr.strip()}'", flush=True)
                         results.append(f"Deleted PDs in range {pd_range}")
             except Exception as e:

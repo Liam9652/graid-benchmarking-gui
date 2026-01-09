@@ -12,7 +12,35 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# --- Non-interactive Mode ---
+export DEBIAN_FRONTEND=noninteractive
+
 echo -e "${GREEN}Starting SupremeRAID Benchmarking Environment Setup...${NC}"
+
+# --- Argument Parsing ---
+SKIP_DOCKER=false
+DUT_MODE=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --skip-docker)
+            SKIP_DOCKER=true
+            shift
+            ;;
+        --dut-mode)
+            DUT_MODE=true
+            SKIP_DOCKER=true
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+if [[ "$DUT_MODE" == "true" ]]; then
+    echo -e "${YELLOW}Running in DUT Mode: Only benchmarking dependencies will be installed.${NC}"
+fi
 
 # --- Root Check ---
 if [[ $EUID -ne 0 ]]; then
@@ -63,63 +91,71 @@ SYS_DEPS="fio jq nvme-cli atop bc python3-pip sg3-utils lsof curl wget git"
 install_pkg $SYS_DEPS
 
 # --- 2. Install Docker & Docker Compose ---
-if ! command -v docker &> /dev/null; then
-    echo -e "${YELLOW}Installing Docker...${NC}"
-    case $DISTRO in
-        ubuntu|debian)
-            curl -fsSL https://get.docker.com -o get-docker.sh
-            sh get-docker.sh
-            rm get-docker.sh
-            ;;
-        centos|rhel|almalinux|rocky|ol)
-            curl -fsSL https://get.docker.com -o get-docker.sh
-            sh get-docker.sh
-            rm get-docker.sh
-            ;;
-        *)
-            echo -e "${RED}Please install Docker manually for $DISTRO${NC}"
-            ;;
-    esac
-    systemctl enable --now docker
-else
-    echo -e "${GREEN}Docker is already installed.${NC}"
-fi
+if [[ "$SKIP_DOCKER" == "false" ]]; then
+    if ! command -v docker &> /dev/null; then
+        echo -e "${YELLOW}Installing Docker...${NC}"
+        case $DISTRO in
+            ubuntu|debian)
+                curl -fsSL https://get.docker.com -o get-docker.sh
+                sh get-docker.sh
+                rm get-docker.sh
+                ;;
+            centos|rhel|almalinux|rocky|ol)
+                curl -fsSL https://get.docker.com -o get-docker.sh
+                sh get-docker.sh
+                rm get-docker.sh
+                ;;
+            *)
+                echo -e "${RED}Please install Docker manually for $DISTRO${NC}"
+                ;;
+        esac
+        systemctl enable --now docker
+    else
+        echo -e "${GREEN}Docker is already installed.${NC}"
+    fi
 
-# Install Docker Compose (plugin) if missing
-if ! docker compose version &> /dev/null; then
-    echo -e "${YELLOW}Installing Docker Compose Plugin...${NC}"
-    install_pkg docker-compose-plugin || echo -e "${YELLOW}Warning: Could not install docker-compose-plugin via package manager. Trying manual download...${NC}"
+    # Install Docker Compose (plugin) if missing
+    if ! docker compose version &> /dev/null; then
+        echo -e "${YELLOW}Installing Docker Compose Plugin...${NC}"
+        install_pkg docker-compose-plugin || echo -e "${YELLOW}Warning: Could not install docker-compose-plugin via package manager. Trying manual download...${NC}"
+    fi
+else
+    echo -e "${YELLOW}Skipping Docker and Docker Compose installation.${NC}"
 fi
 
 # --- 3. Install NVIDIA Container Toolkit ---
-if lspci | grep -i nvidia &> /dev/null; then
-    echo -e "${GREEN}NVIDIA GPU detected. Installing NVIDIA Container Toolkit...${NC}"
-    if ! command -v nvidia-ctk &> /dev/null; then
-        case $DISTRO in
-            ubuntu|debian)
-                curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-                curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-                    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#' | \
-                    tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-                apt-get update
-                apt-get install -y nvidia-container-toolkit
-                ;;
-            centos|rhel|almalinux|rocky|ol)
-                curl -s -L https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo | \
-                    tee /etc/yum.repos.d/nvidia-container-toolkit.repo
-                yum install -y nvidia-container-toolkit
-                ;;
-            *)
-                echo -e "${RED}Please install NVIDIA Container Toolkit manually for $DISTRO${NC}"
-                ;;
-        esac
-        nvidia-ctk runtime configure --runtime=docker
-        systemctl restart docker
+if [[ "$SKIP_DOCKER" == "false" ]]; then
+    if lspci | grep -i nvidia &> /dev/null; then
+        echo -e "${GREEN}NVIDIA GPU detected. Installing NVIDIA Container Toolkit...${NC}"
+        if ! command -v nvidia-ctk &> /dev/null; then
+            case $DISTRO in
+                ubuntu|debian)
+                    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+                    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+                        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#' | \
+                        tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+                    apt-get update
+                    apt-get install -y nvidia-container-toolkit
+                    ;;
+                centos|rhel|almalinux|rocky|ol)
+                    curl -s -L https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo | \
+                        tee /etc/yum.repos.d/nvidia-container-toolkit.repo
+                    yum install -y nvidia-container-toolkit
+                    ;;
+                *)
+                    echo -e "${RED}Please install NVIDIA Container Toolkit manually for $DISTRO${NC}"
+                    ;;
+            esac
+            nvidia-ctk runtime configure --runtime=docker
+            systemctl restart docker
+        else
+            echo -e "${GREEN}NVIDIA Container Toolkit is already installed.${NC}"
+        fi
     else
-        echo -e "${GREEN}NVIDIA Container Toolkit is already installed.${NC}"
+        echo -e "${YELLOW}No NVIDIA GPU detected. Skipping NVIDIA Container Toolkit installation.${NC}"
     fi
 else
-    echo -e "${YELLOW}No NVIDIA GPU detected. Skipping NVIDIA Container Toolkit installation.${NC}"
+    echo -e "${YELLOW}Skipping NVIDIA Container Toolkit (Docker-only) in DUT mode.${NC}"
 fi
 
 # --- 4. Install Python Dependencies ---
@@ -148,16 +184,20 @@ for cmd in fio nvme jq docker python3 pip3 bc; do
 done
 
 # --- 6. Deploy with Docker Compose ---
-echo -e "\n${YELLOW}Deploying SupremeRAID Benchmarking GUI...${NC}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PARENT_DIR="$(dirname "$SCRIPT_DIR")"
+if [[ "$SKIP_DOCKER" == "false" ]]; then
+    echo -e "\n${YELLOW}Deploying SupremeRAID Benchmarking GUI...${NC}"
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    PARENT_DIR="$(dirname "$SCRIPT_DIR")"
 
-if [[ -f "$PARENT_DIR/docker-compose.yml" ]]; then
-    cd "$PARENT_DIR"
-    echo -e "${YELLOW}Running 'docker compose up --build -d' in $PARENT_DIR...${NC}"
-    docker compose up --build -d
+    if [[ -f "$PARENT_DIR/docker-compose.yml" ]]; then
+        cd "$PARENT_DIR"
+        echo -e "${YELLOW}Running 'docker compose up --build -d' in $PARENT_DIR...${NC}"
+        docker compose up --build -d
+    else
+        echo -e "${RED}Error: docker-compose.yml not found in $PARENT_DIR${NC}"
+    fi
 else
-    echo -e "${RED}Error: docker-compose.yml not found in $PARENT_DIR${NC}"
+    echo -e "\n${YELLOW}Skipping SupremeRAID Benchmarking GUI deployment.${NC}"
 fi
 
 # --- 7. Final Instructions ---

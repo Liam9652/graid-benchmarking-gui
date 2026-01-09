@@ -2,6 +2,7 @@ version: "3.8"
 
 services:
   backend:
+    # Change to image: your-account/graid-bench-backend:v1.0 after push
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -12,17 +13,21 @@ services:
       - ./results:/app/results
       - ./logs:/app/logs
       - ./graid-bench.conf:/app/graid-bench.conf
+      # Access to host /dev is required for RAID and NVMe operations
       - /dev:/dev
     environment:
       - FLASK_ENV=production
       - PYTHONUNBUFFERED=1
     networks:
       - graid-network
+    # Privileged is necessary to manage hardware RAID and NVMe devices
     privileged: true
+    # pid: host is necessary for tools like atop to monitor host processes
     pid: "host"
     restart: unless-stopped
 
   frontend:
+    # Change to image: your-account/graid-bench-frontend:v1.0 after push
     build:
       context: ./frontend
       dockerfile: Dockerfile

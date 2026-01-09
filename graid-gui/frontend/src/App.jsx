@@ -104,6 +104,7 @@ function App() {
   const [showAdvancedLog, setShowAdvancedLog] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [galleryFilters, setGalleryFilters] = useState({ raid: 'All', status: 'All', type: 'All' });
+  const [connectionStatus, setConnectionStatus] = useState({ loading: false, success: null, message: '', dependencies: null });
   const logEndRef = React.useRef(null);
 
   useEffect(() => {
@@ -210,9 +211,12 @@ function App() {
     });
   }, [systemInfo.controller_info]);
 
-  const loadSystemInfo = async () => {
+  const loadSystemInfo = async (cfg = null) => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/api/system-info`);
+      const currentCfg = cfg || configRefObj.current;
+      const response = await axios.post(`${API_BASE_URL}/api/system-info`, {
+        config: currentCfg
+      });
       if (response.data.success) {
         setSystemInfo(response.data.data);
       }
@@ -221,9 +225,12 @@ function App() {
     }
   };
 
-  const loadLicenseInfo = async () => {
+  const loadLicenseInfo = async (cfg = null) => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/api/license-info`);
+      const currentCfg = cfg || configRefObj.current;
+      const response = await axios.post(`${API_BASE_URL}/api/license-info`, {
+        config: currentCfg
+      });
       if (response.data.success) {
         setLicenseInfo(response.data.data);
       }
@@ -442,6 +449,65 @@ function App() {
     }
   };
 
+  const handleTestConnection = async () => {
+    try {
+      setConnectionStatus({ loading: true, success: null, message: '' });
+      const response = await fetch(`${API_BASE_URL}/api/benchmark/test-connection`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config })
+      });
+      const data = await response.json();
+
+      if (data.success) {
+        setConnectionStatus({
+          loading: false,
+          success: true,
+          message: data.message,
+          dependencies: data.dependencies
+        });
+        // Success! Reload info from the remote DUT
+        await loadSystemInfo(config);
+        await loadLicenseInfo(config);
+      } else {
+        setConnectionStatus({ loading: false, success: false, message: data.error });
+      }
+    } catch (error) {
+      setConnectionStatus({ loading: false, success: false, message: error.message });
+    }
+  };
+
+  const handleSetupDUT = async () => {
+    try {
+      setConnectionStatus(prev => ({ ...prev, loading: true, message: 'Installing dependencies on DUT...' }));
+      const response = await fetch(`${API_BASE_URL}/api/benchmark/setup-dut`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config })
+      });
+      const data = await response.json();
+
+      if (data.success) {
+        setConnectionStatus(prev => ({
+          loading: false,
+          success: true,
+          message: 'Setup complete! Re-testing connection...',
+          dependencies: null
+        }));
+        // Re-test to refresh dependency list
+        setTimeout(handleTestConnection, 1000);
+      } else {
+        setConnectionStatus(prev => ({
+          loading: false,
+          success: false,
+          message: `Setup failed: ${data.error}`
+        }));
+      }
+    } catch (error) {
+      setConnectionStatus({ loading: false, success: false, message: error.message });
+    }
+  };
+
   const loadResults = async () => {
     try {
       const response = await axios.get(`${API_BASE_URL}/api/results`);
@@ -513,7 +579,14 @@ function App() {
         const firstDev = systemInfo.nvme_info.find(d => d.DevPath.includes(value[0]));
         if (firstDev) newConfig.NVME_INFO = firstDev.Model.replace(/\s+/g, '-');
       }
-      configRef.current = newConfig; // Update ref
+      configRefObj.current = newConfig; // Update ref
+
+      // Trigger info reload if switching back to local mode
+      if (key === 'REMOTE_MODE' && value === false) {
+        loadSystemInfo(newConfig);
+        loadLicenseInfo(newConfig);
+      }
+
       return newConfig;
     });
     setValidationErrors([]); // 清除验证错误
@@ -636,7 +709,10 @@ function App() {
   const handleResetConfig = async () => {
     try {
       setStatus('🔍 Checking Graid resources...');
-      const checkRes = await axios.get(`${API_BASE_URL}/api/graid/check`);
+      // Use POST to pass current config (including unsaved remote settings)
+      const checkRes = await axios.post(`${API_BASE_URL}/api/graid/check`, {
+        config: config
+      });
 
       if (checkRes.data.success) {
         if (!checkRes.data.has_resources) {
@@ -655,10 +731,12 @@ function App() {
         if (confirmReset) {
           setIsResetting(true); // Set resetting state to true
           setStatus('♻️ Resetting Graid resources...');
-          const resetRes = await axios.post(`${API_BASE_URL}/api/graid/reset`);
+          const resetRes = await axios.post(`${API_BASE_URL}/api/graid/reset`, {
+            config: config
+          });
           if (resetRes.data.success) {
             setStatus('✅ Graid resources cleared successfully');
-            loadSystemInfo(); // Refresh device lists
+            loadSystemInfo(config); // Refresh device lists with current config
             setTimeout(() => setStatus(''), 3000);
           }
           setIsResetting(false); // Reset state after completion
@@ -863,6 +941,115 @@ function App() {
               })()}
 
               <div className="config-form">
+                {/* 0. Target Machine Setup */}
+                <div className="config-section">
+                  <h3>🖥️ Target Machine Setup</h3>
+                  <p className="section-desc">Configure where the benchmark should run (Local or Remote DUT).</p>
+                  <div className="form-group">
+                    <label className="switch-label">
+                      <input
+                        type="checkbox"
+                        checked={config.REMOTE_MODE === true}
+                        onChange={(e) => handleConfigChange('REMOTE_MODE', e.target.checked)}
+                      />
+                      Enable Remote DUT Mode
+                    </label>
+                  </div>
+
+                  {config.REMOTE_MODE && (
+                    <div className="remote-setup-grid grid-2-cols" style={{ marginTop: '15px', background: 'rgba(255,255,255,0.03)', padding: '15px', borderRadius: '8px' }}>
+                      <div className="form-group">
+                        <label>DUT IP Address:</label>
+                        <input
+                          type="text"
+                          placeholder="e.g. 192.168.1.100"
+                          value={config.DUT_IP || ''}
+                          onChange={(e) => handleConfigChange('DUT_IP', e.target.value)}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>SSH Port:</label>
+                        <input
+                          type="number"
+                          placeholder="22"
+                          value={config.DUT_PORT || 22}
+                          onChange={(e) => handleConfigChange('DUT_PORT', parseInt(e.target.value))}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>SSH User:</label>
+                        <input
+                          type="text"
+                          placeholder="root"
+                          value={config.DUT_USER || 'root'}
+                          onChange={(e) => handleConfigChange('DUT_USER', e.target.value)}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>SSH Password:</label>
+                        <input
+                          type="password"
+                          placeholder="Leave empty if using SSH Keys"
+                          value={config.DUT_PASSWORD || ''}
+                          onChange={(e) => handleConfigChange('DUT_PASSWORD', e.target.value)}
+                        />
+                      </div>
+                      <div className="form-group" style={{ gridColumn: 'span 2', display: 'flex', gap: '10px' }}>
+                        <button
+                          className="btn btn-secondary"
+                          onClick={handleTestConnection}
+                          style={{ flex: 1 }}
+                          disabled={connectionStatus.loading}
+                        >
+                          {connectionStatus.loading ? '⏳ Connecting...' : '🔗 Connect'}
+                        </button>
+                      </div>
+
+                      {connectionStatus.message && (
+                        <div className={`connection-message ${connectionStatus.success ? 'success' : 'error'}`} style={{ gridColumn: 'span 2' }}>
+                          {connectionStatus.message}
+                        </div>
+                      )}
+
+                      {connectionStatus.dependencies && (
+                        <div className="dependency-check" style={{ gridColumn: 'span 2', marginTop: '10px' }}>
+                          <h4 style={{ fontSize: '14px', marginBottom: '8px' }}>📦 Dependency Check:</h4>
+                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px' }}>
+                            {Object.entries(connectionStatus.dependencies).map(([dep, present]) => (
+                              <div key={dep} style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '13px' }}>
+                                <span>{present ? '✅' : '❌'}</span>
+                                <span style={{ color: present ? '#fff' : '#ff4d4f' }}>{dep}</span>
+                              </div>
+                            ))}
+                          </div>
+                          {Object.values(connectionStatus.dependencies).some(v => v === false) && (
+                            <div style={{ marginTop: '15px', padding: '10px', background: 'rgba(24, 144, 255, 0.1)', borderRadius: '4px', border: '1px solid rgba(24, 144, 255, 0.2)' }}>
+                              <p style={{ fontSize: '12px', marginBottom: '10px', color: '#1890ff' }}>
+                                Some dependencies are missing on the remote DUT. You can automatically install them using the button below.
+                              </p>
+                              <button
+                                className="btn btn-primary"
+                                onClick={handleSetupDUT}
+                                disabled={connectionStatus.loading}
+                                style={{ width: '100%' }}
+                              >
+                                {connectionStatus.loading ? '⏳ Setting up...' : '🚀 Setup Remote DUT (Bootstrap)'}
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {!connectionStatus.success && (
+                        <div className="form-group" style={{ gridColumn: 'span 2' }}>
+                          <p style={{ fontSize: '12px', color: '#888', fontStyle: 'italic' }}>
+                            Note: Ensure the host machine (backend container) can reach the DUT via SSH.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
                 {/* 1. NVMe Device Selection */}
                 <div className="config-section">
                   <div className="section-header-row">
