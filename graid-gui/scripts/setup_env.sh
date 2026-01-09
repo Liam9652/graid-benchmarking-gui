@@ -48,22 +48,63 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-# --- Distribution Detection ---
-if [ -f /etc/os-release ]; then
+# --- OS & Mode Detection ---
+OS_TYPE=$(uname -s)
+HOST_MODE=false
+
+if [[ "$OS_TYPE" == "Darwin" ]]; then
+    echo -e "${YELLOW}macOS detected. Enabling Host Mode (Client/Viewer only).${NC}"
+    HOST_MODE=true
+    SKIP_DOCKER=true
+    DISTRO="macos"
+elif [ -f /etc/os-release ]; then
     . /etc/os-release
     DISTRO=$ID
     DISTRO_VERSION=$VERSION_ID
+    
+    echo -e "${YELLOW}Detected Distribution: $NAME ($DISTRO $DISTRO_VERSION)${NC}"
+
+    # Check for SupremeRAID™ Driver/Hardware
+    HAS_GRAID=false
+    if command -v graidctl &> /dev/null; then
+        HAS_GRAID=true
+    elif command -v lsmod &> /dev/null && lsmod | grep -E "graid|nvme_graid" &> /dev/null; then
+        HAS_GRAID=true
+    fi
+
+    if [[ "$HAS_GRAID" == "false" && "$DUT_MODE" == "false" ]]; then
+        echo -e "${YELLOW}SupremeRAID™ driver not detected. Enabling Host Mode.${NC}"
+        HOST_MODE=true
+        SKIP_DOCKER=true
+    else
+        echo -e "${GREEN}SupremeRAID™ environment detected.${NC}"
+    fi
+
 else
     echo -e "${RED}Error: /etc/os-release not found. Cannot determine distribution.${NC}"
     exit 1
 fi
 
-echo -e "${YELLOW}Detected Distribution: $NAME ($DISTRO $DISTRO_VERSION)${NC}"
+if [[ "$HOST_MODE" == "true" ]]; then
+    echo -e "${YELLOW}Running in HOST MODE: Skipping Docker and Driver checks. Installing minimal dependencies.${NC}"
+fi
 
 # --- Helper Functions ---
 install_pkg() {
     local pkgs=$@
-    echo -e "${YELLOW}Installing system packages: $pkgs...${NC}"
+    echo -e "${YELLOW}Installing packages: $pkgs...${NC}"
+    
+    if [[ "$DISTRO" == "macos" ]]; then
+        if command -v brew &> /dev/null; then
+            for pkg in $pkgs; do
+                brew install $pkg || echo -e "${YELLOW}Brew failed to install $pkg (might be already installed or named differently)${NC}"
+            done
+        else
+            echo -e "${RED}Homebrew not found. Please install Homebrew or manually install packages: $pkgs${NC}"
+        fi
+        return
+    fi
+
     case $DISTRO in
         ubuntu|debian)
             apt-get update
@@ -87,7 +128,17 @@ install_pkg() {
 }
 
 # --- 1. Install System Dependencies ---
-SYS_DEPS="fio jq nvme-cli atop bc python3-pip sg3-utils lsof curl wget git"
+# --- 1. Install System Dependencies ---
+if [[ "$HOST_MODE" == "true" ]]; then
+    # Minimal deps for Host Mode
+    if [[ "$DISTRO" == "macos" ]]; then
+        SYS_DEPS="python3 node git" 
+    else
+        SYS_DEPS="python3-pip git curl"
+    fi
+else
+    SYS_DEPS="fio jq nvme-cli atop bc python3-pip sg3-utils lsof curl wget git"
+fi
 install_pkg $SYS_DEPS
 
 # --- 2. Install Docker & Docker Compose ---
@@ -173,6 +224,12 @@ if [[ -f "src/requirements.txt" ]]; then
     $PIP_CMD install $PIP_OPTS -r src/requirements.txt || echo -e "${RED}Warning: Failed to install dependencies from src/requirements.txt${NC}"
 fi
 
+# Install Backend requirements for Host Mode
+if [[ "$HOST_MODE" == "true" ]] && [[ -f "../backend/requirements.txt" ]]; then
+    echo -e "${YELLOW}Installing Backend requirements...${NC}"
+    $PIP_CMD install $PIP_OPTS -r ../backend/requirements.txt || echo -e "${RED}Warning: Failed to install backend requirements.${NC}"
+fi
+
 # --- 5. Verify Installation ---
 echo -e "\n${GREEN}--- Verification Summary ---${NC}"
 for cmd in fio nvme jq docker python3 pip3 bc; do
@@ -206,8 +263,18 @@ if [[ -z "$IP_ADDR" ]]; then
     IP_ADDR="localhost"
 fi
 
-echo -e "\n${GREEN}Environment setup and deployment complete!${NC}"
-echo -e "${GREEN}You can access the SupremeRAID Benchmarking GUI at:${NC}"
-echo -e "${YELLOW}http://${IP_ADDR}:50072${NC}"
-echo -e "\n${YELLOW}Note: If you are a non-root user, you may need to run 'sudo usermod -aG docker \$USER' and re-login to use Docker without sudo.${NC}"
-echo -e "${YELLOW}Note: Please ensure 'graidctl' and SupremeRAID driver/license are installed separately.${NC}"
+echo -e "\n${GREEN}Environment setup complete!${NC}"
+
+if [[ "$HOST_MODE" == "true" ]]; then
+    echo -e "${GREEN}Running in Host Mode.${NC}"
+    echo -e "\nTo start the Backend:"
+    echo -e "${YELLOW}  cd ../backend && python3 app.py${NC}"
+    echo -e "\nTo start the Frontend (if needed):"
+    echo -e "${YELLOW}  cd ../frontend && npm install && npm start${NC}"
+    echo -e "\nSee README_HOST_MODE.md for more details."
+else
+    echo -e "${GREEN}You can access the SupremeRAID Benchmarking GUI at:${NC}"
+    echo -e "${YELLOW}http://${IP_ADDR}:50072${NC}"
+    echo -e "\n${YELLOW}Note: If you are a non-root user, you may need to run 'sudo usermod -aG docker \$USER' and re-login to use Docker without sudo.${NC}"
+    echo -e "${YELLOW}Note: Please ensure 'graidctl' and SupremeRAID driver/license are installed separately.${NC}"
+fi
