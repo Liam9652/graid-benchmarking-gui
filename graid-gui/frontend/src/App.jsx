@@ -5,8 +5,11 @@ import './App.css';
 import io from 'socket.io-client';
 import RealTimeDashboard from './components/RealTimeDashboard';
 import ComparisonDashboard from './components/ComparisonDashboard';
+import TheoreticalCalculator from './components/TheoreticalCalculator';
+import HelpButton from './components/HelpButton';
+import { helpContent } from './utils/helpContent';
 
-const API_BASE_URL = 'http://localhost:50071';
+const API_BASE_URL = `http://${window.location.hostname}:50071`;
 
 const HIDDEN_PARAMS = [
   'storcli_command',
@@ -80,16 +83,28 @@ function App() {
   const [benchmarkRunning, setBenchmarkRunning] = useState(false);
   const [status, setStatus] = useState('');
   const [currentStage, setCurrentStage] = useState(null); // { stage: 'PD'|'VD', label: '...' }
+  const [runStatus, setRunStatus] = useState('BENCHMARKING');
+  const [progress, setProgress] = useState({ percentage: 0, elapsed: 0, remaining: 0, current_step: 0, total_steps: 0 });
   const [error, setError] = useState('');
   const [validationErrors, setValidationErrors] = useState([]);
   const [results, setResults] = useState([]);
   const [socket, setSocket] = useState(null);
   const [realTimeData, setRealTimeData] = useState([]);
   const [selectedResults, setSelectedResults] = useState([]);
-  const [comparisonData, setComparisonData] = useState({ baseline: null, graid: null });
+  const [comparisonData, setComparisonData] = useState({ baseline: null, graid: null, baselineMetadata: null, graidMetadata: null });
+  const [loadingResults, setLoadingResults] = useState(false);
+  const [reportImages, setReportImages] = useState([]);
+  const [activeResultTab, setActiveResultTab] = useState('dashboard'); // 'dashboard' or 'gallery'
   const [systemInfo, setSystemInfo] = useState({ nvme_info: [], controller_info: [] });
+  const [language, setLanguage] = useState('TW');
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [activeDevices, setActiveDevices] = useState(new Set());
+  const [licenseInfo, setLicenseInfo] = useState({});
+  const [advancedLogs, setAdvancedLogs] = useState([]);
+  const [showAdvancedLog, setShowAdvancedLog] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
+  const [galleryFilters, setGalleryFilters] = useState({ raid: 'All', status: 'All', type: 'All' });
+  const logEndRef = React.useRef(null);
 
   useEffect(() => {
     const newSocket = io(API_BASE_URL);
@@ -111,11 +126,21 @@ function App() {
         setCurrentStage({ stage: 'INIT', label: 'Initializing...' });
         setRealTimeData([]); // Clear old data
         setActiveDevices(new Set()); // Clear old devices
+        setProgress({ percentage: 0, elapsed: 0, remaining: 0, current_step: 0, total_steps: 0 });
+        setRunStatus('BENCHMARKING');
       }
+    });
+
+    newSocket.on('progress_update', (data) => {
+      setProgress(data);
     });
 
     newSocket.on('status_update', (data) => {
       setCurrentStage({ stage: data.stage, label: data.label });
+    });
+
+    newSocket.on('run_status_update', (data) => {
+      setRunStatus(data.status.toUpperCase());
     });
 
     newSocket.on('giostat_data', (data) => {
@@ -128,12 +153,45 @@ function App() {
       handleSnapshot(data);
     });
 
+    newSocket.on('bench_log', (data) => {
+      setAdvancedLogs(prev => {
+        const newLogs = [...prev, data.line];
+        return newLogs.slice(-20); // Keep last 20 lines (tail -n 20)
+      });
+    });
+
     loadConfig();
     loadSystemInfo();
+    loadLicenseInfo();
     checkBenchmarkStatus();
 
     return () => newSocket.close();
   }, []);
+
+  // Real-time countdown for remaining time
+  useEffect(() => {
+    let timer;
+    if (benchmarkRunning) {
+      timer = setInterval(() => {
+        setProgress(prev => {
+          if (prev.remaining > 0) {
+            return {
+              ...prev,
+              elapsed: prev.elapsed + 1,
+              remaining: prev.remaining - 1
+            };
+          }
+          return {
+            ...prev,
+            elapsed: prev.elapsed + 1
+          };
+        });
+      }, 1000);
+    }
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [benchmarkRunning]);
 
   // Set default values for controller and VD name
   useEffect(() => {
@@ -160,6 +218,17 @@ function App() {
       }
     } catch (err) {
       console.error('Loading system info failed:', err);
+    }
+  };
+
+  const loadLicenseInfo = async () => {
+    try {
+      const response = await axios.get(`${API_BASE_URL}/api/license-info`);
+      if (response.data.success) {
+        setLicenseInfo(response.data.data);
+      }
+    } catch (err) {
+      console.error('Loading license info failed:', err);
     }
   };
 
@@ -293,6 +362,9 @@ function App() {
       const response = await axios.get(`${API_BASE_URL}/api/benchmark/status`);
       if (response.data.success) {
         setBenchmarkRunning(response.data.data.running);
+        if (response.data.data.running && response.data.data.progress) {
+          setProgress(response.data.data.progress);
+        }
       }
     } catch (err) {
       console.error('Checking benchmark status failed:', err);
@@ -309,6 +381,13 @@ function App() {
         processed[key] = processed[key].split(',').map(s => s.trim()).filter(s => s);
       }
     });
+
+    // Auto-sync LS_JB
+    const qdCount = (processed.QD_LS || []).length;
+    const pdJobsCount = (processed.pd_jobs || []).length;
+    if (qdCount > 1 || pdJobsCount > 1) {
+      processed.LS_JB = "true";
+    }
 
     // Sanitize NVME_LIST against currently detected devices
     if (systemInfo.nvme_info.length > 0) {
@@ -335,6 +414,7 @@ function App() {
     }
 
     try {
+      setAdvancedLogs([]); // Clear logs when starting
       const response = await axios.post(`${API_BASE_URL}/api/benchmark/start`, {
         config: processedConfig
       });
@@ -378,7 +458,8 @@ function App() {
       // 1. Ensure we are on the Benchmark tab
       setActiveTab('benchmark');
 
-      // 2. Force "Report View" (cdm)
+      // 2. Force "Report View" (cdm) and hide Audit Log
+      setShowAdvancedLog(false);
       setActiveViewMode('cdm');
 
       // 3. Wait for React to render the new view
@@ -441,6 +522,17 @@ function App() {
   const toggleSelection = (key, value) => {
     setConfig(prev => {
       const current = Array.isArray(prev[key]) ? prev[key] : [];
+
+      // License check for NVME_LIST
+      if (key === 'NVME_LIST' && !current.includes(value)) {
+        const maxLimit = getMaxPdLimit();
+        if (current.length >= maxLimit) {
+          setStatus(`⚠️ Cannot select more than ${maxLimit} devices (License Limit).`);
+          setTimeout(() => setStatus(''), 3000);
+          return prev;
+        }
+      }
+
       const next = current.includes(value)
         ? current.filter(v => v !== value)
         : [...current, value];
@@ -464,6 +556,33 @@ function App() {
       return newConfig;
     });
     setValidationErrors([]);
+  };
+
+  const getMaxPdLimit = () => {
+    // Check both 'Features' and 'features' for robust dictionary access
+    const features = licenseInfo.Features || licenseInfo.features || {};
+    return parseInt(features['NVMe/NVMe-oFPDNumber']) ||
+      parseInt(features['NVMe/NVMe-oFPDNumbe']) || 999;
+  };
+
+  const handleSelectAllToggle = () => {
+    const maxLimit = getMaxPdLimit();
+    const allDevices = systemInfo.nvme_info.map(d => d.DevPath.split('/').pop());
+    const currentSelected = config.NVME_LIST || [];
+
+    // If all possible are already selected, deselect all
+    if (currentSelected.length === Math.min(allDevices.length, maxLimit)) {
+      handleConfigChange('NVME_LIST', []);
+      return;
+    }
+
+    // Otherwise, select up to limit
+    const toSelect = allDevices.slice(0, maxLimit);
+    if (toSelect.length < allDevices.length) {
+      setStatus(`⚠️ License limit reached: Selected top ${maxLimit} devices.`);
+      setTimeout(() => setStatus(''), 3000);
+    }
+    handleConfigChange('NVME_LIST', toSelect);
   };
 
   const handleArrayChange = (key, value) => {
@@ -514,52 +633,147 @@ function App() {
     }
   };
 
-  const handleResultSelect = (type, value) => {
-    const newSelection = [...selectedResults];
-    if (type === 'baseline') newSelection[0] = value;
-    else newSelection[1] = value;
-    setSelectedResults(newSelection);
+  const handleResetConfig = async () => {
+    try {
+      setStatus('🔍 Checking Graid resources...');
+      const checkRes = await axios.get(`${API_BASE_URL}/api/graid/check`);
+
+      if (checkRes.data.success) {
+        if (!checkRes.data.has_resources) {
+          setStatus('✅ No Graid resources found to reset.');
+          setTimeout(() => setStatus(''), 3000);
+          return;
+        }
+
+        const findings = checkRes.data.findings.join(', ');
+        const confirmReset = window.confirm(
+          `⚠️ WARNING: Existing Graid resources found (${findings}).\n\n` +
+          `This will delete ALL Virtual Disks, Drive Groups, and Physical Disk configurations.\n` +
+          `Are you sure you want to proceed with the reset?`
+        );
+
+        if (confirmReset) {
+          setIsResetting(true); // Set resetting state to true
+          setStatus('♻️ Resetting Graid resources...');
+          const resetRes = await axios.post(`${API_BASE_URL}/api/graid/reset`);
+          if (resetRes.data.success) {
+            setStatus('✅ Graid resources cleared successfully');
+            loadSystemInfo(); // Refresh device lists
+            setTimeout(() => setStatus(''), 3000);
+          }
+          setIsResetting(false); // Reset state after completion
+        } else {
+          setStatus('Reset cancelled.');
+          setTimeout(() => setStatus(''), 2000);
+        }
+      }
+    } catch (err) {
+      setIsResetting(false); // Reset state on error
+      setError('❌ Reset failed: ' + (err.response?.data?.error || err.message));
+    }
+  };
+
+  const handleResultSelect = (name) => {
+    setSelectedResults([name]);
+    setComparisonData({ baseline: null, graid: null, baselineMetadata: null, graidMetadata: null });
+    setReportImages([]); // Clear images when selecting a new result
+    setActiveResultTab('dashboard'); // Reset to dashboard view
   };
 
   const loadComparisonData = async () => {
-    if (!selectedResults[0] || !selectedResults[1]) {
-      setError('Please select two results to compare');
+    if (!selectedResults[0]) {
+      setError('Please select a result to view');
       return;
     }
 
-    try {
-      // Fetch data for both results
-      // We assume the backend has an endpoint to get the parsed CSV data
-      // If not, we might need to fetch the CSV file and parse it here.
-      // Let's assume we added an endpoint /api/results/:name/data
+    const resultName = selectedResults[0];
+    setLoadingResults(true);
+    setError('');
 
-      const [res1, res2] = await Promise.all([
-        axios.get(`${API_BASE_URL}/api/results/${selectedResults[0]}/data?type=baseline`),
-        axios.get(`${API_BASE_URL}/api/results/${selectedResults[1]}/data?type=graid`)
+    try {
+      const [res1, res2, resImg] = await Promise.all([
+        axios.get(`${API_BASE_URL}/api/results/${resultName}/data?type=baseline`),
+        axios.get(`${API_BASE_URL}/api/results/${resultName}/data?type=graid`),
+        axios.get(`${API_BASE_URL}/api/results/${resultName}/images`)
       ]);
 
-      if (res1.data.success && res2.data.success) {
+      if (resImg.data.success) {
+        setReportImages(resImg.data.images);
+      }
+
+      // Baseline is optional now, graid is required for a valid view
+      if (res2.data.success) {
+        // Metadata extraction helper
+        // Metadata extraction helper
+        const extractMetadata = (resultData, resultName) => {
+          if (resultData && resultData.length > 0) {
+            const row = resultData[0];
+            // Try to use CSV columns if available and valid
+            if (row.RAID_type && row.PD_count) {
+              return {
+                raidType: row.RAID_type,
+                pdCount: parseInt(row.PD_count) || 12
+              };
+            }
+          }
+
+          // Fallback to parsing filename
+          const parts = resultName.split('-');
+          const raidPart = parts.find(p => p.startsWith('RAID'));
+          const pdPart = parts.find(p => p.endsWith('PD'));
+          return {
+            raidType: raidPart || 'RAID0',
+            pdCount: pdPart ? parseInt(pdPart.replace('PD', '')) : 12
+          };
+        };
+
+        // Extract metadata from both results
+        const baselineMetadata = res1.data.success ? extractMetadata(res1.data.data, resultName) : null;
+        const graidMetadata = extractMetadata(res2.data.data, resultName);
+
         setComparisonData({
-          baseline: res1.data.data,
-          graid: res2.data.data
+          baseline: res1.data.success ? res1.data.data : null,
+          graid: res2.data.data,
+          baselineMetadata,
+          graidMetadata
         });
         setError('');
+      } else {
+        setError('Failed to load comparison data: ' + (res1.data.error || res2.data.error || 'Unknown backend error'));
       }
     } catch (err) {
       setError('Failed to load comparison data: ' + err.message);
+    } finally {
+      setLoadingResults(false);
     }
+  };
+
+  const formatTime = (seconds) => {
+    if (isNaN(seconds) || seconds < 0) return '??:??:??';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
   return (
     <div className="app">
       <header className="app-header">
         <h1>🚀 SupremeRAID Benchmark Web GUI</h1>
-        <div className="header-status">
-          {benchmarkRunning ? (
-            <span className="status-running">● Running</span>
-          ) : (
-            <span className="status-idle">● Standby</span>
-          )}
+        <div className="header-controls">
+          <div className="header-status">
+            {benchmarkRunning ? (
+              <span className="status-running">● Running</span>
+            ) : (
+              <span className="status-idle">● Standby</span>
+            )}
+          </div>
+          <HelpButton
+            title={helpContent[language][activeTab]?.title || "Help"}
+            content={helpContent[language][activeTab] || { sections: [] }}
+            language={language}
+            setLanguage={setLanguage}
+          />
         </div>
       </header>
 
@@ -611,6 +825,12 @@ function App() {
           >
             💾 Result
           </button>
+          <button
+            className={`tab-button ${activeTab === 'calculator' ? 'active' : ''}`}
+            onClick={() => setActiveTab('calculator')}
+          >
+            🧮 Calculator
+          </button>
         </div>
 
         <div className="tab-content">
@@ -621,6 +841,7 @@ function App() {
                 <div className="config-actions-top">
                   <button className="btn btn-primary" onClick={saveConfig}>💾 Save</button>
                   <button className="btn btn-secondary" onClick={loadConfig}>🔄 Reload</button>
+                  <button className="btn btn-danger" onClick={handleResetConfig} title="Clear existing VD/DG/PD configurations">♻️ Reset</button>
                 </div>
               </div>
 
@@ -644,13 +865,28 @@ function App() {
               <div className="config-form">
                 {/* 1. NVMe Device Selection */}
                 <div className="config-section">
-                  <h3>💽 NVMe Device List</h3>
-                  <p className="section-desc">Select the NVMe devices you want to include in the benchmark.</p>
+                  <div className="section-header-row">
+                    <h3>💽 NVMe Device List ({
+                      (config.NVME_LIST || []).filter(dev =>
+                        systemInfo.nvme_info.some(sysDev => sysDev.DevPath.endsWith(dev))
+                      ).length
+                    } selected)</h3>
+                  </div>
+                  <p className="section-desc">
+                    Select device (License Limit: {getMaxPdLimit()} PDs)
+                  </p>
                   <div className="nd-scanner">
                     <table>
                       <thead>
                         <tr>
-                          <th>Selected</th>
+                          <th>
+                            <input
+                              type="checkbox"
+                              checked={(config.NVME_LIST || []).length > 0 && (config.NVME_LIST || []).length === Math.min(systemInfo.nvme_info.length, getMaxPdLimit())}
+                              onChange={handleSelectAllToggle}
+                              title="Select All (respects license limit)"
+                            />
+                          </th>
                           <th>Device</th>
                           <th>Model</th>
                           <th>Capacity</th>
@@ -864,10 +1100,16 @@ function App() {
               <div className="test-status-container">
                 {benchmarkRunning ? (
                   <div className="status-split-container">
-                    <div className="status-box status-general-running">
+                    <div className={`status-box ${runStatus === 'NORMAL' ? 'status-normal' :
+                      runStatus === 'REBUILD' ? 'status-rebuild' :
+                        runStatus === 'DISCARD' ? 'status-discard' :
+                          runStatus === 'PRECONDITIONING' ? 'status-precondition' :
+                            runStatus === 'SUSTAINING' ? 'status-sustaining' :
+                              'status-general-running'
+                      }`}>
                       <div className="status-label">RUN STATUS</div>
                       <div className="status-value">
-                        BENCHMARKING
+                        {runStatus}
                         <div className="status-spinner-small"></div>
                       </div>
                     </div>
@@ -883,6 +1125,26 @@ function App() {
                   </div>
                 )}
               </div>
+
+              {benchmarkRunning && (
+                <div className="progress-section">
+                  <div className="progress-info">
+                    <div className="progress-text">
+                      <span>Total Progress: {progress.percentage}% ({progress.current_step}/{progress.total_steps})</span>
+                    </div>
+                    <div className="progress-time">
+                      <span>Elapsed: {formatTime(progress.elapsed)}</span>
+                      <span>Remaining: {formatTime(progress.remaining)}</span>
+                    </div>
+                  </div>
+                  <div className="progress-bar-container">
+                    <div
+                      className="progress-bar-fill"
+                      style={{ width: `${progress.percentage}%` }}
+                    ></div>
+                  </div>
+                </div>
+              )}
               <div className="control-buttons">
                 <button
                   className="btn btn-success"
@@ -901,69 +1163,220 @@ function App() {
               </div>
 
               <div className="realtime-dashboard">
-                <h3>Real-time Monitor</h3>
-                <RealTimeDashboard
-                  data={realTimeData}
-                  devices={Array.from(activeDevices)}
-                  viewMode={activeViewMode}
-                  setViewMode={setActiveViewMode}
-                />
+                <div className="section-header-row">
+                  <h3>Real-time Monitor</h3>
+                  <div className="dashboard-header-toggle">
+                    <button
+                      className={`view-toggle-btn ${!showAdvancedLog && activeViewMode === 'chart' ? 'active' : ''}`}
+                      onClick={() => {
+                        setShowAdvancedLog(false);
+                        setActiveViewMode('chart');
+                      }}
+                    >
+                      Chart View
+                    </button>
+                    <button
+                      className={`view-toggle-btn ${!showAdvancedLog && activeViewMode === 'cdm' ? 'active' : ''}`}
+                      onClick={() => {
+                        setShowAdvancedLog(false);
+                        setActiveViewMode('cdm');
+                      }}
+                    >
+                      Report View
+                    </button>
+                    <button
+                      className={`view-toggle-btn ${showAdvancedLog ? 'active' : ''}`}
+                      onClick={() => setShowAdvancedLog(true)}
+                    >
+                      Audit Log
+                    </button>
+                  </div>
+                </div>
+
+                {showAdvancedLog && (
+                  <div className="advanced-log-container">
+                    <div className="section-header-row">
+                      <h4 style={{ margin: '0 0 10px 0' }}>Audit Log</h4>
+                    </div>
+                    <pre className="log-viewer">
+                      {advancedLogs.map((log, i) => (
+                        <div key={i} className="log-line">{log}</div>
+                      ))}
+                      <div ref={logEndRef} />
+                    </pre>
+                  </div>
+                )}
+
+                {!showAdvancedLog && (
+                  <RealTimeDashboard
+                    data={realTimeData}
+                    devices={Array.from(activeDevices)}
+                    viewMode={activeViewMode}
+                    setViewMode={setActiveViewMode}
+                  />
+                )}
               </div>
             </div>
+          )}
+
+
+
+          {activeTab === 'calculator' && (
+            <TheoreticalCalculator language={language} />
           )}
 
           {activeTab === 'results' && (
             <div className="results-panel">
               <h2>Test Results</h2>
 
-              <div className="comparison-controls">
-                <h3>Compare Results</h3>
-                <div className="selection-group">
+              <div className="section-header-row" style={{ alignItems: 'center', gap: '15px' }}>
+                <h3>Result Comparison</h3>
+                <div className="selection-group" style={{ display: 'flex', alignItems: 'center', gap: '10px', flex: 1 }}>
                   <select
-                    onChange={(e) => handleResultSelect('baseline', e.target.value)}
+                    className="form-select"
+                    onChange={(e) => handleResultSelect(e.target.value)}
                     value={selectedResults[0] || ''}
+                    style={{ flex: 1, minWidth: '300px' }}
                   >
-                    <option value="">Select Baseline (e.g. PD)</option>
-                    {results.map((r, i) => (
-                      <option key={i} value={r.name}>{r.name}</option>
+                    <option value="">-- Select Result --</option>
+                    {results.sort((a, b) => b.name.localeCompare(a.name)).map((r, i) => (
+                      <option key={i} value={r.name}>{r.name} ({r.created})</option>
                     ))}
                   </select>
 
-                  <select
-                    onChange={(e) => handleResultSelect('graid', e.target.value)}
-                    value={selectedResults[1] || ''}
+                  <button
+                    className="btn btn-primary"
+                    onClick={loadComparisonData}
+                    disabled={loadingResults || !selectedResults[0]}
                   >
-                    <option value="">Select Graid (e.g. VD)</option>
-                    {results.map((r, i) => (
-                      <option key={i} value={r.name}>{r.name}</option>
-                    ))}
-                  </select>
-
-                  <button className="btn btn-primary" onClick={loadComparisonData}>
-                    Compare
+                    {loadingResults ? 'Loading...' : '📊 Generate Comparison'}
                   </button>
+
+                  {selectedResults[0] && (
+                    <button
+                      className="btn btn-success"
+                      onClick={() => window.open(`${API_BASE_URL}/api/results/${selectedResults[0]}/download`, '_blank')}
+                      title="Download full result archive (.tar)"
+                    >
+                      ⬇️ Download
+                    </button>
+                  )}
                 </div>
 
-                {comparisonData.baseline && comparisonData.graid && (
-                  <ComparisonDashboard
-                    baselineData={comparisonData.baseline}
-                    graidData={comparisonData.graid}
-                  />
+                {comparisonData.graid && (
+                  <button
+                    className={`btn ${activeResultTab === 'gallery' ? 'btn-primary' : 'btn-secondary'}`}
+                    onClick={() => setActiveResultTab(activeResultTab === 'dashboard' ? 'gallery' : 'dashboard')}
+                  >
+                    {activeResultTab === 'gallery' ? '📊 Dashboard' : '🖼️ Gallery'}
+                  </button>
                 )}
               </div>
 
-              <h3>All Results</h3>
-              {results.length === 0 ? (
-                <p className="empty-message">No results found</p>
-              ) : (
-                <div className="results-list">
-                  {results.map((result, idx) => (
-                    <div key={idx} className="result-item">
-                      <h3>{result.name}</h3>
-                      <p>Testing Time: {result.created}</p>
-                      <p>Files: {result.files ? result.files.length : 'N/A'}</p>
+              {loadingResults && (
+                <div className="loading-overlay">
+                  <div className="loader"></div>
+                  <p>Processing result data and images...</p>
+                </div>
+              )}
+
+              {comparisonData.graid && !loadingResults && (
+                <div className="result-view-container" style={{ marginTop: '20px' }}>
+                  {activeResultTab === 'dashboard' ? (
+                    <ComparisonDashboard
+                      baselineData={comparisonData.baseline}
+                      graidData={comparisonData.graid}
+                      baselineMetadata={comparisonData.baselineMetadata}
+                      graidMetadata={comparisonData.graidMetadata}
+                    />
+                  ) : (
+                    <div className="report-gallery">
+                      <div className="section-header-row" style={{ alignItems: 'flex-start', flexWrap: 'wrap', gap: '20px' }}>
+                        <div style={{ flex: 1 }}>
+                          <h3>Report View Gallery</h3>
+                          <div className="gallery-stats">
+                            {reportImages.filter(img => {
+                              const matchRaid = galleryFilters.raid === 'All' || img.tags.raid === galleryFilters.raid;
+                              const matchStatus = galleryFilters.status === 'All' || img.tags.status === galleryFilters.status;
+                              const matchType = galleryFilters.type === 'All' || img.tags.category === galleryFilters.type;
+                              return matchRaid && matchStatus && matchType;
+                            }).length} of {reportImages.length} images visible
+                          </div>
+                        </div>
+
+                        <div className="gallery-filters" style={{ display: 'flex', gap: '10px', background: 'rgba(255,255,255,0.05)', padding: '10px', borderRadius: '8px' }}>
+                          <div className="filter-group">
+                            <label style={{ fontSize: '10px', display: 'block', color: '#888' }}>RAID</label>
+                            <select
+                              className="form-select"
+                              style={{ fontSize: '12px', padding: '4px 8px' }}
+                              value={galleryFilters.raid}
+                              onChange={(e) => setGalleryFilters(prev => ({ ...prev, raid: e.target.value }))}
+                            >
+                              <option value="All">All RAID</option>
+                              {Array.from(new Set(reportImages.map(img => img.tags.raid))).sort().map(r => <option key={r} value={r}>{r}</option>)}
+                            </select>
+                          </div>
+                          <div className="filter-group">
+                            <label style={{ fontSize: '10px', display: 'block', color: '#888' }}>STATUS</label>
+                            <select
+                              className="form-select"
+                              style={{ fontSize: '12px', padding: '4px 8px' }}
+                              value={galleryFilters.status}
+                              onChange={(e) => setGalleryFilters(prev => ({ ...prev, status: e.target.value }))}
+                            >
+                              <option value="All">All Status</option>
+                              {Array.from(new Set(reportImages.map(img => img.tags.status))).sort().map(s => <option key={s} value={s}>{s}</option>)}
+                            </select>
+                          </div>
+                          <div className="filter-group">
+                            <label style={{ fontSize: '10px', display: 'block', color: '#888' }}>TYPE</label>
+                            <select
+                              className="form-select"
+                              style={{ fontSize: '12px', padding: '4px 8px' }}
+                              value={galleryFilters.type}
+                              onChange={(e) => setGalleryFilters(prev => ({ ...prev, type: e.target.value }))}
+                            >
+                              <option value="All">All Type</option>
+                              <option value="VD">VD (SupremeRAID)</option>
+                              <option value="PD">PD (Baseline)</option>
+                            </select>
+                          </div>
+                        </div>
+                      </div>
+
+                      {reportImages.length === 0 ? (
+                        <div className="empty-message" style={{ textAlign: 'center', padding: '40px' }}>
+                          No report images found in this result.
+                        </div>
+                      ) : (
+                        <div className="gallery-grid">
+                          {reportImages.filter(img => {
+                            const matchRaid = galleryFilters.raid === 'All' || img.tags.raid === galleryFilters.raid;
+                            const matchStatus = galleryFilters.status === 'All' || img.tags.status === galleryFilters.status;
+                            const matchType = galleryFilters.type === 'All' || img.tags.category === galleryFilters.type;
+                            return matchRaid && matchStatus && matchType;
+                          }).map((img, idx) => (
+                            <div key={idx} className="gallery-item">
+                              <img
+                                src={`${API_BASE_URL}${img.url}`}
+                                alt={img.name}
+                                loading="lazy"
+                                onClick={() => window.open(`${API_BASE_URL}${img.url}`, '_blank')}
+                              />
+                              <div className="image-tags">
+                                <span className={`tag tag-cat tag-${img.tags.category.toLowerCase()}`}>{img.tags.category}</span>
+                                <span className="tag tag-raid">{img.tags.raid}</span>
+                                <span className="tag tag-status">{img.tags.status}</span>
+                                <span className="tag tag-workload">{img.tags.workload}</span>
+                                <span className="tag tag-bs">{img.tags.bs}</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
-                  ))}
+                  )}
                 </div>
               )}
             </div>
@@ -974,6 +1387,18 @@ function App() {
       <footer className="app-footer">
         <p>SupremeRAID Benchmark Web GUI v1.0.0 | API: {API_BASE_URL}</p>
       </footer>
+
+      {
+        isResetting && (
+          <div className="reset-overlay">
+            <div className="reset-content">
+              <div className="reset-spinner"></div>
+              <h3>Resetting Graid Configuration</h3>
+              <p>Please wait while existing resources (VDs, DGs, PDs) are being deleted...</p>
+            </div>
+          </div>
+        )
+      }
     </div >
   );
 }

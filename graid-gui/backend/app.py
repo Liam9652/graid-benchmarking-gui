@@ -43,9 +43,11 @@ CONFIG_FILE = BASE_DIR / "graid-bench.conf"
 SCRIPT_DIR = BASE_DIR / "scripts"
 RESULTS_DIR = BASE_DIR / "results"
 LOGS_DIR = BASE_DIR / "logs"
+CACHE_DIR = RESULTS_DIR / ".cache"
 
 RESULTS_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 benchmark_process = None
 benchmark_running = False
@@ -72,6 +74,13 @@ class BenchmarkManager:
     def __init__(self):
         self.process = None
         self.running = False
+        self.latest_progress = {
+            'percentage': 0,
+            'elapsed': 0,
+            'remaining': 0,
+            'current_step': 0,
+            'total_steps': 0
+        }
 
     def run_benchmark(self, config, session_id):
         global benchmark_running, benchmark_process
@@ -102,6 +111,14 @@ class BenchmarkManager:
                 'timestamp': datetime.now().isoformat()
             }, room=session_id)
 
+            self.latest_progress = {
+                'percentage': 0,
+                'elapsed': 0,
+                'remaining': 0,
+                'current_step': 0,
+                'total_steps': 0
+            }
+
             log_file = LOGS_DIR / f"benchmark_{int(time.time())}.log"
             cmd = ['bash', str(SCRIPT_DIR / 'graid-bench.sh')]
 
@@ -109,6 +126,23 @@ class BenchmarkManager:
             env = os.environ.copy()
             venv_bin = BASE_DIR / 'venv' / 'bin'
             env['PATH'] = str(venv_bin) + os.pathsep + env['PATH']
+
+            # Get total estimated time
+            total_est_seconds = 0
+            try:
+                est_cmd = ['bash', str(SCRIPT_DIR / 'est_time.sh')]
+                result = subprocess.run(est_cmd, cwd=str(SCRIPT_DIR), env=env, capture_output=True, text=True)
+                if result.returncode == 0:
+                    # Parse "Estimated Completion Time: 00:00:15 (dd:hh:mm)"
+                    match = re.search(r'Estimated Completion Time: (\d+):(\d+):(\d+)', result.stdout)
+                    if match:
+                        days, hours, minutes = map(int, match.groups())
+                        total_est_seconds = days * 86400 + hours * 3600 + minutes * 60
+                        print(f"DEBUG: Total estimated seconds: {total_est_seconds}", flush=True)
+            except Exception as e:
+                print(f"Error getting estimated time: {e}", flush=True)
+
+            start_time = time.time()
 
             # Open log file for writing
             with open(log_file, 'w') as log:
@@ -119,6 +153,8 @@ class BenchmarkManager:
                 benchmark_process = self.process
                 
                 current_base_label = "Initializing..."
+                self.current_step = 0
+                self.total_steps = 0
 
                 # Use selectors for non-blocking I/O
                 sel = selectors.DefaultSelector()
@@ -137,6 +173,9 @@ class BenchmarkManager:
                         log.write(line)
                         log.flush() # Ensure it's written immediately
                         
+                        # Emit raw log line to frontend for Advanced Mode
+                        socketio.emit('bench_log', {'line': line}, room=session_id)
+
                         # Debug: print to docker logs
                         print(f"BENCH_LOG: {line.strip()}", flush=True)
 
@@ -195,6 +234,44 @@ class BenchmarkManager:
                                 }, room=session_id)
                             except Exception as e:
                                 print(f"Error parsing workload: {e}", flush=True)
+                        
+
+                        
+                        elif "STATUS: TOTAL_STEPS:" in msg:
+                            try:
+                                self.total_steps = int(msg.split("STATUS: TOTAL_STEPS:")[1].strip())
+                                self.current_step = 0
+                                print(f"DEBUG: Global Total Steps set to {self.total_steps}", flush=True)
+                            except: pass
+                            
+                        elif "STATUS: TICK" in msg:
+                            try:
+                                self.current_step += 1
+                                if self.total_steps > 0:
+                                    percentage = (self.current_step / self.total_steps) * 100
+                                    elapsed = int(time.time() - start_time)
+                                    
+                                    # Refined remaining time
+                                    remaining = 0
+                                    if percentage > 0:
+                                        total_projected = elapsed / (percentage / 100)
+                                        remaining = int(total_projected - elapsed)
+                                    elif total_est_seconds > 0:
+                                        remaining = total_est_seconds - elapsed
+                                    
+                                    if remaining < 0: remaining = 0
+                                    
+                                    self.latest_progress = {
+                                        'current_step': self.current_step,
+                                        'total_steps': self.total_steps,
+                                        'percentage': round(percentage, 2),
+                                        'elapsed': elapsed,
+                                        'remaining': remaining,
+                                        'timestamp': datetime.now().isoformat()
+                                    }
+                                    socketio.emit('progress_update', self.latest_progress, room=session_id)
+                            except Exception as e:
+                                print(f"Error handling progress tick: {e}", flush=True)
                     else:
                         # No data or EOF
                         if self.process.poll() is not None:
@@ -342,6 +419,26 @@ def get_system_info():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/license-info', methods=['GET'])
+def get_license_info():
+    try:
+        license_info = {}
+        try:
+            result = subprocess.run(['graidctl', 'desc', 'lic', '--format', 'json'], capture_output=True, text=True)
+            if result.returncode == 0:
+                stdout = result.stdout.strip()
+                # Find the start of the JSON object
+                start_idx = stdout.find('{')
+                if start_idx != -1:
+                    license_info = json.loads(stdout[start_idx:]).get('Result', {})
+        except Exception as e:
+            print(f"Error getting license info: {e}")
+
+        return jsonify({'success': True, 'data': license_info})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/benchmark/start', methods=['POST'])
 def start_benchmark():
     global benchmark_running
@@ -362,6 +459,130 @@ def start_benchmark():
 
         return jsonify({'success': True, 'message': 'Benchmark started'})
     except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+def parse_graidctl_json(output):
+    """Parses JSON from graidctl output, skipping the first checkmark line if present."""
+    if not output:
+        return {}
+    lines = output.strip().split('\n')
+    json_str = ""
+    for line in lines:
+        if line.strip().startswith('{'):
+            json_str = '\n'.join(lines[lines.index(line):])
+            break
+    if not json_str:
+        return {}
+    return json.loads(json_str)
+
+
+@app.route('/api/graid/check', methods=['GET'])
+def check_graid_resources():
+    try:
+        has_resources = False
+        findings = []
+        
+        # Check VDs
+        res = subprocess.run(['graidctl', 'ls', 'vd', '--format', 'json'], capture_output=True, text=True)
+        if res.returncode == 0:
+            vds = parse_graidctl_json(res.stdout).get('Result', [])
+            if vds:
+                has_resources = True
+                findings.append(f"{len(vds)} VDs")
+        
+        # Check DGs
+        res = subprocess.run(['graidctl', 'ls', 'dg', '--format', 'json'], capture_output=True, text=True)
+        if res.returncode == 0:
+            dgs = parse_graidctl_json(res.stdout).get('Result', [])
+            if dgs:
+                has_resources = True
+                findings.append(f"{len(dgs)} DGs")
+
+        # Check PDs
+        res = subprocess.run(['graidctl', 'ls', 'pd', '--format', 'json'], capture_output=True, text=True)
+        if res.returncode == 0:
+            pds = parse_graidctl_json(res.stdout).get('Result', [])
+            if pds:
+                has_resources = True
+                findings.append(f"{len(pds)} PDs")
+
+        return jsonify({'success': True, 'has_resources': has_resources, 'findings': findings})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/graid/reset', methods=['POST'])
+def reset_graid_resources():
+    global benchmark_running
+    if benchmark_running:
+        return jsonify({'success': False, 'error': 'Cannot reset while benchmark is running'}), 400
+        
+    try:
+        results = []
+        print("DEBUG: Starting Graid resources reset...", flush=True)
+        
+        # 1. Delete VDs
+        print("DEBUG: Checking VDs...", flush=True)
+        res_vd = subprocess.run(['graidctl', 'ls', 'vd', '--format', 'json'], capture_output=True, text=True)
+        if res_vd.returncode == 0:
+            try:
+                vds = parse_graidctl_json(res_vd.stdout).get('Result', [])
+                print(f"DEBUG: Found VDs: {vds}", flush=True)
+                for vd in vds:
+                    dg_id = vd.get('DgId')
+                    vd_id = vd.get('VdId')
+                    if dg_id is not None and vd_id is not None:
+                        cmd = ['graidctl', 'del', 'vd', str(dg_id), str(vd_id), '--confirm-to-delete']
+                        print(f"DEBUG: Executing: {' '.join(cmd)}", flush=True)
+                        del_res = subprocess.run(cmd, capture_output=True, text=True)
+                        print(f"DEBUG: VD Delete output: stdout='{del_res.stdout.strip()}', stderr='{del_res.stderr.strip()}'", flush=True)
+                        results.append(f"Deleted VD {vd_id} in DG {dg_id}")
+            except Exception as e:
+                print(f"DEBUG: VD Parsing error: {e}", flush=True)
+
+        # 2. Delete DGs
+        print("DEBUG: Checking DGs...", flush=True)
+        res_dg = subprocess.run(['graidctl', 'ls', 'dg', '--format', 'json'], capture_output=True, text=True)
+        if res_dg.returncode == 0:
+            try:
+                dgs = parse_graidctl_json(res_dg.stdout).get('Result', [])
+                print(f"DEBUG: Found DGs: {dgs}", flush=True)
+                for dg in dgs:
+                    dg_id = dg.get('DgId')
+                    if dg_id is not None:
+                        cmd = ['graidctl', 'del', 'dg', str(dg_id), '--confirm-to-delete']
+                        print(f"DEBUG: Executing: {' '.join(cmd)}", flush=True)
+                        del_res = subprocess.run(cmd, capture_output=True, text=True)
+                        print(f"DEBUG: DG Delete output: stdout='{del_res.stdout.strip()}', stderr='{del_res.stderr.strip()}'", flush=True)
+                        results.append(f"Deleted DG {dg_id}")
+            except Exception as e:
+                print(f"DEBUG: DG Parsing error: {e}", flush=True)
+
+        # 3. Delete PDs
+        print("DEBUG: Checking PDs...", flush=True)
+        res_pd = subprocess.run(['graidctl', 'ls', 'pd', '--format', 'json'], capture_output=True, text=True)
+        if res_pd.returncode == 0:
+            try:
+                pds = parse_graidctl_json(res_pd.stdout).get('Result', [])
+                print(f"DEBUG: Found PDs: {pds}", flush=True)
+                if pds:
+                    pd_ids = [p.get('PdId') for p in pds if p.get('PdId') is not None]
+                    if pd_ids:
+                        min_pd = min(pd_ids)
+                        max_pd = max(pd_ids)
+                        pd_range = f"{min_pd}-{max_pd}"
+                        cmd = ['graidctl', 'del', 'pd', pd_range]
+                        print(f"DEBUG: Executing: {' '.join(cmd)}", flush=True)
+                        del_res = subprocess.run(cmd, capture_output=True, text=True)
+                        print(f"DEBUG: PD Delete output: stdout='{del_res.stdout.strip()}', stderr='{del_res.stderr.strip()}'", flush=True)
+                        results.append(f"Deleted PDs in range {pd_range}")
+            except Exception as e:
+                print(f"DEBUG: PD Parsing error: {e}", flush=True)
+
+        return jsonify({'success': True, 'message': 'Reset complete', 'details': results})
+    except Exception as e:
+        print(f"Error during reset: {e}", flush=True)
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
@@ -454,7 +675,14 @@ def save_snapshot():
 
 @app.route('/api/benchmark/status', methods=['GET'])
 def get_benchmark_status():
-    return jsonify({'success': True, 'data': {'running': benchmark_running, 'timestamp': datetime.now().isoformat()}})
+    return jsonify({
+        'success': True, 
+        'data': {
+            'running': benchmark_running, 
+            'progress': benchmark_manager.latest_progress if benchmark_running else None,
+            'timestamp': datetime.now().isoformat()
+        }
+    })
 
 
 @app.route('/api/results', methods=['GET'])
@@ -463,6 +691,10 @@ def get_results():
         results = []
         if RESULTS_DIR.exists():
             for result_item in RESULTS_DIR.iterdir():
+                # Ignore hidden files/folders (starting with dot)
+                if result_item.name.startswith('.'):
+                    continue
+                    
                 # Handle both directories and tar files
                 if result_item.is_file() and result_item.name.endswith('.tar'):
                      results.append({'name': result_item.name, 'type': 'archive', 'created': datetime.fromtimestamp(result_item.stat().st_mtime).isoformat(), 'size': result_item.stat().st_size})
@@ -481,9 +713,29 @@ def get_results():
 @app.route('/api/results/<path:filename>', methods=['GET'])
 def get_result_file(filename):
     try:
-        return send_from_directory(RESULTS_DIR, filename)
+        response = send_from_directory(RESULTS_DIR, filename)
+        if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+             response.headers['Cache-Control'] = 'public, max-age=86400'
+        return response
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 404
+
+@app.route('/api/results/<result_name>/download', methods=['GET'])
+def download_result(result_name):
+    try:
+        # Check RESULTS_DIR
+        target = RESULTS_DIR / result_name
+        if target.exists() and target.is_file():
+            return send_from_directory(RESULTS_DIR, result_name, as_attachment=True)
+        
+        # Check if it corresponds to a tar in RESULTS_DIR (if result_name came without .tar)
+        tar_target = RESULTS_DIR / f"{result_name}.tar"
+        if tar_target.exists():
+            return send_from_directory(RESULTS_DIR, f"{result_name}.tar", as_attachment=True)
+            
+        return jsonify({'success': False, 'error': 'Result file not found'}), 404
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/results/<result_name>/data', methods=['GET'])
 def get_result_data(result_name):
@@ -682,6 +934,122 @@ def get_result_data(result_name):
                                     csv_data.append(row)
 
         return jsonify({'success': True, 'data': csv_data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/results/<result_name>/images', methods=['GET'])
+def get_result_images(result_name):
+    try:
+        result_path = RESULTS_DIR / result_name
+        model_result_path = SCRIPT_DIR / f"{result_name}-result" / result_name
+        
+        target_path = None
+        if result_path.exists():
+            target_path = result_path
+        elif model_result_path.exists():
+            target_path = model_result_path
+            
+        if not target_path:
+            return jsonify({'success': False, 'error': 'Result not found'}), 404
+            
+        images = []
+        def parse_tags(img_path):
+            tags = {
+                'category': 'VD' if '/VD/' in img_path else 'PD' if '/PD/' in img_path else 'Other',
+                'raid': 'Unknown',
+                'workload': 'Unknown',
+                'bs': 'Unknown',
+                'status': 'Normal'
+            }
+            
+            # Pattern: graid-SR-ULTRA-AD-RAW-RAID6-1VD-24PD-S-Micron-D-afterdiscard-seqwrite-grai-Rebuild
+            filename = Path(img_path).stem
+            parts = filename.split('-')
+            
+            # RAID
+            for p in parts:
+                if p.startswith('RAID'): tags['raid'] = p.replace('RAID', 'RAID ')
+            
+            # Status
+            if 'Normal' in filename: tags['status'] = 'Normal'
+            elif 'Rebuild' in filename: tags['status'] = 'Rebuild'
+            
+            # Workload & BS
+            if 'seqwrite' in filename: tags['workload'] = 'Seq Write'
+            elif 'seqread' in filename: tags['workload'] = 'Seq Read'
+            elif 'randread' in filename: tags['workload'] = 'Rand Read'
+            elif 'randwrite' in filename: tags['workload'] = 'Rand Write'
+            elif 'randrw73' in filename: tags['workload'] = 'Mix(70/30)'
+            elif 'randrw55' in filename: tags['workload'] = 'Mix(50/50)'
+            
+            # Extract BS from filename more robustly
+            known_bs = ['4k', '8k', '16k', '32k', '64k', '128k', '256k', '512k', '1m', '1M', '2m', '4m']
+            for b in known_bs:
+                if f"-{b}-" in filename or filename.endswith(f"-{b}"):
+                    tags['bs'] = b.upper()
+                    break
+            
+            # Fallback for BS if not found in filename but workload is known
+            if tags['bs'] == 'Unknown':
+                if 'rand' in tags['workload'].lower(): tags['bs'] = '4K'
+                elif 'seq' in tags['workload'].lower(): tags['bs'] = '1M'
+            
+            if tags['category'] == 'PD':
+                tags['raid'] = 'BASELINE'
+                
+            return tags
+
+        if target_path.is_dir():
+            for img_file in target_path.rglob('*'):
+                if img_file.is_file() and img_file.suffix.lower() in ['.png', '.jpg', '.jpeg']:
+                    if 'report_view' in str(img_file):
+                        rel_path = str(img_file.relative_to(RESULTS_DIR if result_path.exists() else SCRIPT_DIR))
+                        tags = parse_tags(str(img_file))
+                        images.append({
+                            'name': img_file.name,
+                            'url': f"/api/results/{rel_path}",
+                            'tags': tags
+                        })
+        elif target_path.is_file() and target_path.name.endswith('.tar'):
+            import tarfile
+            
+            # Cache directory for this specific tar
+            result_cache_dir = CACHE_DIR / result_name
+            result_cache_dir.mkdir(parents=True, exist_ok=True)
+            
+            with tarfile.open(target_path, 'r') as tar:
+                for member in tar.getmembers():
+                    if member.isfile() and member.name.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        if 'report_view' in member.name:
+                             # Extract to cache if not exists (flatten name to avoid collision)
+                             cache_filename = member.name.replace('/', '_')
+                             cache_file = result_cache_dir / cache_filename
+                             if not cache_file.exists():
+                                 with tar.extractfile(member) as f_in:
+                                     with open(cache_file, 'wb') as f_out:
+                                         f_out.write(f_in.read())
+                             
+                             tags = parse_tags(member.name)
+                             images.append({
+                                'name': cache_filename,
+                                'url': f"/api/results/.cache/{result_name}/{cache_filename}",
+                                'tags': tags
+                            })
+        
+        response = jsonify({'success': True, 'images': images})
+        response.headers['Cache-Control'] = 'public, max-age=3600'
+        return response
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/results/<result_name>/clear-cache', methods=['POST'])
+def clear_result_cache(result_name):
+    try:
+        import shutil
+        target = CACHE_DIR / result_name
+        if target.exists():
+            shutil.rmtree(target)
+        return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 

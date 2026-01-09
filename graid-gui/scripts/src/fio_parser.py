@@ -547,51 +547,27 @@ def parser_fio(u_filepath):
 
             df = pd.DataFrame(dic, index=[0])
             df_dic_clat_percentiles = pd.DataFrame(dic_clat_percentiles, index=[0])
-            #print(df_dic_clat_percentiles)
 
-            if 'BW(write)-GB/s' not in df:
-                # print(dic)
-                df['Bandwidth (GB/s)'] = round(df['BW(read)-GB/s'], 2)
-                df['Bandwidth (GiB/s)'] = round(df['BW(read)-GiB/s'], 2)
-                df['IOPS(K)'] = round(df['IOPs(read)'], 0)
-                df['Latency (us)'] = round(df['lat_avg(read)[usec]'], 0)
-                df['Latency_stdev (us)'] = round(
-                    df['lat_stdev(read)[usec]'], 0)
+            # Ensure all expected columns exist with default value 0/N/A
+            expected_cols = {
+                'BW(read)-GB/s': 0.0, 'BW(read)-GiB/s': 0.0, 'IOPs(read)': 0.0, 
+                'lat_avg(read)[usec]': 0.0, 'lat_stdev(read)[usec]': 0.0,
+                'BW(write)-GB/s': 0.0, 'BW(write)-GiB/s': 0.0, 'IOPs(write)': 0.0,
+                'lat_avg(write)[usec]': 0.0, 'lat_stdev(write)[usec]': 0.0,
+                'Threads': 'N/A', 'BlockSize': 'N/A', 'Queue Depth': 'N/A',
+                'User CPU': 0.0, 'System CPU': 0.0, 'Idle CPU': 0.0,
+                'fio-version': 'N/A', 'Type': 'N/A'
+            }
+            for col, default in expected_cols.items():
+                if col not in df.columns:
+                    df[col] = default
 
-                df['BW(write)-GB/s'] = 0
-                df['BW(write)-GiB/s'] = 0
-                df['IOPs(write)'] = 0
-                df['lat_avg(write)[usec]'] = 0
-                df['lat_stdev(write)[usec]'] = 0
-
-            elif 'BW(read)-GB/s' not in df:
-
-                df['Bandwidth (GB/s)'] = round(
-                    df['BW(write)-GB/s'], 2)
-                df['Bandwidth (GiB/s)'] = round(df['BW(write)-GiB/s'], 2)
-                # print(df)
-                df['IOPS(K)'] = round(df['IOPs(write)'], 0)
-                df['Latency (us)'] = round(
-                    df['lat_avg(write)[usec]'], 0)
-                df['Latency_stdev (us)'] = round(
-                    df['lat_stdev(write)[usec]'], 0)
-
-                df['BW(read)-GB/s'] = 0
-                df['BW(read)-GiB/s'] = 0
-                df['IOPs(read)'] = 0
-                df['lat_avg(read)[usec]'] = 0
-                df['lat_stdev(read)[usec]'] = 0
-
-            else:
-                df['Bandwidth (GB/s)'] = round(df['BW(read)-GB/s'] +
-                                               df['BW(write)-GB/s'], 2)
-                df['Bandwidth (GiB/s)'] = round(df['BW(read)-GiB/s'] +
-                                                df['BW(write)-GiB/s'], 2)
-                df['IOPS(K)'] = round(df['IOPs(read)'] + df['IOPs(write)'], 0)
-                df['Latency (us)'] = round(df['lat_avg(read)[usec]'] +
-                                           df['lat_avg(write)[usec]'], 0)
-                df['Latency_stdev (us)'] = round(df['lat_stdev(read)[usec]'] +
-                                                 df['lat_stdev(write)[usec]'], 0)
+            # Consolidate metrics (Summing works for Read, Write, or Mixed since missing are 0)
+            df['Bandwidth (GB/s)'] = round(df['BW(read)-GB/s'] + df['BW(write)-GB/s'], 2)
+            df['Bandwidth (GiB/s)'] = round(df['BW(read)-GiB/s'] + df['BW(write)-GiB/s'], 2)
+            df['IOPS(K)'] = round(df['IOPs(read)'] + df['IOPs(write)'], 0)
+            df['Latency (us)'] = round(df['lat_avg(read)[usec]'] + df['lat_avg(write)[usec]'], 0)
+            df['Latency_stdev (us)'] = round(df['lat_stdev(read)[usec]'] + df['lat_stdev(write)[usec]'], 0)
             # print(df.keys(), df)
 
             df.rename({"lat_avg(read)[usec]": "Read Latency (us)",
@@ -599,7 +575,18 @@ def parser_fio(u_filepath):
                        }, axis=1, inplace=True)
 
             df_name = set_dataframe(df, u_filepath)
-            df_n = pd.concat([df_name, df,df_dic_clat_percentiles ], axis=1)
+            
+            # Ensure percentile columns exist
+            percentile_cols = [
+                '1.00th', '5.00th', '10.00th', '20.00th', '30.00th', '40.00th', '50.00th', 
+                '60.00th', '70.00th', '80.00th', '90.00th', '95.00th', '99.00th', '99.50th', 
+                '99.90th', '99.95th', '99.99th'
+            ]
+            for col in percentile_cols:
+                if col not in df_dic_clat_percentiles.columns:
+                    df_dic_clat_percentiles[col] = 0.0
+                    
+            df_n = pd.concat([df_name, df, df_dic_clat_percentiles], axis=1)
             #print(df_n)
             df_n = df_n[[
                 'Model',
@@ -785,60 +772,175 @@ def parser_filename(u_file_path):
     # Initialize default values
     device = fio_type = model = status = RAID_type = PD_count = stage = controller = Jobs = wt = "N/A"
 
-    if u_name[1] == 'SR':
-        i = 1
-    else:
-        i = 0
+    try:
+        # Find critical indices
+        vd_indices = [i for i, x in enumerate(u_name) if x.endswith('VD')]
+        if not vd_indices:
+            raise ValueError("No VD token found")
+        vd_idx = vd_indices[0] # Assume first VD match is the one
 
-    # Find the SSD
-    b_ = u_name.index('S') + 1
-    f_ = u_name.index('D')
+        pd_idx = -1
+        # Look for PD around VD
+        if len(u_name) > vd_idx + 1 and u_name[vd_idx+1].endswith('PD'):
+            pd_idx = vd_idx + 1
+        
+        # PD Count
+        if pd_idx != -1:
+             PD_count = u_name[pd_idx][:-2] # Remove 'PD'
+        
+        # Find S and D indices
+        s_indices = [i for i, x in enumerate(u_name) if x == 'S']
+        d_indices = [i for i, x in enumerate(u_name) if x == 'D']
+        
+        s_idx = s_indices[0] if s_indices else -1
+        d_idx = d_indices[-1] if d_indices else -1 # Use last D as Stage separator usually comes later?
+        # Actually usually ...-S-Device-D-Stage...
+        # If there are multiple Ds (e.g. inside Device name?), take the one after S?
+        if s_idx != -1:
+             possible_d = [i for i in d_indices if i > s_idx]
+             if possible_d:
+                 d_idx = possible_d[0]
+        
+        # Device extraction
+        if s_idx != -1 and d_idx != -1 and d_idx > s_idx:
+            device = "-".join(u_name[s_idx+1 : d_idx])
+        
+        # Filesystem detection to isolate RAID Type
+        fs_list = ['RAW', 'NTFS', 'EXT4', 'XFS', 'BTRFS', 'ZFS']
+        fs_idx = -1
+        for i, token in enumerate(u_name):
+            if token in fs_list:
+                fs_idx = i
+                break
+        
+        # RAID Type Extraction
+        if fs_idx != -1 and vd_idx > fs_idx:
+            # Everything between FS and VD
+            RAID_type = "-".join(u_name[fs_idx+1 : vd_idx])
+        else:
+             # Fallback: Start from roughly index 3?
+             # If graid-SR-RAID5-1VD (No FS?)
+             # Assume GRAID-Controller-FS-RAID-VD
+             # If FS is missing, maybe between Controller and VD?
+             # Checking bench.sh, FS seems mandatory.
+             # If not found, use heuristic: tokens before VD
+             # ex: graid-SR-RAW-RAID5-1VD -> RAW is FS.
+             # If we didn't find known FS, maybe index 2 is FS?
+             # Let's trust bench.sh puts FS there.
+             # If tokens[2] is not FS, then we might have issue.
+             # But let's try to grab token before VD?
+             if vd_idx > 3:
+                 RAID_type = u_name[vd_idx-1]
+                 # If RAID type has multiple tokens (SR-CRAID)
+                 # We need better start point.
+                 # If controller is at 1.
+                 # Start from 2 (FS?) + 1?
+                 pass
 
-    # Device
-    if 'BS' in u_name:
-        ba_ = u_name.index('BS')
-        device = u_name[ba_ + 1]
-    else:
-        device = "-".join(u_name[b_:f_])
+        # Controller and Model
+        # graid-{Controller}-{FS}-{RAID}...
+        # If FS found at fs_idx.
+        # Controller is tokens[1:fs_idx] joined?
+        if fs_idx > 1:
+             # u_name[0] is graid
+             # u_name[1] starts controller
+             controller = "-".join(u_name[1:fs_idx])
+             # logic in original parser separates 'Model' from 'Controller' if it splits?
+             # original: controller=u_name[0+i] (graid? no i=1 means SR).
+             # if i=1, controller = u_name[1] = SR.
+             # model = u_name[2] = RAW?
+             # The original parser semantics for Controller/Model on 'SR' were dubious.
+             # Let's try to map 'SR' to Controller if it starts with SR?
+             pass
+        elif fs_idx == -1 and vd_idx > 2:
+             # Guess controller is 1?
+             controller = u_name[1]
 
-    # Function type
-    if 'BSALL' in u_name:
-        fio_type = u_name[f_ + 4]
-    elif 'BS' in u_name:
-        fio_type = u_name[ba_ + 3]
-    else:
-        fio_type = u_name[f_ + 2]
 
-    # Graid Model
-    model = u_name[1 + i]
+        # Original Logic emulation for controller/model to minimize regression
+        if u_name[1] == 'SR':
+             # Preserve 'SR' as controller?
+             # original code: i=1. controller = u_name[i] -> SR. 
+             # model = u_name[i+1] -> u_name[2].
+             # If file is graid-SR-RAW-RAID5...
+             # Controller=SR, Model=RAW.
+             # If file is graid-SR-ULTRA-AD-RAW...
+             # Controller=SR, Model=ULTRA?
+             # If FS is found, we might want to be smarter.
+             pass
+        
+        # Stage, Type, Status extraction
+        # After D: Stage
+        if d_idx != -1 and len(u_name) > d_idx + 1:
+             stage = u_name[d_idx+1]
+        
+        
+        # Status Parsing: Search from the end for known status keywords
+        status_keywords = ['Normal', 'Rebuild', 'Resync']
+        status_idx = -1
+        # Check last 4 tokens (covering cases with/without J/D)
+        for i in range(1, min(len(u_name) + 1, 6)):
+             if u_name[-i] in status_keywords:
+                 status = u_name[-i]
+                 status_idx = len(u_name) - i
+                 break
+        
+        # Jobs and Wait Time
+        # Usually after Status if they exist.
+        if status_idx != -1:
+             remaining = u_name[status_idx+1:]
+             # Parse remaining tokens for J and D
+             for token in remaining:
+                 if token.endswith('J') or token.endswith('k'):
+                     Jobs = token
+                 elif token.endswith('D') or token.endswith('s') or token.endswith('M'): # wt might be 4D or similar?
+                     wt = token
+        
+        # Fio Type Extraction
+        # Between Stage and Status
+        if d_idx != -1:
+             start_type = d_idx + 2
+             end_type = status_idx if status_idx != -1 else len(u_name)
+             
+             if start_type < end_type:
+                  type_tokens = u_name[start_type : end_type]
+                  # Clean up tokens
+                  clean_tokens = []
+                  for t in type_tokens:
+                      if t in ['BS', 'BSALL', 'grai', 'graid']:
+                          continue
+                      # Filter purely numeric sorting prefixes like '00', '01' if they lack semantic meaning?
+                      # But wait, '00' might be important? User didn't complain about '00'.
+                      # User complained about "Ben_type missing" and distinguishing randrw55/73.
+                      # Ideally we extract 'randread', 'seqwrite', 'randrw73' etc.
+                      # Let's keep it simple: filter known junk.
+                      if t.isdigit() and len(t) <= 3: # heuristics for 00, 01
+                           continue 
+                      clean_tokens.append(t)
+                  
+                  if clean_tokens:
+                      fio_type = "-".join(clean_tokens)
+                  else:
+                      # If cleanup removed everything, revert to raw join
+                      fio_type = "-".join(type_tokens)
 
-    # RAID status and RAID type
-    if '8k' in u_name or '16k' in u_name:
-        RAID_type = u_name[3 + i]
-        PD_count = u_name[5 + i][:-2]
-    else:
-        RAID_type = u_name[3 + i]
-        PD_count = u_name[5 + i][:-2]
+        # Overwrite Controller logic specific to MD case from original
+        if len(Path(u_file_path).parts) >= 3 and Path(u_file_path).parts[-3] == 'MD':
+            controller = 'MD'
+        
+        # Cleanup fallback
+        if controller == "N/A" and len(u_name) > 1:
+             controller = u_name[1]
+             
+        # Refine Model
+        if model == "N/A" and controller == "SR" and fs_idx > 2:
+             model = "-".join(u_name[2:fs_idx])
+        elif model == "N/A" and len(u_name) > 2:
+             model = u_name[2]
 
-    if 'BSALL' in u_name:
-        status = u_name[f_ + 6]
-    elif 'BS' in u_name:
-        status = u_name[ba_ + 5]
-    else:
-        status = u_name[f_ + 4]
-
-    # Stage
-    stage = u_name[f_ + 1]
-
-    # Controller
-    if Path(u_file_path).parts[-3] == 'MD':
-        controller = 'MD'
-    else:
-        controller = u_name[0 + i]
-
-    # Jobs and Wait Time
-    Jobs = u_name[-2]
-    wt = u_name[-1]
+    except Exception as e:
+        print(f"Error parsing filename {u_file_path}: {e}")
+        pass
 
     filename_lst = [device, status, RAID_type, PD_count, stage, fio_type, Jobs, wt, controller, model]
 

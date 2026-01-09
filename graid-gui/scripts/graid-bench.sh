@@ -11,7 +11,7 @@ if [ "$BASH" != "/bin/bash" ]; then
 	        exit $?
 fi
 
-trap "trap - SIGTERM && kill -- -$$" SIGINT SIGTERM EXIT
+trap "trap - SIGTERM && kill -- -$$ 2>/dev/null" SIGINT SIGTERM EXIT
 
 
 Help()
@@ -316,6 +316,52 @@ main() {
     # mkdir -p $result/$NVME_INFO/pd
     # mkdir -p $result/$NVME_INFO/vd
     NVME_COUNT=${#NVME_LIST[@]}
+    
+    # Calculate Global Total Steps
+    if [[ "$QUICK_TEST" == "true" ]]; then
+        WL_COUNT_VD=4
+        if [[ "$DUMMY" == "true" ]]; then WL_COUNT_PD=4; else WL_COUNT_PD=7; fi
+    else
+        WL_COUNT_VD=12
+        WL_COUNT_PD=13
+    fi
+
+    TOTAL_BENCH_STEPS=0
+    # PD Steps
+    if [[ "$RUN_PD" == "true" ]]; then
+        for test in "${TS_LS[@]}"; do
+            NUM_CALLS=$([[ "$RUN_PD_ALL" == "true" ]] && echo 1 || echo $NVME_COUNT)
+            if [[ "$LS_JB" == "true" ]]; then
+                TICKS_PER_CALL=$(( WL_COUNT_PD * ${#QD_LS[@]} * ${#pd_jobs[@]} ))
+            else
+                TICKS_PER_CALL=$WL_COUNT_PD
+            fi
+            TOTAL_BENCH_STEPS=$((TOTAL_BENCH_STEPS + NUM_CALLS * TICKS_PER_CALL))
+        done
+    fi
+
+    # VD/MD Steps
+    PD_STEP_MOD=1
+    if [[ "$SCAN" == "true" ]]; then
+        PD_STEP_MOD=$(($NVME_COUNT / 4))
+    fi
+
+    if [[ "$RUN_VD" == "true" || "$RUN_MD" == "true" ]]; then
+        for test in "${TS_LS[@]}"; do
+            if [[ "$LS_JB" == "true" ]]; then
+                TICKS_PER_CONFIG=$(( WL_COUNT_VD * ${#QD_LS[@]} * ${#JOB_LS[@]} ))
+            elif [[ "$LS_BS" == "true" ]]; then
+                 TICKS_PER_CONFIG=$(( WL_COUNT_VD * ${#BS_LS[@]} + WL_COUNT_VD ))
+            elif [[ "$LS_CUST" == "true" ]]; then
+                 TICKS_PER_CONFIG=$(( WL_COUNT_VD * ${#QD_LS[@]} * ${#QD_LS[@]} * ${#JOB_LS[@]} ))
+            else
+                 TICKS_PER_CONFIG=$WL_COUNT_VD
+            fi
+            TOTAL_BENCH_STEPS=$((TOTAL_BENCH_STEPS + ${#STA_LS[@]} * ${#RAID_TYPE[@]} * TICKS_PER_CONFIG * PD_STEP_MOD))
+        done
+    fi
+    
+    echo "STATUS: TOTAL_STEPS: $TOTAL_BENCH_STEPS"
     bash src/est_time.sh
     
     if [[ $RUN_PD == "true" ]]; then
@@ -352,10 +398,14 @@ main() {
         echo "STATUS: STAGE_VD_START"
         echo $NVME_INFO
         for NVME_DEVICE in "${NVME_LIST[@]}"
-            do
-                discard_device /dev/$NVME_DEVICE
-                graidctl create pd /dev/$NVME_DEVICE  > /dev/null 2>&1
-            done
+        do
+            discard_device /dev/$NVME_DEVICE &
+        done
+        wait
+        for NVME_DEVICE in "${NVME_LIST[@]}"
+        do
+            graidctl create pd /dev/$NVME_DEVICE  > /dev/null 2>&1
+        done
         # graidctl create pd /dev/nvme0-$(($NVME_COUNT - 1))
         #run 4PD/n x all RAID x percondition
         for STAS in  "${STA_LS[@]}"; do
@@ -436,6 +486,7 @@ main() {
     tar czPf "$tar_name" ./$NVME_INFO* ./graid_log_* ./output.log
     echo "Moving results to ../results/"
     mv "$tar_name" ../results/
+    rm -rf ./$NVME_INFO* ./graid_log_* ./output.log
 
 
 }

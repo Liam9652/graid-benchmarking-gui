@@ -1,0 +1,160 @@
+.calculator-container {
+    padding: 20px;
+    background: rgba(30, 30, 30, 0.6);
+    /* Slightly lighter background with transparency */
+    border-radius: 12px;
+    color: #ffffff;
+    /* Brighter font */
+    max-width: 950px;
+    margin: 20px auto;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+}
+
+.calc-header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 25px;
+    padding-bottom: 15px;
+    border-bottom: 1px solid #444;
+}
+
+.calc-header-row h2 {
+    margin: 0;
+    color: #00BBED;
+    /* Highlighted color */
+}
+
+.version-toggle {
+    display: flex;
+    background: #333;
+    padding: 4px;
+    border-radius: 8px;
+}
+
+.toggle-btn {
+    padding: 8px 16px;
+    border: none;
+    background: transparent;
+    color: #888;
+    cursor: pointer;
+    border-radius: 6px;
+    font-weight: 600;
+    transition: all 0.2s ease;
+}
+
+.toggle-btn.active {
+    background: #00BBED;
+    color: white;
+}
+
+.calc-inputs {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    /* Better flow */
+    gap: 15px 30px;
+    margin-bottom: 30px;
+}
+
+@media (max-width: 768px) {
+    .calc-inputs {
+        grid-template-columns: 1fr;
+    }
+}
+
+.input-group {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    /* Prevent overflow */
+}
+
+.input-group label {
+    flex: 1;
+    min-width: 200px;
+    color: #ccc;
+    font-size: 0.95rem;
+}
+
+.input-group input[type="number"] {
+    padding: 8px 12px;
+    background: #1a1a1a;
+    border: 1px solid #444;
+    color: #00BBED;
+    width: 100px;
+    border-radius: 4px;
+    outline: none;
+}
+
+.input-group input[type="number"]:focus {
+    border-color: #00BBED;
+}
+
+.input-group select {
+    padding: 8px;
+    background: #1a1a1a;
+    border: 1px solid #444;
+    color: white;
+    border-radius: 4px;
+    cursor: pointer;
+    min-width: 60px;
+    box-sizing: border-box;
+}
+
+.calc-output table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 20px;
+    overflow-x: auto;
+    display: block;
+}
+
+@media (min-width: 769px) {
+    .calc-output table {
+        display: table;
+    }
+}
+
+.calc-output th,
+.calc-output td {
+    border: 1px solid #444;
+    padding: 12px;
+    text-align: left;
+}
+
+.calc-output th {
+    background: #2a2a2a;
+    color: #00BBED;
+    font-weight: 600;
+}
+
+.calc-output .raid-type-cell {
+    font-weight: bold;
+    background: #2a2a2a;
+    text-align: center;
+    vertical-align: middle;
+    color: #ffffff;
+}
+
+.file-upload-section {
+    grid-column: 1 / -1;
+    /* Full width */
+    background: #222;
+    padding: 20px;
+    border-radius: 8px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+    border: 1px dashed #444;
+}
+
+.file-upload-section .input-group {
+    flex: 1;
+    min-width: 300px;
+}
+
+input[type="file"] {
+    color: #888;
+    font-size: 0.8rem;
+}

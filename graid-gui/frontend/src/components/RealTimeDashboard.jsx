@@ -86,20 +86,6 @@ const RealTimeDashboard = ({ data, devices = [], viewMode, setViewMode }) => {
 
     return (
         <div className="dashboard-wrapper">
-            <div className="dashboard-header-toggle">
-                <button
-                    className={`view-toggle-btn ${viewMode === 'chart' ? 'active' : ''}`}
-                    onClick={() => setViewMode('chart')}
-                >
-                    Chart View
-                </button>
-                <button
-                    className={`view-toggle-btn ${viewMode === 'cdm' ? 'active' : ''}`}
-                    onClick={() => setViewMode('cdm')}
-                >
-                    Report View
-                </button>
-            </div>
 
             {viewMode === 'chart' ? (
                 <div className="dashboard-grid">

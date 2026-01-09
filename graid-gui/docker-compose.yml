@@ -29,7 +29,7 @@ services:
     ports:
       - "50072:3000"
     environment:
-      - REACT_APP_API_URL=http://localhost:50071
+      - REACT_APP_API_URL=
     depends_on:
       - backend
     networks:

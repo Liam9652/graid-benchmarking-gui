@@ -14,6 +14,8 @@ PD_NAME=$9
 #declare -A LAST_END_CPU_BY_NUMA
 echo $DEV_NAME
 
+
+
 . graid-bench.conf
 
 trap cleanup INT TERM EXIT
@@ -89,8 +91,8 @@ cut_cpu_list(){
 
 function raid_cleanup(){
     if [[ "$DEV_NAME" == "VD" ]]; then
-        graidctl del vd 0 0 2>/dev/null
-        graidctl del dg 0 2>/dev/null
+        graidctl del vd 0 0 --confirm-to-delete 2>/dev/null
+        graidctl del dg 0 --confirm-to-delete 2>/dev/null
     elif [[ "$DEV_NAME" == "MD" ]]; then
         mdadm -S /dev/$MD_NAME
     fi
@@ -366,6 +368,13 @@ function wait_for_low_cpu_temp() {
 }
 
 
+
+function trigger_snapshot() {
+    local of_name=$1
+    local fio_dir=$2
+    # Call backend to take snapshot
+    curl -X POST -H "Content-Type: application/json" -d "{\"test_name\": \"$of_name\", \"output_dir\": \"$fio_dir\"}" http://localhost:50071/api/benchmark/trigger_snapshot >/dev/null 2>&1
+}
 
 function output_name_dic() {
     # graid-a2000-ntfs-1vd-12pd-randread-j32b4kd32
@@ -647,8 +656,13 @@ function prestat() {
         echo "STATUS: STATE: PRECONDITIONING"
         echo "STATUS: WORKLOAD: Precondition"
         if [[ "$DEV_NAME" != "PD" ]]; then
-            fio src/precondition.fio --filename="/dev/$FIO_NAME" $common_args --output="$out_dir/$OUTPUT_NAME-precondition.log"
-            sleep 5
+            fio src/precondition.fio --filename="/dev/$FIO_NAME" $common_args --output="$out_dir/$OUTPUT_NAME-precondition.log" &
+            fio_pid=$!
+            # Precondition can be long, but we just need one capture while it's running
+            sleep 10
+            trigger_snapshot "${OUTPUT_NAME}-${STAG}-precondition" "${fio_dir:-$out_dir}"
+            wait $fio_pid
+            sleep 2
         elif [[ "$DEV_NAME" == "PD" ]]; then
             if [[ $RUN_PD_ALL == "true" ]]; then
                 sed -e 's/\[precondition\]//' src/precondition.fio > tfie
@@ -662,6 +676,8 @@ function prestat() {
             fi
         fi
         echo "----aftersustain----"
+        echo "STATUS: STATE: SUSTAINING"
+        echo "STATUS: WORKLOAD: Sustain Write"
         if [[ "$DEV_NAME" != "PD" ]]; then
             fio src/fio-loop/09-randwrite-graid --filename="/dev/$FIO_NAME" --runtime=$sustain_time --numjobs="$CPUJOBS" --cpus_allowed="$CPU_ALLOWED_SEQ" --output="$out_dir/$OUTPUT_NAME-sustain.log"
             sleep 5
@@ -687,8 +703,16 @@ function prestat() {
         echo "STATUS: STATE: SUSTAINING"
         echo "STATUS: WORKLOAD: Sustain Write"
         if [[ "$DEV_NAME" != "PD" ]]; then
-            fio src/fio-loop/09-randwrite-graid --filename="/dev/$FIO_NAME" --runtime=$sustain_time --numjobs="$CPUJOBS" --cpus_allowed="$CPU_ALLOWED_SEQ" --output="$out_dir/$OUTPUT_NAME-sustain.log"
-            sleep 5
+            fio src/fio-loop/09-randwrite-graid --filename="/dev/$FIO_NAME" --runtime=$sustain_time --numjobs="$CPUJOBS" --cpus_allowed="$CPU_ALLOWED_SEQ" --output="$out_dir/$OUTPUT_NAME-sustain.log" &
+            fio_pid=$!
+            if (( sustain_time > 15 )); then
+                sleep $((sustain_time - 12))
+            else
+                sleep $((sustain_time / 2))
+            fi
+            trigger_snapshot "${OUTPUT_NAME}-${STAG}-sustain" "${fio_dir:-$out_dir}"
+            wait $fio_pid
+            sleep 2
         elif [[ "$DEV_NAME" == "PD" ]]; then
             if [[ $RUN_PD_ALL == "true" ]]; then
                 rm -rf tfie
@@ -703,6 +727,8 @@ function prestat() {
             fi
         fi
     fi
+    # No generic trigger at the end anymore, move it inside FIO runs if appropriate
+    # trigger_snapshot "${OUTPUT_NAME}-${STAG}" "$out_dir"
 }
 
 
@@ -784,8 +810,10 @@ function run_task(){
             fio_pid_list="${fio_pid_list} $!"
 
         elif [[ $qd == "" ]] && [[ "$DEV_NAME" != "PD" ]] ; then
-            fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus  --showcmd >> ${fio_cmd_dir}/${of_name}
-            fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus  --output=$fio_dir/$of_name.txt  &
+            # Default to first configured QD if not in batch mode loop
+            local final_qd=${QD_LS[0]:-64}
+            fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --iodepth=$final_qd --showcmd >> ${fio_cmd_dir}/${of_name}
+            fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --iodepth=$final_qd --output=$fio_dir/$of_name.txt  &
             fio_pid_list="${fio_pid_list} $!"
 
         elif [[ $qd == "" ]] && [[ $RUN_PD_ALL == "true" ]]; then
@@ -810,13 +838,21 @@ function run_task(){
         
         # echo ${iostat_pid_list}
 
-        # Trigger Snapshot
-        # Snapshot time = ramp_time (10) + runtime - 10 = runtime
-        sleep $run_time
-        # Call backend to take snapshot
-        curl -X POST -H "Content-Type: application/json" -d "{\"test_name\": \"$of_name\", \"output_dir\": \"$fio_dir\"}" http://localhost:50071/api/benchmark/trigger_snapshot >/dev/null 2>&1
+        # Trigger Snapshot roughly 12 seconds before the end of the run
+        if (( run_time > 15 )); then
+            sleep $((run_time - 12))
+            trigger_snapshot "$of_name" "$fio_dir"
+            # Wait for FIO to finish (remaining 12s + some buffer)
+            wait ${fio_pid_list}
+        else
+            # For short runs, capture in the middle
+            sleep $((run_time / 2))
+            trigger_snapshot "$of_name" "$fio_dir"
+            wait ${fio_pid_list}
+        fi
         
-        wait ${fio_pid_list}
+        # Give some time for frontend to process before cleanup
+        sleep 2
         sync
         if [[ "$LOG_COMPACT" == "false" ]]; then
             kill_pid ${atop_pid_list}
@@ -843,10 +879,14 @@ function run_test(){
                 rm -rf tfie 
                 create_vd
                 prestat ${task}
-                echo "STATUS: STATE: BENCHMARKING"
-                echo "STATUS: WORKLOAD: $(basename $task)"
+                if [[ $STAS == "Rebuild" ]]; then
+                    rebuild_raid
+                fi
+                if [[ "$DEV_NAME" == "PD" ]]; then echo "STATUS: STATE: BENCHMARKING: ${STAS^^}"; else echo "STATUS: STATE: BENCHMARKING: ${RAID_MODE} - ${STAS^^}"; fi
                 for QD in  "${QD_LS[@]}"; do
                     for JOBS in "${JOB_LS[@]}"; do
+                        echo "STATUS: WORKLOAD: $(basename $task) - QD${QD} - ${JOBS}J"
+                        update_progress
                         cp $task tfie
                         sed -i 's/iodepth=\([0-9]*\)//' tfie
                         cpu_seq=""
@@ -888,9 +928,13 @@ function run_test(){
                 rm -rf tfie 
                 create_vd
                 prestat ${task}
-                echo "STATUS: STATE: BENCHMARKING"
-                echo "STATUS: WORKLOAD: $(basename $task)"
+                if [[ $STAS == "Rebuild" ]]; then
+                    rebuild_raid
+                fi
+                if [[ "$DEV_NAME" == "PD" ]]; then echo "STATUS: STATE: BENCHMARKING: ${STAS^^}"; else echo "STATUS: STATE: BENCHMARKING: ${RAID_MODE} - ${STAS^^}"; fi
                 for bs in  "${BS_LS[@]}"; do
+                    echo "STATUS: WORKLOAD: $(basename $task) - ${bs}k"
+                    update_progress
                     cp $task tfie
                     sed -i "s/^bs=.*/bs="$bs"k/" tfie
                     OUTPUT_NAME_NEW="$OUTPUT_NAME-${task:16:-1}-${STAS}-${bs}k"
@@ -902,30 +946,20 @@ function run_test(){
                 done
                 del_devcie
             done
-            
-        elif [[ $LS_JB == "false" ]]; then
-            create_vd
-            prestat ${task}
-            for task in "${task_list[@]}"; do 
-                echo "STATUS: STATE: BENCHMARKING"
-                echo "STATUS: WORKLOAD: $(basename $task)"
-                echo "---$NVME_INFO-${STAS}-$RAID_MODE-${PD_NUMBER}PD-${task}---"
-                OUTPUT_NAME_NEW="$OUTPUT_NAME-${task:16:-1}-${STAS}"
-                collect_log $OUTPUT_NAME_NEW $fio_dir
-                run_task $task $FIO_NAME $RUNTIME $CPUJOBS $CPU_ALLOWED_SEQ $fio_dir $OUTPUT_NAME_NEW $QD
-            done
-            del_devcie
         elif [[ $LS_CUST == "true" ]]; then
-
             for task in "${task_list[@]}"; do 
-                echo "STATUS: WORKLOAD: $(basename $task)"
-                echo "---$NVME_INFO-${STAS}-$RAID_MODE-${PD_NUMBER}PD-${task}---"
+                if [[ "$DEV_NAME" == "PD" ]]; then echo "STATUS: STATE: BENCHMARKING: ${STAS^^}"; else echo "STATUS: STATE: BENCHMARKING: ${RAID_MODE} - ${STAS^^}"; fi
                 rm -rf tfie 
                 create_vd
                 prestat ${task}
+                if [[ $STAS == "Rebuild" ]]; then
+                    rebuild_raid
+                fi
                 for bs in  "${QD_LS[@]}"; do
                     for QD in  "${QD_LS[@]}"; do
                         for JOBS in "${JOB_LS[@]}"; do
+                            echo "STATUS: WORKLOAD: $(basename $task) - ${bs}k - QD${QD} - ${JOBS}J"
+                            update_progress
                             cp $task tfie
                             sed -i 's/iodepth=\([0-9]*\)//' tfie
                             sed -i "s/^bs=.*/bs="$bs"k/" tfie
@@ -947,14 +981,7 @@ function run_test(){
                                 CPU_ALLOWED=${cpu_seq:1}
                             fi
 
-                            
-
-                            # echo "$JOBS" "$cpus_counts"
-                            # echo $CPU_ALLOWED
                             OUTPUT_NAME_NEW="${OUTPUT_NAME}-${task:16:-1}-${STAS}-${JOBS}J-${QD}D-${bs}k"
-                            # output_name=$1
-                            # output_fio_dir=$2
-
                             collect_log $OUTPUT_NAME_NEW $fio_dir
                             run_task tfie $FIO_NAME $RUNTIME $JOBS $CPU_ALLOWED $fio_dir $OUTPUT_NAME_NEW $QD
                             if [[ $WCD == "true" ]]; then
@@ -962,10 +989,26 @@ function run_test(){
                             fi
                         done
                     done
+                done
                 del_devcie
-		done
             done          
-
+        else
+            for task in "${task_list[@]}"; do 
+                create_vd
+                wait_for_device "/dev/$FIO_NAME"
+                prestat ${task}
+                if [[ $STAS == "Rebuild" ]]; then
+                    rebuild_raid
+                fi
+                if [[ "$DEV_NAME" == "PD" ]]; then echo "STATUS: STATE: BENCHMARKING: ${STAS^^}"; else echo "STATUS: STATE: BENCHMARKING: ${RAID_MODE} - ${STAS^^}"; fi
+                echo "STATUS: WORKLOAD: $(basename $task)"
+                update_progress
+                echo "---$NVME_INFO-${STAS}-$RAID_MODE-${PD_NUMBER}PD-${task}---"
+                OUTPUT_NAME_NEW="$OUTPUT_NAME-${task:16:-1}-${STAS}"
+                collect_log $OUTPUT_NAME_NEW $fio_dir
+                run_task $task $FIO_NAME $RUNTIME $CPUJOBS $CPU_ALLOWED_SEQ $fio_dir $OUTPUT_NAME_NEW $QD
+                del_devcie
+            done
         fi
 
         
@@ -978,8 +1021,7 @@ function run_test(){
 		        declare -A LAST_END_CPU_BY_NUMA
                 discard_dev
                 prestat ${task}
-                echo "STATUS: STATE: BENCHMARKING"
-                echo "STATUS: WORKLOAD: $(basename $task)"
+                if [[ "$DEV_NAME" == "PD" ]]; then echo "STATUS: STATE: BENCHMARKING: ${STAS^^}"; else echo "STATUS: STATE: BENCHMARKING: ${RAID_MODE} - ${STAS^^}"; fi
                 rm -rf tfie
                 for QD in  "${QD_LS[@]}"; do
                     unset LAST_END_CPU_BY_NUMA
@@ -988,6 +1030,8 @@ function run_test(){
                     # sed -i 's/iodepth=\([0-9]*\)//' tfie
                     # echo "iodepth=${QD}" >> tfie
                     for JOBS in "${pd_jobs[@]}"; do
+                        echo "STATUS: WORKLOAD: $(basename $task) - QD${QD} - ${JOBS}J"
+                        update_progress
                     unset LAST_END_CPU_BY_NUMA
                     declare -A LAST_END_CPU_BY_NUMA
                         cpu_seq=""
@@ -1066,8 +1110,9 @@ function run_test(){
                 # echo $PD_NAME
                 discard_dev
                 prestat ${task}
-                echo "STATUS: STATE: BENCHMARKING"
+                if [[ "$DEV_NAME" == "PD" ]]; then echo "STATUS: STATE: BENCHMARKING: ${STAS^^}"; else echo "STATUS: STATE: BENCHMARKING: ${RAID_MODE} - ${STAS^^}"; fi
                 echo "STATUS: WORKLOAD: $(basename $task)"
+                update_progress
                 if [[ $RUN_PD_ALL == "true" ]]; then
                     rm -rf tfie
 		    unset LAST_END_CPU_BY_NUMA
@@ -1135,14 +1180,12 @@ function graid_bench(){
     elif [[ $STAS == "Rebuild" ]] && [[ $DEV_NAME == "VD" ]]; then
         echo "----Running ${STAS}----"
         if [ "${RAID_MODE}" != "RAID0" ]; then
-            rebuild_raid
             run_test
             tail -n 60 /var/log/graid/graid_server.log > ${out_dir}/${STAS}/Rebuild_$OUTPUT_NAME.log
         fi
     elif [[ $STAS == "Rebuild" ]] && [[ $DEV_NAME == "MD" ]]; then
         echo "----Running ${STAS}----"
         if [ "${RAID_MODE}" != "RAID0" ]; then
-            rebuild_raid
             run_test
             mdadm -D /dev/$MD_NAME > ${out_dir}/${STAS}/Rebuild_$OUTPUT_NAME.log
         fi
@@ -1153,7 +1196,6 @@ function graid_bench(){
 
 function rebuild_raid(){
     echo "----Set RAID to rebuild---"
-    prestat ${task}
     # echo $DEV_NAME 
     if [[ $DEV_NAME == "VD" ]]; then
         graidctl edit pd $(($PD_NUMBER - 1)) marker offline 2>/dev/null
@@ -1241,7 +1283,7 @@ function detect_dev(){
 
 function discard_dev(){
     echo $DEV_NAME
-    echo "STATUS: STATE: DISCARDING"
+    echo "STATUS: STATE: DISCARD"
     echo "STATUS: WORKLOAD: Initializing..."
     if [[ "$DEV_NAME" == "PD" ]]; then
         if [[ $RUN_PD_ALL == "true" ]]; then
@@ -1265,12 +1307,18 @@ function discard_dev(){
         do
             MD_NVME_LIST=${MD_NVME_LIST:+$MD_NVME_LIST }/dev/$I
             discard_device /dev/$I &
+            
         done
         wait
     fi
 }
 
+function update_progress() {
+    echo "STATUS: TICK"
+}
+
 detect_dev
+
 output_name_dic
 discard_dev
 create_vd

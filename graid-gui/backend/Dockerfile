@@ -28,6 +28,7 @@ RUN echo '#!/bin/bash\nnsenter --target 1 --mount --uts --ipc --net --pid -- gra
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
+COPY templates ./templates
 RUN mkdir -p /app/scripts /app/results /app/logs
 EXPOSE 50071
 CMD ["python", "app.py"]

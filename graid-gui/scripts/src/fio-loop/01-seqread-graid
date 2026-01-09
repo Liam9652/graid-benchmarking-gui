@@ -7,8 +7,8 @@ ioengine=libaio
 direct=1
 random_generator=tausworthe64
 cpus_allowed_policy=split
-offset_increment=0g
-size=0g
+offset_increment=9g
+size=9g
 group_reporting=1
 norandommap=1
 
