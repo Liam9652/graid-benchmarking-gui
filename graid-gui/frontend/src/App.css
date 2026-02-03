@@ -234,6 +234,30 @@ body,
   color: #f39c12;
 }
 
+.connection-info {
+  font-size: 0.85rem;
+  opacity: 0.9;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  background: rgba(255, 255, 255, 0.1);
+  padding: 4px 10px;
+  border-radius: 4px;
+  margin-top: 4px;
+}
+
+.mode-remote {
+  color: #e74c3c;
+  font-weight: bold;
+  font-style: normal;
+}
+
+.mode-local {
+  color: #2ecc71;
+  font-weight: bold;
+  font-style: normal;
+}
+
 @keyframes pulse {
 
   0%,
@@ -1149,7 +1173,8 @@ label .hint {
   display: flex;
   flex-direction: column;
   gap: 15px;
-  max-width: 800px;
+  width: 100%;
+  max-width: 900px;
   margin: 0 auto;
   background: white;
   padding: 30px;
@@ -1171,12 +1196,10 @@ label .hint {
   flex-direction: column;
   justify-content: center;
   align-items: flex-end;
-  /* Align numbers to right like CDM */
   position: relative;
   min-height: 100px;
-  /* Increase height */
-  width: 0;
-  /* Fix flex layout */
+  min-width: 200px;
+  /* Ensure enough space for numbers */
 }
 
 .label-cell {
@@ -1196,12 +1219,14 @@ label .hint {
 .value-cell {
   background: #f8f9fa;
   border: 1px solid #e9ecef;
-  font-size: 2.5rem;
-  /* Big numbers */
+  font-size: 2rem;
+  /* Slightly smaller to fit */
   font-weight: 800;
   color: #2c3e50;
   font-family: 'Roboto Mono', monospace;
-  /* Monospace for alignment */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .value-cell-header {
@@ -1414,6 +1439,7 @@ label .hint {
   color: #ecf0f1;
   line-height: 1.6;
 }
+
 /* Connection & Dependency Styles */
 .connection-message {
   padding: 10px 15px;

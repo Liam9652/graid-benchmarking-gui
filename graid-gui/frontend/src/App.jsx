@@ -22,6 +22,11 @@ const HIDDEN_PARAMS = [
   'RUN_MD',
 ];
 
+const SENSITIVE_PARAMS = [
+  'DUT_PASSWORD',
+];
+
+
 const validateConfig = (cfg) => {
   const errors = [];
 
@@ -75,14 +80,18 @@ const validateConfig = (cfg) => {
 };
 
 function App() {
-  const [activeTab, setActiveTab] = useState('config');
+  const [activeTab, setActiveTab] = useState(localStorage.getItem('activeTab') || 'config');
   const [activeViewMode, setActiveViewMode] = useState('chart'); // Lifted state
-  const [config, setConfig] = useState({});
+  const [config, setConfig] = useState(() => {
+    const savedConfig = localStorage.getItem('configDraft');
+    return savedConfig ? JSON.parse(savedConfig) : {};
+  });
   const [configRef, setConfigRef] = useState(config); // Ref to access latest config in callbacks (Use state for reactivity if needed, or useRef)
   const configRefObj = React.useRef(config); // Renamed to avoid confusion with useState
   const [benchmarkRunning, setBenchmarkRunning] = useState(false);
   const [status, setStatus] = useState('');
   const [currentStage, setCurrentStage] = useState(null); // { stage: 'PD'|'VD', label: '...' }
+  const currentStageRef = React.useRef(null);
   const [runStatus, setRunStatus] = useState('BENCHMARKING');
   const [progress, setProgress] = useState({ percentage: 0, elapsed: 0, remaining: 0, current_step: 0, total_steps: 0 });
   const [error, setError] = useState('');
@@ -104,8 +113,318 @@ function App() {
   const [showAdvancedLog, setShowAdvancedLog] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [galleryFilters, setGalleryFilters] = useState({ raid: 'All', status: 'All', type: 'All' });
-  const [connectionStatus, setConnectionStatus] = useState({ loading: false, success: null, message: '', dependencies: null });
+  const [connectionStatus, setConnectionStatus] = useState(() => {
+    const saved = localStorage.getItem('connectionStatus');
+    return saved ? JSON.parse(saved) : { loading: false, success: null, message: '', dependencies: null };
+  });
   const logEndRef = React.useRef(null);
+  const [nvmeSortConfig, setNvmeSortConfig] = useState({ key: 'DevPath', direction: 'asc' });
+
+  const sortedNvmeInfo = React.useMemo(() => {
+    if (!systemInfo.nvme_info) return [];
+
+    return [...systemInfo.nvme_info].sort((a, b) => {
+      const { key, direction } = nvmeSortConfig;
+
+      let valA = a[key];
+      let valB = b[key];
+
+      // Handle missing values
+      if (valA === undefined || valA === null) valA = '';
+      if (valB === undefined || valB === null) valB = '';
+
+      let comparison = 0;
+
+      // Special handling for numeric fields
+      if (key === 'Capacity' || key === 'Numa') {
+        comparison = (Number(valA) || 0) - (Number(valB) || 0);
+      } else {
+        // String comparison with numeric awareness (e.g. nvme0n1 vs nvme0n10)
+        comparison = String(valA).localeCompare(String(valB), undefined, { numeric: true, sensitivity: 'base' });
+      }
+
+      return direction === 'asc' ? comparison : -comparison;
+    });
+  }, [systemInfo.nvme_info, nvmeSortConfig]);
+
+  const handleSort = (key) => {
+    setNvmeSortConfig(prev => ({
+      key,
+      direction: prev.key === key && prev.direction === 'asc' ? 'desc' : 'asc'
+    }));
+  };
+
+  const SortButton = ({ columnKey, currentConfig }) => {
+    const isActive = currentConfig.key === columnKey;
+    return (
+      <button
+        type="button"
+        onClick={() => handleSort(columnKey)}
+        style={{
+          background: 'transparent',
+          border: 'none',
+          cursor: 'pointer',
+          marginLeft: '5px',
+          fontSize: '12px',
+          padding: '0 4px',
+          color: isActive ? '#007bff' : '#ccc',
+          fontWeight: isActive ? 'bold' : 'normal'
+        }}
+        title={`Sort by ${columnKey}`}
+      >
+        {isActive ? (currentConfig.direction === 'asc' ? '▲' : '▼') : '⇅'}
+      </button>
+    );
+  };
+
+  const loadConfig = async () => {
+    try {
+      const response = await axios.get(`${API_BASE_URL}/api/config`);
+      if (response.data.success) {
+        setConfig(response.data.data);
+        configRefObj.current = response.data.data; // Sync ref
+        setError('');
+      }
+    } catch (err) {
+      setError('Loading config failed: ' + err.message);
+    }
+  };
+
+  const loadSystemInfo = async (cfg = null) => {
+    try {
+      const currentCfg = cfg || configRefObj.current;
+      const response = await axios.post(`${API_BASE_URL}/api/system-info`, {
+        config: currentCfg
+      });
+      if (response.data.success) {
+        setSystemInfo(response.data.data);
+      }
+    } catch (err) {
+      console.error('Loading system info failed:', err);
+    }
+  };
+
+  const loadLicenseInfo = async (cfg = null) => {
+    try {
+      const currentCfg = cfg || configRefObj.current;
+      const response = await axios.post(`${API_BASE_URL}/api/license-info`, {
+        config: currentCfg
+      });
+      if (response.data.success) {
+        setLicenseInfo(response.data.data);
+      }
+    } catch (err) {
+      console.error('Loading license info failed:', err);
+    }
+  };
+
+  const fetchLogs = async () => {
+    try {
+      const res = await axios.get(`${API_BASE_URL}/api/benchmark/logs`);
+      if (res.data.success) {
+        setAdvancedLogs(res.data.logs);
+      }
+    } catch (err) {
+      console.error('Failed to fetch logs:', err);
+    }
+  };
+
+  const checkBenchmarkStatus = async () => {
+    try {
+      const response = await axios.get(`${API_BASE_URL}/api/benchmark/status`);
+      if (response.data.success && response.data.data.running) {
+        setBenchmarkRunning(true);
+
+        // Restore progress if available
+        if (response.data.data.progress) {
+          setProgress(response.data.data.progress);
+        }
+
+        // Set a recovering status indicator
+        // Use recovered stage info if available
+        if (response.data.data.stage_info && response.data.data.stage_info.label) {
+          const sInfo = response.data.data.stage_info;
+          setCurrentStage(sInfo);
+          currentStageRef.current = sInfo;
+        } else {
+          setCurrentStage({ stage: 'VD', label: 'Recovering session...' });
+          currentStageRef.current = { stage: 'VD', label: 'Recovering session...' };
+        }
+
+        loadSystemInfo(); // Refresh system info to get latest remote hostname if any
+
+        if (response.data.data.recovered) {
+          setStatus(`[${new Date().toISOString()}] Benchmark session recovered`);
+        }
+
+        return response.data.data;
+      }
+    } catch (err) {
+      console.error('Check status failed:', err);
+    }
+    return null;
+  };
+
+  const handleSnapshot = async (data = {}) => {
+    try {
+      // 1. Save current view mode
+      const previousViewMode = activeViewMode;
+
+      // 2. Force switch to Report View (CDM Grid) - User requirement: Always capture Report View
+      if (previousViewMode !== 'cdm') {
+        setActiveViewMode('cdm');
+        // Wait for React to render the new view
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+
+      // Add a small delay to ensure DOM is updated
+      await new Promise(resolve => setTimeout(resolve, 200));
+
+      // Find the dashboard or report element
+      let element = document.querySelector('.cdm-grid');
+      // If CDM grid not found (fallback), look for dashboard classes
+      if (!element) element = document.querySelector('.dashboard-grid') || document.querySelector('.dashboard-wrapper');
+
+      if (!element) {
+        console.warn('Snapshot failed: No target element found');
+        // Restore view if we switched
+        if (previousViewMode !== 'cdm') setActiveViewMode(previousViewMode);
+        return;
+      }
+
+      console.log(`Taking snapshot for ${data.test_name} using element:`, element.className);
+      const canvas = await html2canvas(element, {
+        logging: false,
+        useCORS: true,
+        allowTaint: true
+      });
+      const imgData = canvas.toDataURL('image/png');
+
+      // 3. Restore original view mode
+      if (previousViewMode !== 'cdm') {
+        setActiveViewMode(previousViewMode);
+      }
+
+      const response = await axios.post(`${API_BASE_URL}/api/benchmark/save_snapshot`, {
+        image: imgData,
+        test_name: data.test_name,
+        output_dir: data.output_dir,
+        session_id: data.session_id || 'default'
+      });
+
+      if (response.data.success) {
+        console.log('Snapshot saved and synced successfully');
+      }
+    } catch (err) {
+      console.error('Snapshot failed:', err);
+    }
+  };
+
+  const updateRealTimeData = (data) => {
+    const devName = data.dev;
+
+    // Strict filter based on test configuration
+    let isMatch = false;
+
+    // Determine which devices are relevant for the current test config
+    // CRITICAL: Use the latest config from the ref to avoid closure traps
+    const currentConfig = configRefObj.current || {};
+    const runPD = currentConfig.RUN_PD !== false;
+    const runVD = currentConfig.RUN_VD !== false;
+    const nvmeList = currentConfig.NVME_LIST || [];
+    const vdName = currentConfig.VD_NAME || 'gdg0n1';
+
+    // If RUN_PD is active, check against NVME_LIST
+    // Fix: Only show if we are in PD stage or if stage is unknown/init
+    const stage = currentStageRef.current?.stage;
+
+    // Filter logic based on Stage
+    if (stage === 'PD') {
+      if (devName.startsWith('nvme')) {
+        // Further filter by selected NVMe list if available
+        if (nvmeList.length > 0) {
+          if (nvmeList.some(d => devName.includes(d))) isMatch = true;
+        } else {
+          isMatch = true;
+        }
+      }
+    } else if (stage === 'VD') {
+      if (devName.includes(vdName) || devName.startsWith('md') || devName.startsWith('gdg') || devName.startsWith('gvo')) {
+        isMatch = true;
+      }
+    } else {
+      // Fallback or Init: Show what is configured to run
+      if (runPD && devName.startsWith('nvme')) {
+        if (nvmeList.length > 0) {
+          if (nvmeList.some(d => devName.includes(d))) isMatch = true;
+        } else {
+          isMatch = true;
+        }
+      }
+      if (runVD && (devName.includes(vdName) || devName.startsWith('gdg'))) {
+        isMatch = true;
+      }
+    }
+
+    if (isMatch) {
+      setActiveDevices(prev => new Set(prev).add(devName));
+
+      const timestamp = new Date().toLocaleTimeString();
+
+      setRealTimeData(prev => {
+        const last = prev[prev.length - 1];
+        let shouldMerge = false;
+
+        if (last) {
+          const alreadyHasDevice = Object.keys(last).some(k => k.startsWith(`${devName}_`));
+          if (!alreadyHasDevice) {
+            shouldMerge = true;
+          }
+        }
+
+        if (shouldMerge) {
+          const updatedLast = {
+            ...last,
+            [`${devName}_iops_read`]: data.iops_read,
+            [`${devName}_bw_read`]: data.bw_read,
+            [`${devName}_lat_read`]: data.lat_read,
+            [`${devName}_iops_write`]: data.iops_write,
+            [`${devName}_bw_write`]: data.bw_write,
+            [`${devName}_lat_write`]: data.lat_write,
+          };
+          return [...prev.slice(0, -1), updatedLast];
+        } else {
+          const newData = {
+            timestamp,
+            [`${devName}_iops_read`]: data.iops_read,
+            [`${devName}_bw_read`]: data.bw_read,
+            [`${devName}_lat_read`]: data.lat_read,
+            [`${devName}_iops_write`]: data.iops_write,
+            [`${devName}_bw_write`]: data.bw_write,
+            [`${devName}_lat_write`]: data.lat_write,
+          };
+          const newHistory = [...prev, newData];
+          return newHistory.slice(-60);
+        }
+      });
+    }
+  };
+
+  // Sync refs to avoid closure traps in socket listeners
+  const updateRealTimeDataRef = React.useRef(updateRealTimeData);
+  const handleSnapshotRef = React.useRef(handleSnapshot);
+
+  useEffect(() => {
+    configRefObj.current = config;
+  }, [config]);
+
+  useEffect(() => {
+    updateRealTimeDataRef.current = updateRealTimeData;
+  }, [updateRealTimeData]);
+
+  useEffect(() => {
+    handleSnapshotRef.current = handleSnapshot;
+  }, [handleSnapshot]);
 
   useEffect(() => {
     const newSocket = io(API_BASE_URL);
@@ -122,9 +441,11 @@ function App() {
       if (data.status === 'completed' || data.status === 'failed') {
         setBenchmarkRunning(false);
         setCurrentStage(null);
+        currentStageRef.current = null;
       } else if (data.status === 'started') {
         setBenchmarkRunning(true);
         setCurrentStage({ stage: 'INIT', label: 'Initializing...' });
+        currentStageRef.current = { stage: 'INIT', label: 'Initializing...' };
         setRealTimeData([]); // Clear old data
         setActiveDevices(new Set()); // Clear old devices
         setProgress({ percentage: 0, elapsed: 0, remaining: 0, current_step: 0, total_steps: 0 });
@@ -138,20 +459,30 @@ function App() {
 
     newSocket.on('status_update', (data) => {
       setCurrentStage({ stage: data.stage, label: data.label });
+      currentStageRef.current = { stage: data.stage, label: data.label };
+      // If benchmark started while we were on config tab, maybe we should switch?
+      // But typically it starts from the Benchmark tab anyway.
     });
 
     newSocket.on('run_status_update', (data) => {
       setRunStatus(data.status.toUpperCase());
     });
 
+    newSocket.on('giostat_data_v2', (data) => {
+      if (updateRealTimeDataRef.current) {
+        updateRealTimeDataRef.current(data);
+      }
+    });
+
     newSocket.on('giostat_data', (data) => {
-      parseGiostatLine(data.line);
+      console.log('Got raw giostat data:', data);
     });
 
     // Listen for snapshot trigger
     newSocket.on('snapshot_request', (data) => {
-      console.log('Received snapshot request:', data);
-      handleSnapshot(data);
+      if (handleSnapshotRef.current) {
+        handleSnapshotRef.current(data);
+      }
     });
 
     newSocket.on('bench_log', (data) => {
@@ -161,13 +492,54 @@ function App() {
       });
     });
 
-    loadConfig();
-    loadSystemInfo();
-    loadLicenseInfo();
-    checkBenchmarkStatus();
+    const fetchLogs = async () => {
+      try {
+        const res = await axios.get(`${API_BASE_URL}/api/benchmark/logs`);
+        if (res.data.success) {
+          setAdvancedLogs(res.data.logs);
+        }
+      } catch (err) {
+        console.error('Failed to fetch logs:', err);
+      }
+    };
+
+    const init = async () => {
+      // If no saved config draft, load from server
+      if (!localStorage.getItem('configDraft')) {
+        await loadConfig();
+      }
+
+      const status = await checkBenchmarkStatus();
+      if (status && status.running) {
+        setActiveTab('benchmark');
+        fetchLogs();
+      }
+    };
+
+    init();
 
     return () => newSocket.close();
   }, []);
+
+  // Save activeTab to localStorage
+  useEffect(() => {
+    localStorage.setItem('activeTab', activeTab);
+  }, [activeTab]);
+
+  // Save config draft to localStorage
+  useEffect(() => {
+    if (Object.keys(config).length > 0) {
+      localStorage.setItem('configDraft', JSON.stringify(config));
+    }
+  }, [config]);
+
+  // Effect to load system info once config is loaded if we have connection success
+  useEffect(() => {
+    if (connectionStatus.success && Object.keys(config).length > 0) {
+      loadSystemInfo(config);
+      loadLicenseInfo(config);
+    }
+  }, [connectionStatus.success, (config && config.DUT_IP)]);
 
   // Real-time countdown for remaining time
   useEffect(() => {
@@ -211,172 +583,7 @@ function App() {
     });
   }, [systemInfo.controller_info]);
 
-  const loadSystemInfo = async (cfg = null) => {
-    try {
-      const currentCfg = cfg || configRefObj.current;
-      const response = await axios.post(`${API_BASE_URL}/api/system-info`, {
-        config: currentCfg
-      });
-      if (response.data.success) {
-        setSystemInfo(response.data.data);
-      }
-    } catch (err) {
-      console.error('Loading system info failed:', err);
-    }
-  };
-
-  const loadLicenseInfo = async (cfg = null) => {
-    try {
-      const currentCfg = cfg || configRefObj.current;
-      const response = await axios.post(`${API_BASE_URL}/api/license-info`, {
-        config: currentCfg
-      });
-      if (response.data.success) {
-        setLicenseInfo(response.data.data);
-      }
-    } catch (err) {
-      console.error('Loading license info failed:', err);
-    }
-  };
-
-  const parseGiostatLine = (line) => {
-    // Basic parsing for iostat -xmcd 1 output
-    const parts = line.trim().split(/\s+/);
-    if (parts.length < 12) return; // Not a valid data line
-    if (parts[0] === 'Device' || parts[0] === 'avg-cpu:') return; // Header
-
-    // Check if it matches our target device
-    const targetDevice = config.VD_NAME || 'nvme';
-    const devName = parts[0];
-
-    // Strict filter based on test configuration
-    let isMatch = false;
-
-    // Determine which devices are relevant for the current test config
-    // Use configRef.current to get the latest config inside local closure
-    const currentConfig = configRef.current || {};
-    const runPD = currentConfig.RUN_PD !== false; // Default to true if undefined
-    const runVD = currentConfig.RUN_VD !== false; // Default to true if undefined
-    const nvmeList = currentConfig.NVME_LIST || [];
-    const vdName = currentConfig.VD_NAME || 'gdg0n1';
-
-    // If RUN_PD is active, check against NVME_LIST
-    if (runPD) {
-      if (nvmeList.length > 0) {
-        // Exact or includes match for selected devices
-        if (nvmeList.some(d => devName.includes(d))) isMatch = true;
-      } else {
-        // Fallback: if list empty but PD test active, maybe show all nvme?
-        // But user asked for "tested devices only". If empty, arguably nothing is tested.
-        // We'll keep the old behavior of accepting all nvme if list is empty to be safe, 
-        // OR better: strict match only if list exists.
-        // Let's stick to strict if list exists. If list empty, we ignore PDs to avoid clutter?
-        // Actually, if list is empty, the benchmark script might select ALL. 
-        // Let's assume emptiness means "all" or "none". 
-        // Usage pattern implies user selects devices.
-        if (devName.startsWith('nvme')) isMatch = true;
-      }
-    }
-
-    // If RUN_VD is active, check against VD_NAME
-    if (runVD) {
-      if (devName.includes(vdName)) isMatch = true;
-    }
-
-    // Special case: if NO specific filtering (default state), show nvme and gdg/md to be helpful
-    if (!currentConfig.RUN_PD && !currentConfig.RUN_VD && !currentConfig.NVME_LIST) {
-      // Only if config is truly empty/default, to avoid noise at start
-      if (Object.keys(currentConfig).length === 0 && (devName.startsWith('nvme') || devName.startsWith('gdg'))) {
-        isMatch = true;
-      }
-    }
-
-    if (isMatch) {
-      setActiveDevices(prev => new Set(prev).add(devName));
-
-      const timestamp = new Date().toLocaleTimeString();
-      const iops_read = parseFloat(parts[1]);
-      const bw_read = parseFloat(parts[2]);
-      const lat_read = parseFloat(parts[5]);
-      const iops_write = parseFloat(parts[7]);
-      const bw_write = parseFloat(parts[8]);
-      const lat_write = parseFloat(parts[11]);
-
-      setRealTimeData(prev => {
-        const last = prev[prev.length - 1];
-
-        // If we have a last entry and this device is NOT yet in it, merge it.
-        // Otherwise (device already matches or no last entry), create new entry.
-        // We assume "timestamp" is close enough for grouping.
-        // Better heuristic: Check if `devName` data is already present in `last`.
-        let shouldMerge = false;
-
-        if (last) {
-          // Check if this device is already in the last record
-          const alreadyHasDevice = Object.keys(last).some(k => k.startsWith(`${devName}_`));
-          if (!alreadyHasDevice) {
-            shouldMerge = true;
-          }
-        }
-
-        if (shouldMerge) {
-          const updatedLast = {
-            ...last,
-            [`${devName}_iops_read`]: iops_read,
-            [`${devName}_bw_read`]: bw_read,
-            [`${devName}_lat_read`]: lat_read,
-            [`${devName}_iops_write`]: iops_write,
-            [`${devName}_bw_write`]: bw_write,
-            [`${devName}_lat_write`]: lat_write,
-          };
-          // Replace last entry
-          return [...prev.slice(0, -1), updatedLast];
-        } else {
-          // Create new entry
-          const newData = {
-            timestamp,
-            [`${devName}_iops_read`]: iops_read,
-            [`${devName}_bw_read`]: bw_read,
-            [`${devName}_lat_read`]: lat_read,
-            [`${devName}_iops_write`]: iops_write,
-            [`${devName}_bw_write`]: bw_write,
-            [`${devName}_lat_write`]: lat_write,
-          };
-          const newDataArray = [...prev, newData];
-          if (newDataArray.length > 50) newDataArray.shift(); // Keep last 50 points
-          return newDataArray;
-        }
-      });
-    }
-  };
-
-
-  const loadConfig = async () => {
-    try {
-      const response = await axios.get(`${API_BASE_URL}/api/config`);
-      if (response.data.success) {
-        setConfig(response.data.data);
-        configRef.current = response.data.data; // Sync ref
-        setError('');
-      }
-    } catch (err) {
-      setError('Loading config failed: ' + err.message);
-    }
-  };
-
-  const checkBenchmarkStatus = async () => {
-    try {
-      const response = await axios.get(`${API_BASE_URL}/api/benchmark/status`);
-      if (response.data.success) {
-        setBenchmarkRunning(response.data.data.running);
-        if (response.data.data.running && response.data.data.progress) {
-          setProgress(response.data.data.progress);
-        }
-      }
-    } catch (err) {
-      console.error('Checking benchmark status failed:', err);
-    }
-  };
+  // Consolidating configRefObj usage
 
   // ✅ 添加这个辅助函数
   const processArrayFields = (cfg) => {
@@ -460,17 +667,21 @@ function App() {
       const data = await response.json();
 
       if (data.success) {
-        setConnectionStatus({
+        const newStatus = {
           loading: false,
           success: true,
           message: data.message,
           dependencies: data.dependencies
-        });
+        };
+        setConnectionStatus(newStatus);
+        localStorage.setItem('connectionStatus', JSON.stringify(newStatus));
         // Success! Reload info from the remote DUT
         await loadSystemInfo(config);
         await loadLicenseInfo(config);
       } else {
-        setConnectionStatus({ loading: false, success: false, message: data.error });
+        const newStatus = { loading: false, success: false, message: data.error };
+        setConnectionStatus(newStatus);
+        localStorage.removeItem('connectionStatus');
       }
     } catch (error) {
       setConnectionStatus({ loading: false, success: false, message: error.message });
@@ -508,6 +719,7 @@ function App() {
     }
   };
 
+
   const loadResults = async () => {
     try {
       const response = await axios.get(`${API_BASE_URL}/api/results`);
@@ -519,57 +731,12 @@ function App() {
     }
   };
 
-  const handleSnapshot = async (data) => {
-    try {
-      // 1. Ensure we are on the Benchmark tab
-      setActiveTab('benchmark');
-
-      // 2. Force "Report View" (cdm) and hide Audit Log
-      setShowAdvancedLog(false);
-      setActiveViewMode('cdm');
-
-      // 3. Wait for React to render the new view
-      await new Promise(resolve => setTimeout(resolve, 800));
-
-      // 4. Capture
-      // Target the Metric View specifically
-      let element = document.querySelector('.cdm-grid');
-
-      if (!element) {
-        console.warn('.cdm-grid not found, trying .realtime-dashboard');
-        element = document.querySelector('.realtime-dashboard');
-      }
-
-      if (!element) {
-        console.warn('.realtime-dashboard not found, falling back to body');
-        element = document.body;
-      }
-
-      if (!element) return;
-
-      const canvas = await html2canvas(element, {
-        useCORS: true,
-        logging: false,
-        backgroundColor: '#1a1a1a', // Dark background for dark mode theme
-        scale: 2 // High resolution
-      });
-
-      const imageData = canvas.toDataURL('image/png');
-
-      await axios.post(`${API_BASE_URL}/api/benchmark/save_snapshot`, {
-        image: imageData,
-        test_name: data.test_name,
-        output_dir: data.output_dir
-      });
-
-      console.log('Snapshot uploaded successfully');
-      setStatus('📸 Snapshot saved');
-      setTimeout(() => setStatus(''), 2000);
-
-    } catch (err) {
-      console.error('Snapshot capture failed:', err);
+  useEffect(() => {
+    if (activeTab === 'results') {
+      loadResults();
     }
-  };
+  }, [activeTab]);
+
 
   const handleConfigChange = (key, value) => {
     setConfig(prev => {
@@ -583,6 +750,8 @@ function App() {
 
       // Trigger info reload if switching back to local mode
       if (key === 'REMOTE_MODE' && value === false) {
+        setConnectionStatus({ loading: false, success: null, message: '', dependencies: null });
+        localStorage.removeItem('connectionStatus');
         loadSystemInfo(newConfig);
         loadLicenseInfo(newConfig);
       }
@@ -845,6 +1014,16 @@ function App() {
             ) : (
               <span className="status-idle">● Standby</span>
             )}
+            <div className="connection-info">
+              {config.REMOTE_MODE ? (
+                <span>
+                  <i className="mode-remote">Remote Mode</i>: {config.DUT_IP}
+                  {systemInfo.hostname && ` (${systemInfo.hostname})`}
+                </span>
+              ) : (
+                <i className="mode-local">Local Mode</i>
+              )}
+            </div>
           </div>
           <HelpButton
             title={helpContent[language][activeTab]?.title || "Help"}
@@ -996,12 +1175,12 @@ function App() {
                       </div>
                       <div className="form-group" style={{ gridColumn: 'span 2', display: 'flex', gap: '10px' }}>
                         <button
-                          className="btn btn-secondary"
+                          className={`btn ${connectionStatus.success ? 'btn-success' : 'btn-secondary'}`}
                           onClick={handleTestConnection}
                           style={{ flex: 1 }}
                           disabled={connectionStatus.loading}
                         >
-                          {connectionStatus.loading ? '⏳ Connecting...' : '🔗 Connect'}
+                          {connectionStatus.loading ? '⏳ Connecting...' : (connectionStatus.success ? '✅ Connected' : '🔗 Connect')}
                         </button>
                       </div>
 
@@ -1013,30 +1192,32 @@ function App() {
 
                       {connectionStatus.dependencies && (
                         <div className="dependency-check" style={{ gridColumn: 'span 2', marginTop: '10px' }}>
-                          <h4 style={{ fontSize: '14px', marginBottom: '8px' }}>📦 Dependency Check:</h4>
-                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px' }}>
-                            {Object.entries(connectionStatus.dependencies).map(([dep, present]) => (
-                              <div key={dep} style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '13px' }}>
-                                <span>{present ? '✅' : '❌'}</span>
-                                <span style={{ color: present ? '#fff' : '#ff4d4f' }}>{dep}</span>
-                              </div>
-                            ))}
-                          </div>
-                          {Object.values(connectionStatus.dependencies).some(v => v === false) && (
-                            <div style={{ marginTop: '15px', padding: '10px', background: 'rgba(24, 144, 255, 0.1)', borderRadius: '4px', border: '1px solid rgba(24, 144, 255, 0.2)' }}>
-                              <p style={{ fontSize: '12px', marginBottom: '10px', color: '#1890ff' }}>
-                                Some dependencies are missing on the remote DUT. You can automatically install them using the button below.
-                              </p>
-                              <button
-                                className="btn btn-primary"
-                                onClick={handleSetupDUT}
-                                disabled={connectionStatus.loading}
-                                style={{ width: '100%' }}
-                              >
-                                {connectionStatus.loading ? '⏳ Setting up...' : '🚀 Setup Remote DUT (Bootstrap)'}
-                              </button>
-                            </div>
-                          )}
+                          {(() => {
+                            const allPassed = Object.values(connectionStatus.dependencies).every(v => v === true);
+                            return (
+                              <>
+                                <h4 style={{ fontSize: '14px', marginBottom: '8px' }}>
+                                  📦 Dependency Check: <span style={{ color: allPassed ? '#52c41a' : '#ff4d4f' }}>{allPassed ? 'Success' : 'Failed'}</span>
+                                </h4>
+
+                                {!allPassed && (
+                                  <div style={{ marginTop: '15px', padding: '10px', background: 'rgba(24, 144, 255, 0.1)', borderRadius: '4px', border: '1px solid rgba(24, 144, 255, 0.2)' }}>
+                                    <p style={{ fontSize: '12px', marginBottom: '10px', color: '#1890ff' }}>
+                                      Some dependencies are missing.
+                                    </p>
+                                    <button
+                                      className="btn btn-primary"
+                                      onClick={handleSetupDUT}
+                                      disabled={connectionStatus.loading}
+                                      style={{ width: '100%' }}
+                                    >
+                                      {connectionStatus.loading ? '⏳ Installing...' : '🚀 Execute Installation'}
+                                    </button>
+                                  </div>
+                                )}
+                              </>
+                            );
+                          })()}
                         </div>
                       )}
 
@@ -1074,14 +1255,26 @@ function App() {
                               title="Select All (respects license limit)"
                             />
                           </th>
-                          <th>Device</th>
-                          <th>Model</th>
-                          <th>Capacity</th>
-                          <th>NUMA</th>
+                          <th>
+                            Device
+                            <SortButton columnKey="DevPath" currentConfig={nvmeSortConfig} />
+                          </th>
+                          <th>
+                            Model
+                            <SortButton columnKey="Model" currentConfig={nvmeSortConfig} />
+                          </th>
+                          <th>
+                            Capacity
+                            <SortButton columnKey="Capacity" currentConfig={nvmeSortConfig} />
+                          </th>
+                          <th>
+                            NUMA
+                            <SortButton columnKey="Numa" currentConfig={nvmeSortConfig} />
+                          </th>
                         </tr>
                       </thead>
                       <tbody>
-                        {systemInfo.nvme_info.map((dev, idx) => (
+                        {sortedNvmeInfo.map((dev, idx) => (
                           <tr key={idx} onClick={() => toggleSelection('NVME_LIST', dev.DevPath.split('/').pop())} className={(config.NVME_LIST || []).includes(dev.DevPath.split('/').pop()) ? 'selected' : ''}>
                             <td>
                               <input
@@ -1253,11 +1446,17 @@ function App() {
                 <summary>📄 View Raw JSON (Visible Parameters Only)</summary>
                 <pre>{JSON.stringify(
                   Object.fromEntries(
-                    Object.entries(config).filter(([key]) => !HIDDEN_PARAMS.includes(key))
+                    Object.entries(config)
+                      .filter(([key]) => !HIDDEN_PARAMS.includes(key))
+                      .map(([key, val]) => [
+                        key,
+                        SENSITIVE_PARAMS.includes(key) ? '********' : val
+                      ])
                   ),
                   null,
                   2
                 )}</pre>
+
               </details>
             </div>
           )}
@@ -1400,6 +1599,7 @@ function App() {
                     devices={Array.from(activeDevices)}
                     viewMode={activeViewMode}
                     setViewMode={setActiveViewMode}
+                    testTarget={currentStage?.stage || null}
                   />
                 )}
               </div>
