@@ -7,6 +7,8 @@ A web-based GUI for benchmarking SupremeRAID performance, featuring real-time mo
 -   **Configuration Management**: Easily configure NVMe devices, RAID types, and test parameters.
 -   **One-Click Benchmarking**: Start/Stop benchmarks directly from the web interface.
 -   **Real-Time Monitoring**: Visualize IOPS, Bandwidth, and Latency in real-time during tests (powered by `giostat`).
+-   **Session Recovery**: Automatically recovers the benchmark state and progress if the page is refreshed or the connection is interrupted.
+-   **Enhanced Error Reporting**: Displays detailed, actionable error messages in the UI for issues like missing devices or dependencies.
 -   **Result Management**: View and compare benchmark results (Baseline vs Graid) with interactive charts.
 
 ## Prerequisites
@@ -50,7 +52,7 @@ A web-based GUI for benchmarking SupremeRAID performance, featuring real-time mo
 
 ### 3. Results
 -   Go to the **Result** tab.
--   View the list of past benchmarks.
+-   View the list of past benchmarks (supports `.tar`, `.tar.gz` archives and `.txt`, `.log` files).
 -   **Compare Results**: Select a "Baseline" result (e.g., Physical Drive test) and a "Graid" result (e.g., Virtual Drive test) to see side-by-side comparison charts.
 
 ## Development
@@ -68,5 +70,5 @@ The frontend is a React application located in `frontend/`.
 ## Troubleshooting
 
 -   **Real-time data not showing**: Ensure `giostat` is installed and accessible in the system path. Check the backend logs for errors.
--   **Benchmark fails to start**: Check `logs/` for detailed error messages. Ensure you have root privileges (Docker container runs as privileged).
+-   **Benchmark fails to start**: Check the UI for specific error messages (e.g., "Device not found"). Check `logs/` for detailed logs. Ensure you have root privileges (Docker container runs as privileged).
 
