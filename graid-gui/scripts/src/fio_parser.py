@@ -700,14 +700,9 @@ def read_file(u_file_path, u_file_type):
     elif Path(u_file_path).is_dir():
         # print('folder')
         parse_file_lst = []
-        parse_file_lst = [x for x in Path(
-            # u_file_path).rglob('*') if x.suffix == '.txt']
-
-            u_file_path).rglob('*') if x.suffix == u_file_type]
-        # parse_iostat_lst = [x for x in Path(
-        #     # u_file_path).rglob('*') if x.suffix == '.txt']
-
-        #     u_file_path).rglob('*') if x.suffix == '.iostat']
+        # Support both .txt and .log suffixes
+        parse_file_lst = [x for x in Path(u_file_path).rglob('*') 
+                         if x.suffix in ['.txt', '.log']]
         # print(parse_file_lst)
         for file in parse_file_lst:
             parser_fio(file)
@@ -963,5 +958,5 @@ if __name__ == '__main__':
         rm_folder(parse_file, 'query_result')
         u_name = Path(parse_file).stem.split('-')
         # print(u_name[-1].split('_')[-2])
-        read_file(parse_file, '.txt')
+        read_file(parse_file, '.log')
         # query_data(parse_file)
