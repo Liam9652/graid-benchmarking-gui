@@ -12,6 +12,7 @@ services:
       - ./scripts:/app/scripts
       - ./results:/app/results
       - ./logs:/app/logs
+      - ./backend/app.py:/app/app.py
       - ./graid-bench.conf:/app/graid-bench.conf
       # Access to host /dev is required for RAID and NVMe operations
       - /dev:/dev
