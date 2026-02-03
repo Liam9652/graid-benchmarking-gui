@@ -12,16 +12,19 @@ DEV_NAME=$8
 FILESYSTEM='RAW'
 PD_NAME=$9
 #declare -A LAST_END_CPU_BY_NUMA
-echo $DEV_NAME
-
-
+log_info() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $@"
+}
 
 . graid-bench.conf
-
 trap cleanup INT TERM EXIT
 
+SNAPSHOT_COUNT=0
+
+log_info "DEV_NAME: $DEV_NAME"
+
 function cleanup() {
-        echo "** Trapped Signal, Cleaning up..."
+        log_info "** Trapped Signal, Cleaning up..."
         # Disable trap to avoid recursion
         trap - INT TERM EXIT
         
@@ -178,7 +181,7 @@ function ipmi_error(){
 function collect_log() {
     output_name=$1
     output_fio_dir=$2
-    echo ---collect_log----
+    log_info "---collect_log----"
     # echo $output_name 
     # echo $output_fio_dir
     for u in iostat ssd_tmp cpu_tmp gpu_tmp raid_config; do
@@ -358,10 +361,9 @@ function wait_for_low_cpu_temp() {
 
         # Check if all CPU temperatures are lower than the threshold
         if $all_temps_low; then
-            echo "All CPU Temperatures are lower than $TEMP°C. Proceeding..."
-            break
+            log_info "All CPU Temperatures are lower than $TEMP°C. Proceeding..."
         else
-            echo "Some CPU Temperatures are still above $TEMP°C. Waiting..."
+            log_info "Some CPU Temperatures are still above $TEMP°C. Waiting..."
             sleep 5  #sleep 5 sec
         fi
     done
@@ -370,19 +372,22 @@ function wait_for_low_cpu_temp() {
 
 
 function trigger_snapshot() {
+    SNAPSHOT_COUNT=$((SNAPSHOT_COUNT + 1))
     local of_name=$1
     local fio_dir=$2
-    # Call backend to take snapshot
-    curl -X POST -H "Content-Type: application/json" -d "{\"test_name\": \"$of_name\", \"output_dir\": \"$fio_dir\"}" http://localhost:50071/api/benchmark/trigger_snapshot >/dev/null 2>&1
+    local unique_name=$(printf "%03d_%s" "$SNAPSHOT_COUNT" "$of_name")
+    # Output marker for backend to trigger snapshot
+    echo "STATUS: SNAPSHOT: test_name=\"$unique_name\" output_dir=\"$fio_dir\""
 }
 
 function output_name_dic() {
     # graid-a2000-ntfs-1vd-12pd-randread-j32b4kd32
     timestamp=$(date '+%Y-%m-%d')
-    result="$NVME_INFO-result"
-    out_dir=./$result/$NVME_INFO/${STAG}/${DEV_NAME}
+    # Use hidden directory for temporary/active test data
+    result=".test-temp-data/$NVME_INFO-result"
+    out_dir=../results/$result/$NVME_INFO/${STAG}/${DEV_NAME}
     mkdir -p ${out_dir}
-    out_dir_tmp=./$result/$NVME_INFO/
+    out_dir_tmp=../results/$result/$NVME_INFO/
 
     for ts in "${TS_LS[@]}"; do
         # mkdir -p "${out_dir}/$ts"
@@ -422,11 +427,10 @@ function wait_for_device() {
     local dg_num=${VD_NAME:3:1}
     while [[ ! -e $device ]]; do
         if (( count >= max_wait )); then
-            echo "Over 2mins recreate $device..."
-            create_vd
-            count=0
+            log_info "ERROR: Device $device failed to appear after 2 minutes."
+            exit 1
         else
-            echo "Checking for $device ..."
+            log_info "Checking for $device ..."
             sleep 5
             ((count++))
         fi
@@ -434,9 +438,8 @@ function wait_for_device() {
     if [[ $device == *gdg* ]]; then
         graidctl ls dg --dg-id="$dg_num" --format json > dg.log
         status=$(jq '.Result[0].State' dg.log | tr -d '"')
-        while [[ $status == "OPTIMAL" ]] && [[ $status == "RECOVERY" ]]; do
-
-            echo "Waiting for $device to finish initializing...sleeping for 3 minutes"
+        while [[ $status != "OPTIMAL" ]] && [[ $status != "RECOVERY" ]]; do
+            log_info "Waiting for $device to finish initializing (Current: $status)...sleeping for 3 minutes"
             sleep 180
             graidctl ls dg --dg-id="$dg_num" --format json > dg.log
             status=$(jq '.Result[0].State' dg.log | tr -d '"')
@@ -456,13 +459,13 @@ create_raid_group() {
         strip_option="-s $strip_size"
     fi
 
-    graidctl create dg $raid_mode 0-$(($pd_number - 1)) $strip_option $force_flag 2>/dev/null
+    yes | graidctl create dg $raid_mode 0-$(($pd_number - 1)) $strip_option $force_flag
 }
 
 create_virtual_disk() {
     local vd_name_c=$1
 
-    graidctl create vd 0 2>/dev/null
+    yes | graidctl create vd 0
     wait_for_device "/dev/$vd_name_c"
     sleep 15
 }
@@ -488,7 +491,7 @@ handle_sd_devices() {
 
 
 function create_vd(){
-    echo "----Create $RAID_MODE DG with $PD_NUMBER PD----"
+    log_info "----Create $RAID_MODE DG with $PD_NUMBER PD----"
     device=$(echo $NVME_LIST | awk '{print $1}')
 
     if [[ $DEV_NAME == "VD" ]]; then
@@ -622,18 +625,18 @@ function prestat() {
         sustain_time=3600
         #Micron 7450
         tvid="0x1344"
-        local common_args="--size=${runsize}g --offset_increment=${runsize}g "
+        local common_args="--size=${runsize}g --offset_increment=${runsize}g --iodepth=${IODEPTH:-1} "
     else
         echo $vid
         sustain_time=36
         tvid="0x1af4"
-        local common_args="--size=${runsize}g --offset_increment=${runsize}g --runtime=5"
+        local common_args="--size=${runsize}g --offset_increment=${runsize}g --runtime=5 --iodepth=${IODEPTH:-1}"
     fi
     
     if [[ "${STAG}" == "afterprecondition" ]];  then
-            echo "----precondition(1st)----"
-            echo "STATUS: STATE: PRECONDITIONING"
-            echo "STATUS: WORKLOAD: Precondition"
+            log_info "----precondition(1st)----"
+            log_info "STATUS: STATE: PRECONDITIONING"
+            log_info "STATUS: WORKLOAD: Precondition"
         if [[ "$DEV_NAME" != "PD" ]]; then
             fio src/precondition.fio --filename="/dev/$FIO_NAME" $common_args --output="$out_dir/$OUTPUT_NAME-precondition.log"
             sleep 5
@@ -652,9 +655,9 @@ function prestat() {
     fi
     # if [[ "${STAG}" == "aftersustain" ]] && [[ "$vid" != '' ]]; then
     if [[ "${STAG}" == "aftersustain" ]] && [[ "$vid" != "$tvid" ]]; then
-        echo "----precondition----"
-        echo "STATUS: STATE: PRECONDITIONING"
-        echo "STATUS: WORKLOAD: Precondition"
+        log_info "----precondition----"
+        log_info "STATUS: STATE: PRECONDITIONING"
+        log_info "STATUS: WORKLOAD: Precondition"
         if [[ "$DEV_NAME" != "PD" ]]; then
             fio src/precondition.fio --filename="/dev/$FIO_NAME" $common_args --output="$out_dir/$OUTPUT_NAME-precondition.log" &
             fio_pid=$!
@@ -675,11 +678,11 @@ function prestat() {
                 fio src/precondition.fio --filename=/dev/"$PD_NAME" $common_args --output="$out_dir/$OUTPUT_NAME-$PD_NAME-precondition.log"
             fi
         fi
-        echo "----aftersustain----"
-        echo "STATUS: STATE: SUSTAINING"
-        echo "STATUS: WORKLOAD: Sustain Write"
+        log_info "----aftersustain----"
+        log_info "STATUS: STATE: SUSTAINING"
+        log_info "STATUS: WORKLOAD: Sustain Write"
         if [[ "$DEV_NAME" != "PD" ]]; then
-            fio src/fio-loop/09-randwrite-graid --filename="/dev/$FIO_NAME" --runtime=$sustain_time --numjobs="$CPUJOBS" --cpus_allowed="$CPU_ALLOWED_SEQ" --output="$out_dir/$OUTPUT_NAME-sustain.log"
+            fio src/fio-loop/09-randwrite-graid --filename="/dev/$FIO_NAME" --runtime=$sustain_time --numjobs="$CPUJOBS" --cpus_allowed="$CPU_ALLOWED_SEQ" --iodepth=${IODEPTH} --output="$out_dir/$OUTPUT_NAME-sustain.log"
             sleep 5
         elif [[ "$DEV_NAME" == "PD" ]]; then
             if [[ $RUN_PD_ALL == "true" ]]; then
@@ -688,28 +691,37 @@ function prestat() {
                 for PD_NAME in "${NVME_LIST[@]}"; do
                     printf "[${PD_NAME}]\nfilename=/dev/${PD_NAME}\n" >> tfie
                 done
-                fio tfie --runtime=$sustain_time --numjobs=8 --output="$result/$OUTPUT_NAME-PD_ALL-sustain.log"
+                fio tfie --runtime=$sustain_time --numjobs=8 --iodepth=${IODEPTH} --output="$result/$OUTPUT_NAME-PD_ALL-sustain.log"
                 rm -rf tfie
             else
-                fio "$src_path/09-randwrite-graid" --filename=/dev/"$PD_NAME" --runtime=$sustain_time --numjobs=8 --output="$out_dir/$OUTPUT_NAME-$PD_NAME-sustain.log"
+                fio "$src_path/09-randwrite-graid" --filename=/dev/"$PD_NAME" --runtime=$sustain_time --numjobs=8 --iodepth=${IODEPTH} --output="$out_dir/$OUTPUT_NAME-$PD_NAME-sustain.log"
             fi
         fi
-
     fi
-
     # if [[ "${STAG}" == "aftersustain" ]] && [[ "$vid" == '0x1af4' ]]; then
     if [[ "${STAG}" == "aftersustain" ]] && [[ "$vid" == "$tvid" ]]; then
-        echo "----aftersustain----"
-        echo "STATUS: STATE: SUSTAINING"
-        echo "STATUS: WORKLOAD: Sustain Write"
+        log_info "----aftersustain----"
+        log_info "STATUS: STATE: SUSTAINING"
+        log_info "STATUS: WORKLOAD: Sustain Write"
         if [[ "$DEV_NAME" != "PD" ]]; then
-            fio src/fio-loop/09-randwrite-graid --filename="/dev/$FIO_NAME" --runtime=$sustain_time --numjobs="$CPUJOBS" --cpus_allowed="$CPU_ALLOWED_SEQ" --output="$out_dir/$OUTPUT_NAME-sustain.log" &
+            fio src/fio-loop/09-randwrite-graid --filename="/dev/$FIO_NAME" --runtime=$sustain_time --numjobs="$CPUJOBS" --cpus_allowed="$CPU_ALLOWED_SEQ" --iodepth=${IODEPTH:-1} --output="$out_dir/$OUTPUT_NAME-sustain.log" &
             fio_pid=$!
+            
+            # Use polling instead of static sleep
             if (( sustain_time > 15 )); then
-                sleep $((sustain_time - 12))
+                wait_time=$((sustain_time - 12))
+                start_wait=$(date +%s)
+                while (( $(date +%s) - start_wait < wait_time )); do
+                    if ! kill -0 $fio_pid 2>/dev/null; then
+                        log_info "WARNING: fio sustain process ended early."
+                        break
+                    fi
+                    sleep 10
+                done
             else
                 sleep $((sustain_time / 2))
             fi
+            
             trigger_snapshot "${OUTPUT_NAME}-${STAG}-sustain" "${fio_dir:-$out_dir}"
             wait $fio_pid
             sleep 2
@@ -720,10 +732,10 @@ function prestat() {
                 for PD_NAME in "${NVME_LIST[@]}"; do
                     printf "[${PD_NAME}]\nfilename=/dev/${PD_NAME}\n" >> tfie
                 done
-                fio tfie --runtime=$sustain_time --numjobs=8 --output="$result/$OUTPUT_NAME-PD_ALL-sustain.log"
+                fio tfie --runtime=$sustain_time --numjobs=8 --iodepth=${IODEPTH:-1} --output="$result/$OUTPUT_NAME-PD_ALL-sustain.log"
                 rm -rf tfie
             else
-                fio "$src_path/09-randwrite-graid" --filename=/dev/"$PD_NAME" --runtime=$sustain_time --numjobs=8 --output="$out_dir/$OUTPUT_NAME-$PD_NAME-sustain.log"
+                fio "$src_path/09-randwrite-graid" --filename=/dev/"$PD_NAME" --runtime=$sustain_time --numjobs=8 --iodepth=${IODEPTH:-1} --output="$out_dir/$OUTPUT_NAME-$PD_NAME-sustain.log"
             fi
         fi
     fi
@@ -739,7 +751,7 @@ function kill_pid(){
 
 function discard_device() {
     local device="$1"
-    echo $device
+    # echo "Discarding $device..."
     # Try with "-f" option
     blkdiscard "$device" -f > /dev/null 2>&1
     local RESULT=$?
@@ -750,40 +762,43 @@ function discard_device() {
         RESULT=$?
     fi
 
-    # Check if either attempt was successful
-    if [ $RESULT -eq 0 ]; then
-        echo "blkdiscard success on $device"
-    else
-        echo "blkdiscard failed on $device"
-        exit 1
-    fi
     if [[ $device == *nvme* ]]; then
-        nvme format -f "$device"
-        nvme sanitize -a 2 "$device"
+        nvme format -f "$device" > /dev/null 2>&1
+        nvme sanitize -a 2 "$device" > /dev/null 2>&1
         check_sanitize_done "$device"
     fi
-    
-
-
 }
 
 check_sanitize_done() {
     local device_path="$1"
     local device="${device_path#/dev/}"
+    
     while true; do
-        devices_status=$(nvme sanitize-log "$device_path" -o json 2>/dev/null)
-        if [ $? -eq 0 ]; then  # Check if nvme command succeeded
-            devices_finished=$(echo "$devices_status" | jq -r --arg device "$device" '.[$device].sprog')
-            if [[ "$devices_finished" == "65535" ]]; then
-                echo "Sanitization finished"
-                return 0  # Indicate success with exit status 0
-            else
-                echo "Sanitization in progress, checking again in 5 seconds..."
-                sleep 5  # Wait for 5 seconds before checking again
-            fi
+        local sprog=""
+        
+        # 1. Try JSON output
+        local json_out
+        json_out=$(nvme sanitize-log "$device_path" -o json 2>/dev/null)
+        
+        if [[ -n "$json_out" ]]; then
+            # Attempt to parse as JSON, handling both flat and nested structure
+            sprog=$(echo "$json_out" | jq -r --arg device "$device" '.sprog // .[$device].sprog' 2>/dev/null)
+        fi
+        
+        # 2. Fallback to text output if JSON failed to produce value
+        if [[ -z "$sprog" || "$sprog" == "null" ]]; then
+             local text_out
+             text_out=$(nvme sanitize-log "$device_path" 2>/dev/null)
+             # Parse 'Sanitize Progress (SPROG) : 65535'
+             sprog=$(echo "$text_out" | grep -i "SPROG" | awk -F':' '{print $2}' | tr -d '[:space:]')
+        fi
+
+        if [[ "$sprog" == "65535" ]]; then
+             # echo "Sanitization finished on $device"
+             return 0
         else
-            echo "Error reading sanitize log for device $device_path"
-            return 2  # Indicate an error with a distinct non-zero exit status
+             # echo "Sanitization in progress, checking again in 5 seconds..."
+             sleep 5
         fi
     done
 }
@@ -794,11 +809,14 @@ function run_task(){
         run_time=$3
         job=$4
         cpus=$5
+        
+        # Ensure IODEPTH has a value
+        export IODEPTH=${IODEPTH:-1}
         fio_dir=$6
         of_name=$7
         qd=$8
         # echo ---run task----
-        echo $1 $2 $3 $4 $5 $6 $7 $8
+        log_info "$1 $2 $3 $4 $5 $6 $7 $8"
         fio_cmd_dir=${fio_dir}/cmd
         mkdir -p $fio_cmd_dir
         fio_pid_list=""
@@ -838,11 +856,19 @@ function run_task(){
         
         # echo ${iostat_pid_list}
 
-        # Trigger Snapshot roughly 12 seconds before the end of the run
+        # Trigger Snapshot roughly 10 seconds before the end of the run
         if (( run_time > 15 )); then
-            sleep $((run_time - 12))
+            wait_time=$((run_time - 10))
+            start_wait=$(date +%s)
+            while (( $(date +%s) - start_wait < wait_time )); do
+                if ! kill -0 ${fio_pid_list} 2>/dev/null; then
+                    log_info "WARNING: fio process ended unexpectedly."
+                    break
+                fi
+                sleep 5
+            done
             trigger_snapshot "$of_name" "$fio_dir"
-            # Wait for FIO to finish (remaining 12s + some buffer)
+            # Wait for FIO to finish (remaining 10s + some buffer)
             wait ${fio_pid_list}
         else
             # For short runs, capture in the middle
@@ -852,7 +878,7 @@ function run_task(){
         fi
         
         # Give some time for frontend to process before cleanup
-        sleep 2
+        sleep 5
         sync
         if [[ "$LOG_COMPACT" == "false" ]]; then
             kill_pid ${atop_pid_list}
@@ -875,20 +901,21 @@ function run_test(){
     if [[ $DEV_NAME != "PD" ]]; then
         if [[ $LS_JB == "true" ]]; then
             for task in "${task_list[@]}"; do 
-                echo "---$NVME_INFO-${STAS}-$RAID_MODE-${PD_NUMBER}PD-${task}---"
+                log_info "---$NVME_INFO-${STAS}-$RAID_MODE-${PD_NUMBER}PD-${task}---"
                 rm -rf tfie 
                 create_vd
                 prestat ${task}
                 if [[ $STAS == "Rebuild" ]]; then
                     rebuild_raid
                 fi
-                if [[ "$DEV_NAME" == "PD" ]]; then echo "STATUS: STATE: BENCHMARKING: ${STAS^^}"; else echo "STATUS: STATE: BENCHMARKING: ${RAID_MODE} - ${STAS^^}"; fi
+                if [[ "$DEV_NAME" == "PD" ]]; then log_info "STATUS: STATE: BENCHMARKING: ${STAS^^}"; else log_info "STATUS: STATE: BENCHMARKING: ${RAID_MODE} - ${STAS^^}"; fi
                 for QD in  "${QD_LS[@]}"; do
                     for JOBS in "${JOB_LS[@]}"; do
-                        echo "STATUS: WORKLOAD: $(basename $task) - QD${QD} - ${JOBS}J"
+                        log_info "STATUS: WORKLOAD: $(basename $task) - QD${QD} - ${JOBS}J"
                         update_progress
                         cp $task tfie
-                        sed -i 's/iodepth=\([0-9]*\)//' tfie
+                        sed -i '/^iodepth=/d' tfie
+                        sed -i "/ramp_time=/a iodepth=$QD" tfie
                         cpu_seq=""
                         #get all cpu list and get the cpu_seq by added diff jobs
                         cpu_lst_node=$(cat /sys/devices/system/node/online | awk -F'-' '{print $NF}')
@@ -909,7 +936,8 @@ function run_test(){
 
                         # echo "$JOBS" "$cpus_counts"
                         # echo $CPU_ALLOWED
-                        OUTPUT_NAME_NEW="${OUTPUT_NAME}-${task:16:-1}-${STAS}-${JOBS}J-${QD}D"
+                        task_name=$(basename "$task" | sed 's/-graid//')
+                        OUTPUT_NAME_NEW="${OUTPUT_NAME}-${task_name}-${STAS}-${JOBS}J-${QD}D"
                         # output_name=$1
                         # output_fio_dir=$2
 
@@ -924,20 +952,21 @@ function run_test(){
             done
         elif [[ $LS_BS == "true" ]]; then
             for task in "${task_list[@]}"; do 
-                echo "---$NVME_INFO-${STAS}-$RAID_MODE-${PD_NUMBER}PD-${task}---"
+                log_info "---$NVME_INFO-${STAS}-$RAID_MODE-${PD_NUMBER}PD-${task}---"
                 rm -rf tfie 
                 create_vd
                 prestat ${task}
                 if [[ $STAS == "Rebuild" ]]; then
                     rebuild_raid
                 fi
-                if [[ "$DEV_NAME" == "PD" ]]; then echo "STATUS: STATE: BENCHMARKING: ${STAS^^}"; else echo "STATUS: STATE: BENCHMARKING: ${RAID_MODE} - ${STAS^^}"; fi
+                if [[ "$DEV_NAME" == "PD" ]]; then log_info "STATUS: STATE: BENCHMARKING: ${STAS^^}"; else log_info "STATUS: STATE: BENCHMARKING: ${RAID_MODE} - ${STAS^^}"; fi
                 for bs in  "${BS_LS[@]}"; do
-                    echo "STATUS: WORKLOAD: $(basename $task) - ${bs}k"
+                    log_info "STATUS: WORKLOAD: $(basename $task) - ${bs}k"
                     update_progress
                     cp $task tfie
                     sed -i "s/^bs=.*/bs="$bs"k/" tfie
-                    OUTPUT_NAME_NEW="$OUTPUT_NAME-${task:16:-1}-${STAS}-${bs}k"
+                    task_name=$(basename "$task" | sed 's/-graid//')
+                    OUTPUT_NAME_NEW="$OUTPUT_NAME-${task_name}-${STAS}-${bs}k"
                     collect_log $OUTPUT_NAME_NEW $fio_dir
                     run_task tfie $FIO_NAME $RUNTIME $CPUJOBS $CPU_ALLOWED_SEQ $fio_dir $OUTPUT_NAME_NEW $QD
                     if [[ $WCD == "true" ]]; then
@@ -961,7 +990,8 @@ function run_test(){
                             echo "STATUS: WORKLOAD: $(basename $task) - ${bs}k - QD${QD} - ${JOBS}J"
                             update_progress
                             cp $task tfie
-                            sed -i 's/iodepth=\([0-9]*\)//' tfie
+                            sed -i '/^iodepth=/d' tfie
+                            sed -i "/ramp_time=/a iodepth=$QD" tfie
                             sed -i "s/^bs=.*/bs="$bs"k/" tfie
                             cpu_seq=""
                             #get all cpu list and get the cpu_seq by added diff jobs
@@ -981,7 +1011,8 @@ function run_test(){
                                 CPU_ALLOWED=${cpu_seq:1}
                             fi
 
-                            OUTPUT_NAME_NEW="${OUTPUT_NAME}-${task:16:-1}-${STAS}-${JOBS}J-${QD}D-${bs}k"
+                            task_name=$(basename "$task" | sed 's/-graid//')
+                            OUTPUT_NAME_NEW="${OUTPUT_NAME}-${task_name}-${STAS}-${JOBS}J-${QD}D-${bs}k"
                             collect_log $OUTPUT_NAME_NEW $fio_dir
                             run_task tfie $FIO_NAME $RUNTIME $JOBS $CPU_ALLOWED $fio_dir $OUTPUT_NAME_NEW $QD
                             if [[ $WCD == "true" ]]; then
@@ -1004,7 +1035,8 @@ function run_test(){
                 echo "STATUS: WORKLOAD: $(basename $task)"
                 update_progress
                 echo "---$NVME_INFO-${STAS}-$RAID_MODE-${PD_NUMBER}PD-${task}---"
-                OUTPUT_NAME_NEW="$OUTPUT_NAME-${task:16:-1}-${STAS}"
+                task_name=$(basename "$task" | sed 's/-graid//')
+                OUTPUT_NAME_NEW="$OUTPUT_NAME-${task_name}-${STAS}"
                 collect_log $OUTPUT_NAME_NEW $fio_dir
                 run_task $task $FIO_NAME $RUNTIME $CPUJOBS $CPU_ALLOWED_SEQ $fio_dir $OUTPUT_NAME_NEW $QD
                 del_devcie
@@ -1051,8 +1083,8 @@ function run_test(){
                             MAX_CPU=$(get_physical_cores)
                             MAX_CPU=$((MAX_CPU - 1))
                             sed -e 's/\[graid-test\]//' $task > tfie
-                            sed -i 's/iodepth=\([0-9]*\)//' tfie
-                            echo "iodepth=${QD}" >> tfie
+                            sed -i '/^iodepth=/d' tfie
+                            sed -i "/ramp_time=/a iodepth=${QD}" tfie
                             for PD_NAME in "${NVME_LIST[@]}"
                             do
                                 echo "[${PD_NAME}]" >> tfie
@@ -1080,18 +1112,20 @@ function run_test(){
                                 fi
                             done
                             
-                            OUTPUT_NAME_NEW="$OUTPUT_NAME-BSALL-${task:16:-1}-${STAS}-${JOBS}J-${QD}D"
+                            task_name=$(basename "$task" | sed 's/-graid//')
+                            OUTPUT_NAME_NEW="$OUTPUT_NAME-BSALL-${task_name}-${STAS}-${JOBS}J-${QD}D"
                             collect_log $OUTPUT_NAME_NEW $fio_dir
-                            run_task tfie $PD_NAME $RUNTIME $JOBS $CPU_ALLOWED $fio_dir $OUTPUT_NAME_NEW
+                            run_task tfie $PD_NAME $RUNTIME $JOBS $CPU_ALLOWED $fio_dir $OUTPUT_NAME_NEW $QD
                             if [[ $WCD == "true" ]]; then
                                 wait_for_low_cpu_temp
                             fi
                         else
-                            OUTPUT_NAME_NEW="$OUTPUT_NAME-${PD_NAME}-${task:16:-1}-${STAS}-${JOBS}J-${QD}D"
+                            task_name=$(basename "$task" | sed 's/-graid//')
+                            OUTPUT_NAME_NEW="$OUTPUT_NAME-${PD_NAME}-${task_name}-${STAS}-${JOBS}J-${QD}D"
                             CPU_ALLOWED=$(get_numa $PD_NAME $JOBS )
                             cp $task tfie
-                            sed -i 's/iodepth=\([0-9]*\)//'  tfie
-                            echo "iodepth=${QD}" >> tfie
+                            sed -i '/^iodepth=/d' tfie
+                            sed -i "/ramp_time=/a iodepth=${QD}" tfie
                             #echo $JOBS
 
                             collect_log $OUTPUT_NAME_NEW $fio_dir 
@@ -1122,6 +1156,10 @@ function run_test(){
 		    MAX_CPU=$((MAX_CPU - 1))
                     sed -e 's/\[graid-test\]//' $task > tfie
                     
+                    sed -i '/^iodepth=/d' tfie
+                    sed -i "/ramp_time=/a iodepth=${IODEPTH:-1}" tfie
+
+                    
                     for PD_NAME in "${NVME_LIST[@]}"
                     do
                         echo "[${PD_NAME}]" >> tfie
@@ -1150,7 +1188,8 @@ function run_test(){
                         
                     done
 
-                    OUTPUT_NAME_NEW="$OUTPUT_NAME-BSALL-${task:16:-1}-${STAS}"
+                    task_name=$(basename "$task" | sed 's/-graid//')
+                    OUTPUT_NAME_NEW="$OUTPUT_NAME-BSALL-${task_name}-${STAS}"
                     # CPU_ALLOWED=$(get_numa $PD_NAME $pd_jobs )
                     collect_log $OUTPUT_NAME_NEW $fio_dir
                     run_task tfie $PD_NAME $RUNTIME $pd_jobs $CPU_ALLOWED $fio_dir $OUTPUT_NAME_NEW $QD
@@ -1158,7 +1197,8 @@ function run_test(){
                         wait_for_low_cpu_temp
                     fi
                 else
-                    OUTPUT_NAME_NEW="$OUTPUT_NAME-BS-${PD_NAME}-${task:16:-1}-${STAS}"
+                    task_name=$(basename "$task" | sed 's/-graid//')
+                    OUTPUT_NAME_NEW="$OUTPUT_NAME-BS-${PD_NAME}-${task_name}-${STAS}"
                     CPU_ALLOWED=$(get_numa $PD_NAME $pd_jobs )
                     collect_log $OUTPUT_NAME_NEW $fio_dir 
                     run_task $task $PD_NAME $RUNTIME $pd_jobs $CPU_ALLOWED_SEQ $fio_dir $OUTPUT_NAME_NEW $QD
@@ -1169,6 +1209,8 @@ function run_test(){
             done
         fi
     fi
+
+    log_info "----Benchmark Logic Completed----"
 
 }                   
 
@@ -1275,42 +1317,47 @@ function detect_dev(){
                     ;;
                 *) echo "$RAID_MODE : unknow."
             esac
-            echo start md
+            log_info start md
             sleep 5
     fi
 
 }
 
 function discard_dev(){
-    echo $DEV_NAME
-    echo "STATUS: STATE: DISCARD"
-    echo "STATUS: WORKLOAD: Initializing..."
+    log_info "DEV_NAME: $DEV_NAME"
+    log_info "STATUS: STATE: DISCARD"
+    log_info "STATUS: WORKLOAD: Initializing..."
+    log_info "Cleaning and sanitizing devices, please wait..."
     if [[ "$DEV_NAME" == "PD" ]]; then
         if [[ $RUN_PD_ALL == "true" ]]; then
             PD_NAME=""
             # echo '12312'
-            echo ${NVME_LIST[@]}
+            # echo ${NVME_LIST[@]}
+            pids=()
             for PD_NAME in "${NVME_LIST[@]}"
             do
                 discard_device /dev/$PD_NAME &
+                pids+=($!)
             done
-            wait
+            wait "${pids[@]}"
         else
             # blkdiscard $PD_NAME
             discard_device /dev/$PD_NAME
             wait
         fi
 
-    elif [[ "$DEV_NAME" == "MD" ]] || [[ "$DEV_NAME" == "VD" ]]; then
+    elif [[ "$DEV_NAME" == "MD" ]]; then
         MD_NVME_LIST=""
+        pids=()
         for I in "${NVME_LIST[@]}"; 
         do
             MD_NVME_LIST=${MD_NVME_LIST:+$MD_NVME_LIST }/dev/$I
             discard_device /dev/$I &
-            
+            pids+=($!)
         done
-        wait
+        wait "${pids[@]}"
     fi
+    echo "Device cleaning completed."
 }
 
 function update_progress() {
@@ -1338,3 +1385,4 @@ if [[ "$DEV_NAME" != "PD" ]]; then
     fi
 fi
 
+trap - INT TERM EXIT

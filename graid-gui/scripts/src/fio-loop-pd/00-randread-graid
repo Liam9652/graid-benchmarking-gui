@@ -13,7 +13,6 @@ norandommap=1
 [graid-test]
 rw=randread
 bs=4k
-iodepth=64
 
 # runtime=180
 # numjobs=128

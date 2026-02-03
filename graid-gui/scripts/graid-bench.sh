@@ -2,8 +2,17 @@
 
 export LC_ALL=C
 
+# Separate debug trace (set -x) to debug.log instead of mixing with audit log
+DEBUG_LOG_FILE="./debug.log"
 LOG_FILE="./output.log"
-# exec > >(tee -a "$LOG_FILE") 2>&1
+
+# Open fd 3 for debug log and redirect xtrace there
+exec 3>> "$DEBUG_LOG_FILE"
+export BASH_XTRACEFD=3
+set -x
+
+# Main output goes to output.log (audit log only)
+exec > >(tee -a "$LOG_FILE") 2>&1
 
 # Check the running shell and re-run with bash if necessary
 if [ "$BASH" != "/bin/bash" ]; then
@@ -12,6 +21,10 @@ if [ "$BASH" != "/bin/bash" ]; then
 fi
 
 trap "trap - SIGTERM && kill -- -$$ 2>/dev/null" SIGINT SIGTERM EXIT
+
+log_info() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
 
 
 Help()
@@ -48,7 +61,9 @@ done
 
 function check_root_user() {
     if [[ $(whoami) != "root" ]]; then
+        echo "STATUS: ERROR: Script must be run as root."
         echo "Must be root or using sudo"
+        sleep 1
         exit 1
     fi
 }
@@ -58,14 +73,16 @@ get_distro() {
         source /etc/os-release
         echo "$ID" | tr '[:upper:]' '[:lower:]'
     else
+        echo "STATUS: ERROR: /etc/os-release does not exist."
         echo "Error: /etc/os-release does not exist."
+        sleep 1
         exit 1
     fi
 }
 
 
 function check_dependencies() {
-    echo -n "Checking dependencies... "
+    log_info "Checking dependencies..."
     deps=0
 
     # Check if LOG_COMPACT is true
@@ -157,23 +174,26 @@ function check_dependencies() {
     done
     
     if [[ $deps -ne 1 ]]; then
-        echo "OK"
+        log_info "Dependency check OK"
     else
-        echo -en "\nInstall the above and rerun this script\n"; exit 1;
+        echo "STATUS: ERROR: Missing dependencies. Check log for details."
+        log_info "Error: Missing dependencies. Install the above and rerun this script"; sleep 1; exit 1;
     fi
 
     REQUIREMENTS_FILE="src/requirements.txt"
     if [ ! -f "$REQUIREMENTS_FILE" ]; then
+    echo "STATUS: ERROR: Missing requirements.txt."
     echo "Can't find requirements.txt"
+    sleep 1
     exit 1
     fi
     while IFS= read -r package || [[ -n "$package" ]]; do
     
-    if python -c "import pkg_resources; pkg_resources.require('$package')" 2>/dev/null; then
-        echo "Package $package ....ok"
+    if python3 -c "import pkg_resources; pkg_resources.require('$package')" 2>/dev/null; then
+        log_info "Package $package ....ok"
     else
-        echo "Installing $package"
-        pip3 install "$package"
+        log_info "Installing $package"
+        pip3 install "$package" --break-system-packages
     fi
 done < "$REQUIREMENTS_FILE"
 
@@ -185,26 +205,34 @@ function chk_device() {
     for device in "${NVME_LIST[@]}"; do
         # check device exist or not
         if [[ ! -b "/dev/$device" ]]; then
+            echo "STATUS: ERROR: Device /dev/$device does not exist."
             echo "Device /dev/$device does not exist. Exiting script."
 	    
+            sleep 1
             exit 1
         fi
 
         # use lsof check is use or not
         if lsof "/dev/$device" &> /dev/null; then
+            echo "STATUS: ERROR: Device /dev/$device is busy (in use)."
             echo "Device /dev/$device is busy. Exiting script."
+            sleep 1
             exit 1
         fi
 
         # check devcice is boot device or not
         if [[ $device == nvme* ]]; then
             if grep -q "${device}p[0-9].*/boot" /proc/mounts; then
+                echo "STATUS: ERROR: /boot/ folder found on $device."
                 echo "/boot/ folder found on a partition of $device. Exiting script."
+                sleep 1
                 exit 1
             fi
         elif [[ $device == sd* ]]; then
             if grep -q "${device}[0-9].*/boot" /proc/mounts; then
+                echo "STATUS: ERROR: /boot/ folder found on $device."
                 echo "/boot/ folder found on a partition of $device. Exiting script."
+                sleep 1
                 exit 1
             fi
         fi
@@ -214,11 +242,13 @@ function chk_device() {
     online_count=$(echo "$result" | jq '.Result[] | select(.State=="ONLINE") | .ControllerId' | wc -l)
 
     if [[ $online_count -gt 0 ]]; then
-        echo "graid service is active"
+        log_info "graid service is active"
     else
-        echo "graid service is not avaliable, please check your controller or license"
-        echo "graidctl ls cx"
-        echo "graidctl desc lic"
+        echo "STATUS: ERROR: GRAID service not available. Check controller/license."
+        log_info "graid service is not avaliable, please check your controller or license"
+        log_info "graidctl ls cx"
+        log_info "graidctl desc lic"
+        sleep 1
         exit 1
     fi
  
@@ -262,20 +292,33 @@ function get_basic_para() {
 check_sanitize_done() {
     local device_path="$1"
     local device="${device_path#/dev/}"
+    
     while true; do
-        devices_status=$(nvme sanitize-log "$device_path" -o json 2>/dev/null)
-        if [ $? -eq 0 ]; then  # Check if nvme command succeeded
-            devices_finished=$(echo "$devices_status" | jq -r --arg device "$device" '.[$device].sprog')
-            if [[ "$devices_finished" == "65535" ]]; then
-                echo "Sanitization finished"
-                return 0  # Indicate success with exit status 0
-            else
-                echo "Sanitization in progress, checking again in 5 seconds..."
-                sleep 5  # Wait for 5 seconds before checking again
-            fi
+        local sprog=""
+        
+        # 1. Try JSON output
+        local json_out
+        json_out=$(nvme sanitize-log "$device_path" -o json 2>/dev/null)
+        
+        if [[ -n "$json_out" ]]; then
+            # Attempt to parse as JSON, handling both flat and nested structure
+            sprog=$(echo "$json_out" | jq -r --arg device "$device" '.sprog // .[$device].sprog' 2>/dev/null)
+        fi
+        
+        # 2. Fallback to text output if JSON failed to produce value
+        if [[ -z "$sprog" || "$sprog" == "null" ]]; then
+             local text_out
+             text_out=$(nvme sanitize-log "$device_path" 2>/dev/null)
+             # Parse 'Sanitize Progress (SPROG) : 65535'
+             sprog=$(echo "$text_out" | grep -i "SPROG" | awk -F':' '{print $2}' | tr -d '[:space:]')
+        fi
+
+        if [[ "$sprog" == "65535" ]]; then
+             echo "Sanitization finished on $device"
+             return 0
         else
-            echo "Error reading sanitize log for device $device_path"
-            return 2  # Indicate an error with a distinct non-zero exit status
+             echo "Sanitization in progress on $device. Status: '${sprog}'"
+             sleep 5
         fi
     done
 }
@@ -297,7 +340,9 @@ function discard_device() {
     if [ $RESULT -eq 0 ]; then
         echo "blkdiscard success on $device"
     else
+        echo "STATUS: ERROR: blkdiscard failed on $device."
         echo "blkdiscard failed on $device"
+        sleep 1
         exit 1
     fi
     if [[ $device == *nvme* ]]; then
@@ -357,15 +402,15 @@ main() {
             else
                  TICKS_PER_CONFIG=$WL_COUNT_VD
             fi
-            TOTAL_BENCH_STEPS=$((TOTAL_BENCH_STEPS + ${#STA_LS[@]} * ${#RAID_TYPE[@]} * TICKS_PER_CONFIG * PD_STEP_MOD))
+            TOTAL_BENCH_STEPS=$((TOTAL_BENCH_STEPS + ${#STA_LS[@]} * ${#RAID_TYPE[@]} * ${#QD_LS[@]} * TICKS_PER_CONFIG * PD_STEP_MOD))
         done
     fi
     
-    echo "STATUS: TOTAL_STEPS: $TOTAL_BENCH_STEPS"
+    log_info "STATUS: TOTAL_STEPS: $TOTAL_BENCH_STEPS"
     bash src/est_time.sh
     
     if [[ $RUN_PD == "true" ]]; then
-        echo "STATUS: STAGE_PD_START"
+        log_info "STATUS: STAGE_PD_START"
     fi
 
     if [[ $RUN_PD == "true" && $RUN_PD_ALL == "false" ]]; then
@@ -375,7 +420,10 @@ main() {
             #    cat /sys/class/block/${NVME_DEVICE}/device/model >> $result/$NVME_INFO/pd/${NVME_DEVICE}-INFO
             #    cat /sys/class/block/${NVME_DEVICE}/device/address >> $result/$NVME_INFO/pd/${NVME_DEVICE}-INFO
             #    echo $NVME_DEVICE $PD_RUNTIME $CPU_ALLOWED_SEQ $CPU_ALLOWED_RAND $CPU_JOBS $NVME_INFO $RAID_CTRLR $FILESYSTEM
-                bash src/bench.sh SingleTest $NVME_COUNT $PD_RUNTIME $CPU_ALLOWED_SEQ $CPU_JOBS $STAG $STA_LS PD $NVME_DEVICE
+                for iodepth in "${QD_LS[@]}"; do
+                    export IODEPTH=$iodepth
+                    bash src/bench.sh SingleTest $NVME_COUNT $PD_RUNTIME $CPU_ALLOWED_SEQ $CPU_JOBS $STAG $STA_LS PD $NVME_DEVICE
+                done
             done
         done
     elif [[ $RUN_PD == "true" && $RUN_PD_ALL == "true" ]]; then
@@ -388,40 +436,52 @@ main() {
         # #echo $fio_name
         # val=`expr 4 \* $NVME_COUNT`
         #echo $val
+        #echo $val
         for STAG in  "${TS_LS[@]}"; do
-            bash src/bench.sh SingleTest $NVME_COUNT $PD_RUNTIME $CPU_ALLOWED_SEQ $CPU_JOBS $STAG $STA_LS PD $NVME_LIST
+            for iodepth in "${QD_LS[@]}"; do
+                export IODEPTH=$iodepth
+                bash src/bench.sh SingleTest $NVME_COUNT $PD_RUNTIME $CPU_ALLOWED_SEQ $CPU_JOBS $STAG $STA_LS PD $NVME_LIST
+            done
         done
         
     fi
 
     if [[ $RUN_VD == "true" ]]; then
-        echo "STATUS: STAGE_VD_START"
-        echo $NVME_INFO
+        log_info "STATUS: STAGE_VD_START"
+        log_info "DEV_NAME: $NVME_INFO"
+        pids=()
         for NVME_DEVICE in "${NVME_LIST[@]}"
         do
             discard_device /dev/$NVME_DEVICE &
+            pids+=($!)
         done
-        wait
+        wait "${pids[@]}"
+        log_info "Sanitization finished"
         for NVME_DEVICE in "${NVME_LIST[@]}"
         do
-            graidctl create pd /dev/$NVME_DEVICE  > /dev/null 2>&1
+            log_info "Creating PD for $NVME_DEVICE"
+            log_info "Creating PD for $NVME_DEVICE"
+            yes | graidctl create pd /dev/$NVME_DEVICE
         done
         # graidctl create pd /dev/nvme0-$(($NVME_COUNT - 1))
         #run 4PD/n x all RAID x percondition
         for STAS in  "${STA_LS[@]}"; do
             for STAG in  "${TS_LS[@]}"; do
                 for RAID in "${RAID_TYPE[@]}"; do
-                    if [[ $SCAN == "false" ]]; then
-                        for PD_NUMBER in $NVME_COUNT; do
-                            echo "---$RAID x $PD_NUMBER---$NVME_INFO-$CPU_JOBS"
-                            bash src/bench.sh $RAID $PD_NUMBER $VD_RUNTIME $CPU_ALLOWED_SEQ $CPU_JOBS $STAG $STAS VD
-                        done
-                    elif [[ $SCAN == "true" ]]; then
-                        for PD_NUMBER in $(seq 4 4 $NVME_COUNT); do
-                            echo "---$RAID x $PD_NUMBER---$NVME_INFO-$CPU_JOBS"
-                            bash src/bench.sh $RAID $PD_NUMBER $VD_RUNTIME $CPU_ALLOWED_SEQ $CPU_JOBS $STAG $STAS VD
-                        done
-                    fi
+                    for iodepth in "${QD_LS[@]}"; do
+                        export IODEPTH=$iodepth
+                        if [[ $SCAN == "false" ]]; then
+                            for PD_NUMBER in $NVME_COUNT; do
+                                echo "---$RAID x $PD_NUMBER---$NVME_INFO-$CPU_JOBS-QD${IODEPTH}"
+                                bash src/bench.sh $RAID $PD_NUMBER $VD_RUNTIME $CPU_ALLOWED_SEQ $CPU_JOBS $STAG $STAS VD
+                            done
+                        elif [[ $SCAN == "true" ]]; then
+                            for PD_NUMBER in $(seq 4 4 $NVME_COUNT); do
+                                echo "---$RAID x $PD_NUMBER---$NVME_INFO-$CPU_JOBS-QD${IODEPTH}"
+                                bash src/bench.sh $RAID $PD_NUMBER $VD_RUNTIME $CPU_ALLOWED_SEQ $CPU_JOBS $STAG $STAS VD
+                            done
+                        fi
+                    done
                 done
             done
         done
@@ -434,21 +494,25 @@ main() {
     if [[ $RUN_MD == "true" ]]; then
         echo $NVME_INFO
         #run 4PD/n x all RAID x percondition
+        #run 4PD/n x all RAID x percondition
         for STAS in  "${STA_LS[@]}"; do
             for STAG in  "${TS_LS[@]}"; do
                 for RAID in "${RAID_TYPE[@]}"; do
-                    # for PD_NUMBER in $(seq 4 4 $NVME_COUNT); do
-                    if [[ $SCAN == "false" ]]; then
-                        for PD_NUMBER in $NVME_COUNT; do
-                            echo "---$RAID x $PD_NUMBER---$NVME_INFO-$CPU_JOBS"
-                            bash src/bench.sh $RAID $PD_NUMBER $VD_RUNTIME $CPU_ALLOWED_SEQ $CPU_JOBS $STAG $STAS MD
-                        done
-                    elif [[ $SCAN == "true" ]]; then
-                        for PD_NUMBER in $(seq 4 4 $NVME_COUNT); do
-                            echo "---$RAID x $PD_NUMBER---$NVME_INFO-$CPU_JOBS"
-                            bash src/bench.sh $RAID $PD_NUMBER $VD_RUNTIME $CPU_ALLOWED_SEQ $CPU_JOBS $STAG $STAS MD
-                        done
-                    fi
+                    for iodepth in "${QD_LS[@]}"; do
+                        export IODEPTH=$iodepth
+                        # for PD_NUMBER in $(seq 4 4 $NVME_COUNT); do
+                        if [[ $SCAN == "false" ]]; then
+                            for PD_NUMBER in $NVME_COUNT; do
+                                echo "---$RAID x $PD_NUMBER---$NVME_INFO-$CPU_JOBS-QD${IODEPTH}"
+                                bash src/bench.sh $RAID $PD_NUMBER $VD_RUNTIME $CPU_ALLOWED_SEQ $CPU_JOBS $STAG $STAS MD
+                            done
+                        elif [[ $SCAN == "true" ]]; then
+                            for PD_NUMBER in $(seq 4 4 $NVME_COUNT); do
+                                echo "---$RAID x $PD_NUMBER---$NVME_INFO-$CPU_JOBS-QD${IODEPTH}"
+                                bash src/bench.sh $RAID $PD_NUMBER $VD_RUNTIME $CPU_ALLOWED_SEQ $CPU_JOBS $STAG $STAS MD
+                            done
+                        fi
+                    done
                 done
 
             done
@@ -473,30 +537,27 @@ main() {
     #pip3 install pandas
     #pip3 install pathlib
     #python3 parser.py
+    python_paser
     bash ./src/graid-log-collector.sh -y -U
 
-	# Find files smaller than 100MB and store their paths in the temporary file
-	#find "./$NVME_INFO-result-*" -type f -size -100M > "$temp_file"
+    tar_name="graid_bench_result_$(hostname)_$NVME_INFO_$timestamp.tar.gz"
+    
+    # Create the archive with files from different locations but clean paths
+    # We use -C to change directory context for specific items
+    tar czf "$tar_name" ./graid_log_* ./output.log -C "../results/.test-temp-data" "$NVME_INFO-result"
 
-	# Create tar archive excluding files over 100MB
-	#tar -czvf archive.tar.gz -T "$temp_file"
-
-    python_paser
-    tar_name="graid_bench_result_$(hostname)_$NVME_INFO_$timestamp.tar"
-    tar czPf "$tar_name" ./$NVME_INFO* ./graid_log_* ./output.log
     echo "Moving results to ../results/"
     mv "$tar_name" ../results/
-    rm -rf ./$NVME_INFO* ./graid_log_* ./output.log
-
-
+    rm -rf "../results/.test-temp-data/$NVME_INFO-result" ./graid_log_* ./output.log
 }
 
 python_paser(){
     PYTHON_SCRIPT="src/fio_parser.py"
     timestamp=$(date '+%Y-%m-%d')
-    result="$NVME_INFO-result"
+    # Point parser to the hidden temporary results directory
+    result_path="../results/.test-temp-data/$NVME_INFO-result"
     
-    python3 $PYTHON_SCRIPT "./$result"
+    python3 $PYTHON_SCRIPT "$result_path"
 
 }
 

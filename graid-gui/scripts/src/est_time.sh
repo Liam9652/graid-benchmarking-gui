@@ -5,8 +5,9 @@ convert_seconds() {
     local days=$((total_seconds / 86400))
     local hours=$(( (total_seconds % 86400) / 3600))
     local minutes=$(( (total_seconds % 3600) / 60))
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 
-    printf "%02d:%02d:%02d\n" $days $hours $minutes 
+    printf "[%s] Estimated Completion Time: %02d:%02d:%02d (dd:hh:mm)\n" "$timestamp" $days $hours $minutes 
 }
 
 get_disk_size() {
@@ -179,5 +180,5 @@ fi
 buffered_seconds=$(bc <<< "scale=0; ($TOTAL_SECONDS * 1.15) / 1")
 
 FORMATTED_TIME=$(convert_seconds $buffered_seconds)
-echo "Estimated Completion Time: $FORMATTED_TIME (dd:hh:mm)"
+echo "$FORMATTED_TIME"
 

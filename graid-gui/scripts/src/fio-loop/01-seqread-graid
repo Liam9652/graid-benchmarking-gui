@@ -16,7 +16,6 @@ norandommap=1
 [graid-test]
 rw=read
 bs=1m
-iodepth=8
 # runtime=180
 # numjobs=128
 # cpus_allowed=0-127

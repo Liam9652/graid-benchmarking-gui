@@ -13,7 +13,6 @@ norandommap=1
 [graid-test]
 rw=randwrite
 bs=16k
-iodepth=64
 
 # [vd0]
 # filename=/dev/gdg0n1

@@ -14,7 +14,6 @@ norandommap=1
 rw=randrw
 rwmixread=50
 bs=4k
-iodepth=64
 # runtime=180
 # numjobs=128
 # cpus_allowed=0-127
