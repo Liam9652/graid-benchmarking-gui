@@ -20,27 +20,30 @@ coverage.xml
 node_modules/
 npm-debug.log*
 yarn-debug.log*
-yarn-error.log*
 build/
 dist/
 
 # Logs and Results
 logs/
 results/
-graid-gui/logs/
-graid-gui/results/
-graid-gui/backend/logs/
-graid-gui/backend/results/
-backend/scripts/
-graid-gui/backend/scripts
-graid-gui/scripts/QEMU-result/
+benchmark-gui/logs/
+benchmark-gui/results/
+benchmark-gui/backend/logs/
+benchmark-gui/backend/results/
+benchmark-gui/scripts/QEMU-result/
 *.log
 *.tar.gz
 *.md5
 
-# Misc
+# Test and Misc
+.agent/
+.vscode/
+.idea/
 .DS_Store
 .env
 .flaskenv
-.vscode/
-.idea/
+test_*.py
+*.fio
+benchmark-gui/repro_error.py
+benchmark-gui/scripts/mock_bench.sh
+**/__pycache__/
