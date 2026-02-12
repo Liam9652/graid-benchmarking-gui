@@ -11,6 +11,8 @@ STAS=$7
 DEV_NAME=$8
 FILESYSTEM='RAW'
 PD_NAME=$9
+MD_NAME=${MD_NAME:-md0}
+MD_BS=${MD_BS:-64}
 #declare -A LAST_END_CPU_BY_NUMA
 log_info() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $@"

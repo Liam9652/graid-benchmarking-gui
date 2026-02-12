@@ -492,6 +492,7 @@ main() {
     fi
 
     if [[ $RUN_MD == "true" ]]; then
+        log_info "STATUS: STAGE_MD_START"
         echo $NVME_INFO
         #run 4PD/n x all RAID x percondition
         #run 4PD/n x all RAID x percondition
@@ -541,6 +542,21 @@ main() {
     bash ./src/graid-log-collector.sh -y -U
 
     tar_name="graid_bench_result_$(hostname)_$NVME_INFO_$timestamp.tar.gz"
+    
+    # Capture System Info
+    log_info "Capturing System Info"
+    GRAID_VER=$(graidctl version | grep "graidctl version" | awk '{print $3, $4}')
+    KERNEL_VER=$(uname -r)
+    OS_INFO=$(cat /etc/os-release | grep "PRETTY_NAME" | cut -d= -f2 | tr -d '"')
+    
+    cat <<EOF > "$NVME_INFO-result/system_info.json"
+{
+    "graid_version": "$GRAID_VER",
+    "os_info": "$OS_INFO",
+    "kernel_version": "$KERNEL_VER",
+    "timestamp": "$timestamp"
+}
+EOF
     
     # Create the archive with files from different locations but clean paths
     # We use -C to change directory context for specific items

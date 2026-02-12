@@ -33,20 +33,22 @@ app = Flask(__name__, static_folder='static', template_folder='templates')
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-print(f"DEBUG: __file__ = {__file__}")
-print(f"DEBUG: __file__ resolved = {Path(__file__).resolve()}")
-print(f"DEBUG: parent = {Path(__file__).resolve().parent}")
-print(f"DEBUG: parent.parent = {Path(__file__).resolve().parent.parent}")
-print(f"DEBUG: Current working dir = {os.getcwd()}")
-print(f"DEBUG: Files in cwd = {os.listdir('.')}")
-
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "graid-bench.conf"
 SCRIPT_DIR = BASE_DIR / "scripts"
-RESULTS_DIR = BASE_DIR / "results"
-LOGS_DIR = BASE_DIR / "logs"
+
+# Flexible path detection for Local vs Docker
+# Preference: Parent results (Local Dev) > Subfolder results (Existing/Docker)
+if (BASE_DIR.parent / "results").exists():
+    RESULTS_DIR = BASE_DIR.parent / "results"
+    LOGS_DIR = BASE_DIR.parent / "logs"
+else:
+    RESULTS_DIR = BASE_DIR / "results"
+    LOGS_DIR = BASE_DIR / "logs"
+
 CACHE_DIR = RESULTS_DIR / ".cache"
 
+# Ensure directories exist
 RESULTS_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -729,6 +731,25 @@ class BenchmarkManager:
                                      'stage_info': self.current_stage_info
                                  })
 
+                            elif "STATUS: STAGE_MD_START" in msg:
+                                 print("DETECTED STAGE MD START", flush=True)
+                                 current_base_label = 'MDADM Performance Test\n'
+                                 self.current_stage_info = {'stage': 'MD', 'label': current_base_label}
+                                 socketio.emit('status_update', {
+                                    'stage': 'MD',
+                                    'label': current_base_label,
+                                    'timestamp': datetime.now().isoformat()
+                                }, room=session_id)
+                                 # Update persistent state
+                                 BenchmarkState.save({
+                                     'session_id': session_id,
+                                     'log_file': str(self.current_log_file),
+                                     'config': config,
+                                     'start_time': start_time,
+                                     'status': 'started',
+                                     'stage_info': self.current_stage_info
+                                 })
+
                             elif "STATUS: WORKLOAD:" in msg:
                                 try:
                                     filename = msg.split("STATUS: WORKLOAD:")[1].strip()
@@ -740,7 +761,7 @@ class BenchmarkManager:
                                     
                                     new_label = f"{current_base_label} - {friendly_name}"
                                     print(f"DETECTED WORKLOAD: {filename} -> {new_label}", flush=True)
-                                    stage_code = 'PD' if 'Baseline' in current_base_label else 'VD'
+                                    stage_code = 'PD' if 'Baseline' in current_base_label else 'MD' if 'MDADM' in current_base_label else 'VD'
                                     
                                     self.current_stage_info = {'stage': stage_code, 'label': new_label}
                                     socketio.emit('status_update', {
@@ -1588,6 +1609,9 @@ def get_results():
                                     'size': file.stat().st_size
                                 })
                         results.append(result_info)
+        
+        # Sort by created time descending (newest first)
+        results.sort(key=lambda x: x['created'], reverse=True)
         return jsonify({'success': True, 'data': results})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -1595,12 +1619,136 @@ def get_results():
 @app.route('/api/results/<path:filename>', methods=['GET'])
 def get_result_file(filename):
     try:
+        if filename.endswith('/info'):
+             # Special case for getting system info
+             result_name = filename[:-5]
+             return get_result_info(result_name)
+
         response = send_from_directory(RESULTS_DIR, filename)
         if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
              response.headers['Cache-Control'] = 'public, max-age=86400'
         return response
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 404
+
+def get_result_info(result_name):
+    try:
+        result_path = RESULTS_DIR / result_name
+        model_result_path = SCRIPT_DIR / f"{result_name}-result" / result_name
+        
+        target_path = None
+        if result_path.exists():
+            target_path = result_path
+        elif model_result_path.exists():
+            target_path = model_result_path
+            
+        if not target_path:
+             # Try checking for archive with common extensions
+             for ext in ['.tar', '.tar.gz', '.tgz', '.json']:
+                archive_path = RESULTS_DIR / f"{result_name}{ext}"
+                if archive_path.exists():
+                    target_path = archive_path
+                    break
+             
+             if not target_path:
+                return jsonify({'success': False, 'error': 'Result not found'}), 404
+
+        info_data = {}
+        
+        # Helper to parse basic.log content
+        def parse_basic_log(content):
+            res = {"graid_version": "N/A", "os_info": "N/A", "kernel_version": "N/A"}
+            for line in content.splitlines():
+                line = line.strip()
+                if "graidctl version:" in line:
+                    parts = line.split(":", 1)
+                    if len(parts) > 1:
+                        res["graid_version"] = parts[1].strip()
+                elif line.startswith("OS:"):
+                    res["os_info"] = line.split(":", 1)[1].strip().replace('"', '')
+                elif "PRETTY_NAME=" in line:
+                    res["os_info"] = line.split("=", 1)[1].strip().replace('"', '')
+                elif line.startswith("Kernel version:"):
+                    res["kernel_version"] = line.split(":", 1)[1].strip()
+                elif "Linux" in line and "x86_64" in line and res["kernel_version"] == "N/A":
+                     parts = line.split()
+                     if len(parts) >= 3:
+                         res["kernel_version"] = parts[2]
+            return res
+
+        if target_path.is_dir():
+            # 1. Try system_info.json in the directory
+            info_file = target_path / 'system_info.json'
+            if info_file.exists():
+                try:
+                    with open(info_file, 'r') as f:
+                        info_data = json.load(f)
+                except: pass
+            
+            # 2. Try recursive search for basic.log
+            if not info_data:
+                for log_file in target_path.rglob('basic.log'):
+                    try:
+                        with open(log_file, 'r') as f:
+                            content = f.read()
+                            info_data = parse_basic_log(content)
+                            if info_data.get('graid_version') != 'N/A' or info_data.get('os_info') != 'N/A':
+                                break
+                    except: pass
+
+        else:
+            # Handle archive
+            import tarfile
+            with tarfile.open(target_path, 'r') as tar:
+                # 1. Try system_info.json in archive
+                try:
+                    for m in tar.getmembers():
+                        if m.name.endswith('system_info.json'):
+                            f = tar.extractfile(m)
+                            if f:
+                                info_data = json.load(f)
+                                break
+                except: pass
+
+                # 2. Try nested log archive or basic.log directly
+                if not info_data:
+                    for member in tar.getmembers():
+                        m_name = member.name.lower()
+                        # Direct basic.log
+                        if m_name.endswith('basic.log'):
+                            f = tar.extractfile(member)
+                            if f:
+                                try:
+                                    content = f.read().decode('utf-8', errors='ignore')
+                                    info_data = parse_basic_log(content)
+                                    if info_data.get('graid_version') != 'N/A': break
+                                except: pass
+                        
+                        # Nested archive: looks for something with 'log' and 'tar.gz/tgz'
+                        elif ('log' in m_name) and (m_name.endswith('.tar.gz') or m_name.endswith('.tgz')):
+                            f_obj = tar.extractfile(member)
+                            if f_obj:
+                                try:
+                                    # Create a secondary tar object from the extracted nested file
+                                    # Since extractfile returns a file-like object, it might need to be wrapped or read into BytesIO
+                                    import io
+                                    nested_data = f_obj.read()
+                                    with tarfile.open(fileobj=io.BytesIO(nested_data), mode='r:gz') as inner_tar:
+                                        for inner in inner_tar.getmembers():
+                                            if inner.name.endswith('basic.log'):
+                                                inner_f = inner_tar.extractfile(inner)
+                                                if inner_f:
+                                                    content = inner_f.read().decode('utf-8', errors='ignore')
+                                                    info_data = parse_basic_log(content)
+                                                    break
+                                except: pass
+                                if info_data and info_data.get('graid_version') != 'N/A':
+                                    break
+        
+        return jsonify({'success': True, 'data': info_data or {}})
+    except Exception as e:
+        print(f"ERROR in get_result_info: {str(e)}", flush=True)
+        return jsonify({'success': True, 'data': {}})
 
 @app.route('/api/results/<result_name>/download', methods=['GET'])
 def download_result(result_name):
@@ -1798,12 +1946,15 @@ def get_result_data(result_name):
                                 if 'SingleTest' not in filename_col and '/PD/' not in member.name.upper():
                                     continue
                             elif req_type == 'graid':
-                                if 'RAID' not in filename_col and '/VD/' not in member.name.upper():
+                                if 'RAID' not in filename_col and '/VD/' not in member.name.upper() and '/MD/' not in member.name.upper():
                                     continue
                             
                             # Ensure Workload is set
                             if 'Workload' not in row:
                                 row['Workload'] = get_workload_name(row)
+                            
+                            # Identify controller
+                            row['controller'] = 'MDADM' if 'graid-mdadm' in (filename_col or member.name) else 'SupremeRAID'
                             
                             # Try to extract RAID info if missing (important for charts)
                             if not row.get('RAID_type') or row.get('RAID_type') == 'N/A':
@@ -1841,7 +1992,7 @@ def get_result_images(result_name):
         images = []
         def parse_tags(img_path):
             tags = {
-                'category': 'VD' if '/VD/' in img_path else 'PD' if '/PD/' in img_path else 'Other',
+                'category': 'VD' if '/VD/' in img_path else 'MD' if '/MD/' in img_path else 'PD' if '/PD/' in img_path else 'Other',
                 'raid': 'Unknown',
                 'workload': 'Unknown',
                 'bs': 'Unknown',
