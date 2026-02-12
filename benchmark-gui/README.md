@@ -24,7 +24,7 @@ A web-based GUI for benchmarking SupremeRAID performance, featuring real-time mo
 1.  **Clone the repository**:
     ```bash
     git clone <repository_url>
-    cd graid-benchmarking-gui/graid-gui
+    cd graid-benchmarking-gui/benchmark-gui
     ```
 
 2.  **Build and Run with Docker Compose**:

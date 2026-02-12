@@ -1,0 +1,4 @@
+[global]
+ramp_time=10
+[test]
+iodepth=1

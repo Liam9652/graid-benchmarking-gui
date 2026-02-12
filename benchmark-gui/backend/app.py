@@ -59,7 +59,7 @@ giostat_process = None
 giostat_thread = None
 stop_giostat_event = threading.Event()
 
-REMOTE_BASE_DIR = Path("/tmp/graid-gui")
+REMOTE_BASE_DIR = Path("/tmp/benchmark-gui")
 ACTIVE_STATE_FILE = LOGS_DIR / "active_benchmark.json"
 
 class BenchmarkState:
@@ -196,7 +196,7 @@ class RemoteExecutor:
     def _to_remote_path(self, path):
         if not self.is_remote:
             return path
-        # Map local absolute path to remote /tmp/graid-gui based path
+        # Map local absolute path to remote /tmp/benchmark-gui based path
         path_obj = Path(path).resolve()
         base_obj = BASE_DIR.resolve()
         
