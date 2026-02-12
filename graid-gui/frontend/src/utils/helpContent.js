@@ -1,5 +1,5 @@
 export const helpContent = {
-    TW: {
+    ZH: {
         config: {
             title: "配置管理說明",
             sections: [
@@ -30,6 +30,7 @@ export const helpContent = {
             title: "理論性能計算機說明",
             sections: [
                 { header: "參數設置", content: "選擇 SupremeRAID 卡型號、磁碟型號、數量以及 RAID 級別。" },
+                { header: "系統配置", content: "填入 CPU 核心數與每顆 CPU 的 RAM 數量。核心數會影響隨機 IO (IOPs) 上限，而 RAM 數量與 DDR 類型則會決定系統頻寬上限。" },
                 { header: "計算邏輯", content: "系統將根據硬體規格和 RAID 公式計算理論上的性能上限（IOPS 與帶寬）。" },
                 { header: "參考價值", content: "該數值僅供理論參考，代表硬體在理想狀態下的極限性能。實際測試結果可能會受系統配置、驅動及工作負載影響。" }
             ]
@@ -66,6 +67,7 @@ export const helpContent = {
             title: "理论性能计算机说明",
             sections: [
                 { header: "参数设置", content: "选择 SupremeRAID 卡型号、磁盘型号、数量以及 RAID 级别。" },
+                { header: "系统配置", content: "填入 CPU 核心数与每颗 CPU 的 RAM 数量。核心数会影响随机 IO (IOPs) 上限，而 RAM 数量与 DDR 类型则会决定系统带宽上限。" },
                 { header: "计算逻辑", content: "系统将根据硬件规格和 RAID 公式计算理论上的性能上限（IOPS 与带宽）。" },
                 { header: "参考价值", content: "该数值仅供理论参考，代表硬件在理想状态下的极限性能。实际测试结果可能会受系统配置、驱动及工作负载影响。" }
             ]
@@ -102,6 +104,7 @@ export const helpContent = {
             title: "Theoretical Performance Calculator Help",
             sections: [
                 { header: "Parameter Settings", content: "Select SupremeRAID card model, drive model, count, and RAID level." },
+                { header: "System Configuration", content: "Enter CPU core count and RAM per CPU. CPU cores impact Random IO (IOPs) limits, while RAM count and DDR type determine the system bandwidth ceiling." },
                 { header: "Calculation Logic", content: "The system calculates theoretical performance limits (IOPS and Bandwidth) based on hardware specs and RAID formulas." },
                 { header: "Reference Value", content: "These values are for theoretical reference only, representing limits in ideal conditions. Real-world results may vary." }
             ]

@@ -20,7 +20,7 @@ const WORKLOADS_OF_INTEREST = [
     '1M Sequential Write'
 ];
 
-const ComparisonDashboard = ({ baselineData, graidData, baselineMetadata, graidMetadata }) => {
+const ComparisonDashboard = ({ baselineData, graidData, baselineMetadata, graidMetadata, systemInfo }) => {
     const [availableMetrics, setAvailableMetrics] = React.useState([]);
     const [availableWorkloads, setAvailableWorkloads] = React.useState([]);
     const [selectedMetrics, setSelectedMetrics] = React.useState(['IOPS(K)', 'Bandwidth (GB/s)']);
@@ -34,6 +34,8 @@ const ComparisonDashboard = ({ baselineData, graidData, baselineMetadata, graidM
     const [selectedRaidStatuses, setSelectedRaidStatuses] = React.useState([]);
     const [availableStages, setAvailableStages] = React.useState([]);
     const [selectedStages, setSelectedStages] = React.useState([]);
+    const [availableControllers, setAvailableControllers] = React.useState([]);
+    const [selectedControllers, setSelectedControllers] = React.useState([]);
     const [showBaseline, setShowBaseline] = React.useState(true);
 
     // Effect to extract available metrics and workloads from data
@@ -92,6 +94,11 @@ const ComparisonDashboard = ({ baselineData, graidData, baselineMetadata, graidM
         setAvailableStages(stages.sort());
         if (selectedStages.length === 0) setSelectedStages(stages);
 
+        // Extract Controllers from Graid data
+        const controllers = Array.from(new Set((graidData || []).map(d => d.controller))).filter(Boolean);
+        setAvailableControllers(controllers.sort());
+        if (selectedControllers.length === 0) setSelectedControllers(controllers);
+
         // Extract Numeric Metrics
         const sample = allData[0];
         const metrics = Object.keys(sample).filter(key => {
@@ -139,6 +146,12 @@ const ComparisonDashboard = ({ baselineData, graidData, baselineMetadata, graidM
     const handleStageToggle = (stage) => {
         setSelectedStages(prev =>
             prev.includes(stage) ? prev.filter(s => s !== stage) : [...prev, stage]
+        );
+    };
+
+    const handleControllerToggle = (controller) => {
+        setSelectedControllers(prev =>
+            prev.includes(controller) ? prev.filter(c => c !== controller) : [...prev, controller]
         );
     };
 
@@ -191,17 +204,20 @@ const ComparisonDashboard = ({ baselineData, graidData, baselineMetadata, graidM
                         Baseline: showBaseline ? parseFloat(bItem[metric] || 0) : 0,
                     };
 
-                    selectedRaidTypes.forEach(raidType => {
-                        const item = (graidData || []).find(d =>
-                            d.stage === stage &&
-                            d.RAID_status === status &&
-                            d.Workload === searchWl &&
-                            d.RAID_type === raidType
-                        );
+                    selectedControllers.forEach(controller => {
+                        selectedRaidTypes.forEach(raidType => {
+                            const item = (graidData || []).find(d =>
+                                d.stage === stage &&
+                                d.RAID_status === status &&
+                                d.Workload === searchWl &&
+                                d.RAID_type === raidType &&
+                                (d.controller === controller || (!d.controller && controller === 'SupremeRAID'))
+                            );
 
-                        if (item) {
-                            dataPoint[`SupremeRAID - ${raidType}`] = parseFloat(item[metric] || 0);
-                        }
+                            if (item) {
+                                dataPoint[`${controller} - ${raidType}`] = parseFloat(item[metric] || 0);
+                            }
+                        });
                     });
                     return dataPoint;
                 });
@@ -218,6 +234,40 @@ const ComparisonDashboard = ({ baselineData, graidData, baselineMetadata, graidM
 
     return (
         <div>
+            {/* System Info Panel */}
+            {systemInfo && (
+                <div style={{
+                    background: '#f8f9fa',
+                    border: '1px solid #dee2e6',
+                    borderRadius: '8px',
+                    padding: '1.5rem',
+                    marginBottom: '2rem',
+                    boxShadow: '0 2px 4px rgba(0, 0, 0, 0.05)'
+                }}>
+                    <h4 style={{
+                        margin: '0 0 15px 0',
+                        borderBottom: '2px solid #3498db',
+                        paddingBottom: '10px',
+                        color: '#333',
+                        fontSize: '18px'
+                    }}>🖥️ System Information</h4>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '20px' }}>
+                        <div>
+                            <strong style={{ color: '#555', display: 'block', marginBottom: '5px' }}>Graid Version:</strong>
+                            <div style={{ fontFamily: 'monospace', fontSize: '14px', color: '#2c3e50' }}>{systemInfo.graid_version || 'N/A'}</div>
+                        </div>
+                        <div>
+                            <strong style={{ color: '#555', display: 'block', marginBottom: '5px' }}>OS Info:</strong>
+                            <div style={{ fontFamily: 'monospace', fontSize: '14px', color: '#2c3e50' }}>{systemInfo.os_info || 'N/A'}</div>
+                        </div>
+                        <div>
+                            <strong style={{ color: '#555', display: 'block', marginBottom: '5px' }}>Kernel Version:</strong>
+                            <div style={{ fontFamily: 'monospace', fontSize: '14px', color: '#2c3e50' }}>{systemInfo.kernel_version || 'N/A'}</div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* Configuration Panel */}
             <div style={{ padding: '15px', marginBottom: '20px', borderRadius: '8px' }}>
                 <h4 style={{ marginTop: 0 }}>Comparison Config</h4>
@@ -247,6 +297,21 @@ const ComparisonDashboard = ({ baselineData, graidData, baselineMetadata, graidM
                             />
                             Show Baseline (Single PD)
                         </label>
+                    </div>
+
+                    <div style={{ marginBottom: '10px' }}>
+                        <strong>Controllers: </strong>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', marginTop: '5px' }}>
+                            {availableControllers.map(ctrl => (
+                                <label key={ctrl} style={{ cursor: 'pointer' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={selectedControllers.includes(ctrl)}
+                                        onChange={() => handleControllerToggle(ctrl)}
+                                    /> {ctrl}
+                                </label>
+                            ))}
+                        </div>
                     </div>
 
                     <strong>RAID Types: </strong>
@@ -319,11 +384,11 @@ const ComparisonDashboard = ({ baselineData, graidData, baselineMetadata, graidM
                     resultGroups.map((group, groupIdx) => (
                         <div key={groupIdx} className="result-group-section" style={{ marginBottom: '40px', borderTop: '2px solid #34495e', paddingTop: '20px' }}>
                             <h2 style={{ color: '#00BBED', marginBottom: '20px' }}>
-                                Stage: <span style={{ color: '#fff' }}>{group.stage.replace('after', '').toUpperCase()}</span> |
+                                Stage: <span style={{ color: '#52C41A' }}>{group.stage.replace('after', '').toUpperCase()}</span> |
                                 Status: <span style={{ color: group.status === 'Normal' ? '#52C41A' : '#f1c40f' }}>{group.status}</span>
                             </h2>
 
-                            <div className="dashboard-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '20px' }}>
+                            <div className="comparison-dashboard-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '20px' }}>
                                 {selectedWorkloads.filter(w => w !== 'Baseline').map(workload => {
                                     const data = group.charts[workload];
                                     if (!data || data.length === 0) return null;
@@ -347,16 +412,20 @@ const ComparisonDashboard = ({ baselineData, graidData, baselineMetadata, graidM
                                                             <LabelList dataKey="Baseline" content={<CustomBarLabel />} />
                                                         </Bar>
                                                     )}
-                                                    {selectedRaidTypes.map((type, idx) => {
-                                                        const dataKey = `SupremeRAID - ${type}`;
-                                                        if (!data.some(d => d[dataKey] > 0)) return null;
+                                                    {selectedControllers.map((controller, cIdx) => (
+                                                        selectedRaidTypes.map((type, rIdx) => {
+                                                            const dataKey = `${controller} - ${type}`;
+                                                            if (!data.some(d => d[dataKey] > 0)) return null;
 
-                                                        return (
-                                                            <Bar key={type} dataKey={dataKey} fill={RAID_COLORS[idx % RAID_COLORS.length]}>
-                                                                <LabelList dataKey={dataKey} content={<CustomBarLabel />} />
-                                                            </Bar>
-                                                        );
-                                                    })}
+                                                            // Offset colors based on controller to differentiate
+                                                            const colorIdx = (cIdx * 3 + rIdx) % RAID_COLORS.length;
+                                                            return (
+                                                                <Bar key={dataKey} dataKey={dataKey} fill={RAID_COLORS[colorIdx]}>
+                                                                    <LabelList dataKey={dataKey} content={<CustomBarLabel />} />
+                                                                </Bar>
+                                                            );
+                                                        })
+                                                    ))}
                                                 </BarChart>
                                             </ResponsiveContainer>
                                         </div>

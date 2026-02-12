@@ -22,6 +22,11 @@ const TheoreticalCalculator = ({ language }) => {
     const [version, setVersion] = useState('1.7.x'); // '1.7.x' or '2.0'
     const [cardModel, setCardModel] = useState('SR1010');
 
+    // New System Parameters
+    const [ramPerCpu, setRamPerCpu] = useState(1);
+    const [cpuCores, setCpuCores] = useState(32);
+    const [ddrType, setDdrType] = useState('DDR5');
+
     // Filter card models based on version
     const getVisibleModels = () => {
         const allModels = Object.keys(CARD_LIMITS);
@@ -194,7 +199,11 @@ const TheoreticalCalculator = ({ language }) => {
             mixedIOPS: inputs.iopsMixed4k,
             readBW: inputs.randRead64k,
             writeBW: inputs.randWrite64k
-        }, inputs.platformBaselineIOPS, version, cardModel);
+        }, inputs.platformBaselineIOPS, version, cardModel, {
+            ramPerCpu,
+            cpuCores,
+            ddrType
+        });
         return { raid, ...perf };
     });
 
@@ -233,7 +242,6 @@ const TheoreticalCalculator = ({ language }) => {
                         ))}
                     </select>
                 </div>
-
 
                 <div className="input-group">
                     <label>Single PD 4K Random Read IOPS:</label>
@@ -290,6 +298,34 @@ const TheoreticalCalculator = ({ language }) => {
                         <option value="1000000">M</option>
                         <option value="1000000000">B</option>
                     </select>
+                </div>
+
+                <hr style={{ margin: '20px 0', borderColor: '#444' }} />
+
+                <div className="system-config-section">
+                    <div className="input-group">
+                        <label>
+                            CPU Core Counts (physical):
+                        </label>
+                        <input type="number" value={cpuCores} onChange={(e) => setCpuCores(parseInt(e.target.value))} />
+                    </div>
+
+                    <div className="input-row">
+                        <div className="input-group">
+                            <label>
+                                RAM per CPU:
+                            </label>
+                            <input type="number" value={ramPerCpu} onChange={(e) => setRamPerCpu(parseInt(e.target.value))} />
+                        </div>
+
+                        <div className="input-group">
+                            <label>DDR Type:</label>
+                            <select value={ddrType} onChange={(e) => setDdrType(e.target.value)}>
+                                <option value="DDR4">DDR4</option>
+                                <option value="DDR5">DDR5</option>
+                            </select>
+                        </div>
+                    </div>
                 </div>
 
                 <hr style={{ margin: '20px 0', borderColor: '#444' }} />

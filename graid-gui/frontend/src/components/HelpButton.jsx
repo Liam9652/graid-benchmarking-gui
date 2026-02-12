@@ -38,7 +38,7 @@ const HelpButton = ({ title, content, language, setLanguage }) => {
                         </div>
                         <div className="help-modal-body">
                             <div className="modal-language-switcher">
-                                {['EN', 'CN', 'TW'].map(lang => (
+                                {['EN', 'CN', 'ZH'].map(lang => (
                                     <button
                                         key={lang}
                                         className={`modal-lang-btn ${language === lang ? 'active' : ''}`}

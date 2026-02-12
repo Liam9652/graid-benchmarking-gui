@@ -137,6 +137,7 @@
     color: #ffffff;
 }
 
+.system-config-section,
 .file-upload-section {
     grid-column: 1 / -1;
     /* Full width */
@@ -144,9 +145,17 @@
     padding: 20px;
     border-radius: 8px;
     display: flex;
+    flex-direction: column;
+    /* Changed to column to handle rows */
+    gap: 15px;
+    border: 1px dashed #444;
+}
+
+.input-row {
+    display: flex;
     flex-wrap: wrap;
     gap: 20px;
-    border: 1px dashed #444;
+    align-items: center;
 }
 
 .file-upload-section .input-group {

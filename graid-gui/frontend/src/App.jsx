@@ -7,6 +7,7 @@ import RealTimeDashboard from './components/RealTimeDashboard';
 import ComparisonDashboard from './components/ComparisonDashboard';
 import TheoreticalCalculator from './components/TheoreticalCalculator';
 import HelpButton from './components/HelpButton';
+import PrintReport from './components/PrintReport';
 import { helpContent } from './utils/helpContent';
 
 const API_BASE_URL = `http://${window.location.hostname}:50071`;
@@ -19,7 +20,6 @@ const HIDDEN_PARAMS = [
   'EID',
   'SID',
   'WP_LS',
-  'RUN_MD',
 ];
 
 const SENSITIVE_PARAMS = [
@@ -105,7 +105,7 @@ function App() {
   const [reportImages, setReportImages] = useState([]);
   const [activeResultTab, setActiveResultTab] = useState('dashboard'); // 'dashboard' or 'gallery'
   const [systemInfo, setSystemInfo] = useState({ nvme_info: [], controller_info: [] });
-  const [language, setLanguage] = useState('TW');
+  const [language, setLanguage] = useState('ZH');
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [activeDevices, setActiveDevices] = useState(new Set());
   const [licenseInfo, setLicenseInfo] = useState({});
@@ -267,42 +267,77 @@ function App() {
 
   const handleSnapshot = async (data = {}) => {
     try {
-      // 1. Save current view mode
+      // 1. Save current UI state
+      const previousTab = activeTab;
       const previousViewMode = activeViewMode;
+      const previousShowLog = showAdvancedLog;
 
-      // 2. Force switch to Report View (CDM Grid) - User requirement: Always capture Report View
-      if (previousViewMode !== 'cdm') {
-        setActiveViewMode('cdm');
-        // Wait for React to render the new view
-        await new Promise(resolve => setTimeout(resolve, 500));
+      // 2. Prepare UI for snapshot: Must be on Benchmark tab, not in advanced log, and in CDM mode
+      let stateChanged = false;
+
+      if (previousTab !== 'benchmark') {
+        setActiveTab('benchmark');
+        stateChanged = true;
       }
 
-      // Add a small delay to ensure DOM is updated
-      await new Promise(resolve => setTimeout(resolve, 200));
+      if (previousShowLog) {
+        setShowAdvancedLog(false);
+        stateChanged = true;
+      }
 
-      // Find the dashboard or report element
-      let element = document.querySelector('.cdm-grid');
-      // If CDM grid not found (fallback), look for dashboard classes
-      if (!element) element = document.querySelector('.dashboard-grid') || document.querySelector('.dashboard-wrapper');
+      if (previousViewMode !== 'cdm') {
+        setActiveViewMode('cdm');
+        stateChanged = true;
+      }
+
+      // If we changed anything, wait for React to re-render and for the layout to stabilize
+      if (stateChanged) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } else {
+        // Minimal delay for DOM stability anyway
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+
+      // Find the CDM grid specifically within the monitor section
+      let element = document.querySelector('#realtime-monitor-section .cdm-grid');
 
       if (!element) {
-        console.warn('Snapshot failed: No target element found');
-        // Restore view if we switched
-        if (previousViewMode !== 'cdm') setActiveViewMode(previousViewMode);
+        console.warn('Snapshot failed: .cdm-grid not found in #realtime-monitor-section');
+        // Partial fallback: some versions might not have the ID prefix
+        element = document.querySelector('.cdm-grid');
+      }
+
+      if (!element) {
+        console.warn('Snapshot failed: No .cdm-grid element found anywhere');
+        // Restore state if we modified it
+        if (stateChanged) {
+          setActiveTab(previousTab);
+          setActiveViewMode(previousViewMode);
+          setShowAdvancedLog(previousShowLog);
+        }
         return;
       }
 
       console.log(`Taking snapshot for ${data.test_name} using element:`, element.className);
       const canvas = await html2canvas(element, {
+        backgroundColor: '#ffffff',
+        scale: 2,
         logging: false,
         useCORS: true,
-        allowTaint: true
+        allowTaint: true,
+        // Ensure we capture even if elements are slightly off-screen
+        scrollX: 0,
+        scrollY: -window.scrollY,
+        windowWidth: document.documentElement.offsetWidth,
+        windowHeight: document.documentElement.offsetHeight
       });
       const imgData = canvas.toDataURL('image/png');
 
-      // 3. Restore original view mode
-      if (previousViewMode !== 'cdm') {
+      // 3. Restore original UI state
+      if (stateChanged) {
+        setActiveTab(previousTab);
         setActiveViewMode(previousViewMode);
+        setShowAdvancedLog(previousShowLog);
       }
 
       const response = await axios.post(`${API_BASE_URL}/api/benchmark/save_snapshot`, {
@@ -313,7 +348,7 @@ function App() {
       });
 
       if (response.data.success) {
-        console.log('Snapshot saved and synced successfully');
+        console.log('Snapshot saved successfully');
       }
     } catch (err) {
       console.error('Snapshot failed:', err);
@@ -348,8 +383,12 @@ function App() {
           isMatch = true;
         }
       }
+    } else if (stage === 'MD') {
+      if (devName.startsWith('md')) {
+        isMatch = true;
+      }
     } else if (stage === 'VD') {
-      if (devName.includes(vdName) || devName.startsWith('md') || devName.startsWith('gdg') || devName.startsWith('gvo')) {
+      if (devName.includes(vdName) || devName.startsWith('gdg') || devName.startsWith('gvo')) {
         isMatch = true;
       }
     } else {
@@ -938,10 +977,11 @@ function App() {
     setError('');
 
     try {
-      const [res1, res2, resImg] = await Promise.all([
+      const [res1, res2, resImg, resInfo] = await Promise.all([
         axios.get(`${API_BASE_URL}/api/results/${resultName}/data?type=baseline`),
         axios.get(`${API_BASE_URL}/api/results/${resultName}/data?type=graid`),
-        axios.get(`${API_BASE_URL}/api/results/${resultName}/images`)
+        axios.get(`${API_BASE_URL}/api/results/${resultName}/images`),
+        axios.get(`${API_BASE_URL}/api/results/${resultName}/info`)
       ]);
 
       if (resImg.data.success) {
@@ -982,7 +1022,8 @@ function App() {
           baseline: res1.data.success ? res1.data.data : null,
           graid: res2.data.data,
           baselineMetadata,
-          graidMetadata
+          graidMetadata,
+          systemInfo: resInfo.data.success ? resInfo.data.data : null // Save system info
         });
         setError('');
       } else {
@@ -1415,6 +1456,7 @@ function App() {
                           { key: 'SCAN', label: 'Full Scan' },
                           { key: 'RUN_PD', label: 'Run PD Test' },
                           { key: 'RUN_VD', label: 'Run VD Test' },
+                          { key: 'RUN_MD', label: 'Run MD Test' },
                           { key: 'RUN_PD_ALL', label: 'Test All PDs' }
                         ].map(sw => (
                           <label key={sw.key} className="switch-label">
@@ -1594,13 +1636,15 @@ function App() {
                 )}
 
                 {!showAdvancedLog && (
-                  <RealTimeDashboard
-                    data={realTimeData}
-                    devices={Array.from(activeDevices)}
-                    viewMode={activeViewMode}
-                    setViewMode={setActiveViewMode}
-                    testTarget={currentStage?.stage || null}
-                  />
+                  <div id="realtime-monitor-section">
+                    <RealTimeDashboard
+                      data={realTimeData}
+                      devices={Array.from(activeDevices)}
+                      viewMode={activeViewMode}
+                      setViewMode={setActiveViewMode}
+                      testTarget={currentStage?.stage || null}
+                    />
+                  </div>
                 )}
               </div>
             </div>
@@ -1626,7 +1670,7 @@ function App() {
                     style={{ flex: 1, minWidth: '300px' }}
                   >
                     <option value="">-- Select Result --</option>
-                    {results.sort((a, b) => b.name.localeCompare(a.name)).map((r, i) => (
+                    {results.map((r, i) => (
                       <option key={i} value={r.name}>{r.name} ({r.created})</option>
                     ))}
                   </select>
@@ -1640,13 +1684,22 @@ function App() {
                   </button>
 
                   {selectedResults[0] && (
-                    <button
-                      className="btn btn-success"
-                      onClick={() => window.open(`${API_BASE_URL}/api/results/${selectedResults[0]}/download`, '_blank')}
-                      title="Download full result archive (.tar)"
-                    >
-                      ⬇️ Download
-                    </button>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <button
+                        className="btn btn-success"
+                        onClick={() => window.open(`${API_BASE_URL}/api/results/${selectedResults[0]}/download`, '_blank')}
+                        title="Download full result archive (.tar)"
+                      >
+                        ⬇️ Download
+                      </button>
+                      {/* <button
+                        className="btn btn-secondary"
+                        onClick={() => window.print()}
+                        title="Print Performance Report"
+                      >
+                        🖨️ Print
+                      </button> */}
+                    </div>
                   )}
                 </div>
 
@@ -1675,6 +1728,7 @@ function App() {
                       graidData={comparisonData.graid}
                       baselineMetadata={comparisonData.baselineMetadata}
                       graidMetadata={comparisonData.graidMetadata}
+                      systemInfo={comparisonData.systemInfo}
                     />
                   ) : (
                     <div className="report-gallery">
@@ -1786,6 +1840,11 @@ function App() {
           </div>
         )
       }
+      <PrintReport
+        comparisonData={comparisonData}
+        systemInfo={systemInfo}
+        reportImages={reportImages}
+      />
     </div >
   );
 }

@@ -27,8 +27,9 @@ export const CARD_LIMITS = {
 /**
  * Calculates theoretical performance based on RAID level, drive count, and single PD metrics.
  */
-export const calculatePerformance = (raidType, numDrives, pdMetrics, baselineIOPS = Infinity, version = '1.7.x', cardModel = 'SR1010') => {
+export const calculatePerformance = (raidType, numDrives, pdMetrics, baselineIOPS = Infinity, version = '1.7.x', cardModel = 'SR1010', systemParams = {}) => {
     const { readIOPS, writeIOPS, mixedIOPS, readBW, writeBW } = pdMetrics;
+    const { ramPerCpu = 1, cpuCores = 32, ddrType = 'DDR5' } = systemParams;
 
     let result = {
         readIOPS: "0",
@@ -41,6 +42,22 @@ export const calculatePerformance = (raidType, numDrives, pdMetrics, baselineIOP
         writeBWVal: 0,
         notes: {}
     };
+
+    // Calculate System Limits
+    let systemIopsLimit = cpuCores * 200000; // CPU core limit
+    let systemBwLimit = Infinity;
+
+    if (ddrType === 'DDR4') {
+        const ddr4BwPerUnit = 12.5; // GB/s
+        const ddr4IopsPerUnit = (12.5 * 1024 * 1024 * 1024) / (4 * 1024) / 1000000; // ~3.27M, rounding to 3M as per spec
+        systemBwLimit = ddr4BwPerUnit * ramPerCpu * 1000; // in MB/s
+        systemIopsLimit = Math.min(systemIopsLimit, 3000000 * ramPerCpu);
+    } else {
+        const ddr5BwPerUnit = 25.0; // GB/s
+        const ddr5IopsPerUnit = (25.0 * 1024 * 1024 * 1024) / (4 * 1024) / 1000000; // ~6.55M, rounding to 6M as per spec
+        systemBwLimit = ddr5BwPerUnit * ramPerCpu * 1000; // in MB/s
+        systemIopsLimit = Math.min(systemIopsLimit, 6000000 * ramPerCpu);
+    }
 
     // Normalize RAID Type
     const normalizedRaidType = (raidType || '').toUpperCase().replace('-', '');
@@ -79,8 +96,9 @@ export const calculatePerformance = (raidType, numDrives, pdMetrics, baselineIOP
             break;
         case 'RAID5':
             if (version === '2.0') {
-                rawWriteIOPS = ((rawReadIOPS) / 4) * 0.9; // Base on theoretical read
-                result.notes.writeIOPS = `(RAID5 random read) / 4 * 0.9 (v2.0 formula)`;
+                // Formula will be applied AFTER Read IOPS is capped
+                rawWriteIOPS = 0;
+                result.notes.writeIOPS = `(Capped Read IOPS) / 4 * 0.9 (v2.0 formula)`;
             } else {
                 rawWriteIOPS = (mixedIOPS * numDrives) / 2;
                 result.notes.writeIOPS = `${formatIOPS(mixedIOPS)} x ${numDrives} / 2`;
@@ -91,8 +109,9 @@ export const calculatePerformance = (raidType, numDrives, pdMetrics, baselineIOP
             break;
         case 'RAID6':
             if (version === '2.0') {
-                rawWriteIOPS = ((rawReadIOPS) / 6) * 0.9; // Base on theoretical read
-                result.notes.writeIOPS = `(RAID5 random read) / 6 * 0.9 (v2.0 formula)`;
+                // Formula will be applied AFTER Read IOPS is capped
+                rawWriteIOPS = 0;
+                result.notes.writeIOPS = `(Capped Read IOPS) / 6 * 0.9 (v2.0 formula)`;
             } else {
                 rawWriteIOPS = (mixedIOPS * numDrives) / 3;
                 result.notes.writeIOPS = `${formatIOPS(mixedIOPS)} x ${numDrives} / 3`;
@@ -103,60 +122,74 @@ export const calculatePerformance = (raidType, numDrives, pdMetrics, baselineIOP
             break;
     }
 
-    // 2. Apply Capping (Platform Baseline & Card Spec)
-    let finalReadIOPS = Math.min(rawReadIOPS, baselineIOPS);
-    let finalWriteIOPS = rawWriteIOPS;
-    let finalReadBW = rawReadBW;
-    let finalWriteBW = rawWriteBW;
+    // 2. Apply Capping (Platform Baseline & Card Spec & System Limits)
+    let finalReadIOPS = Math.min(rawReadIOPS, baselineIOPS, systemIopsLimit);
+    let finalReadBW = Math.min(rawReadBW, systemBwLimit);
+    let finalWriteBW = Math.min(rawWriteBW, systemBwLimit);
 
     const cardLimit = CARD_LIMITS[cardModel];
     const raidLimit = cardLimit?.[effectiveRaidType];
 
+    // Card capping for Read
     if (raidLimit) {
-        // V2 Style limits (RAID specific)
         if (finalReadIOPS > raidLimit.randReadIOPS) {
             finalReadIOPS = raidLimit.randReadIOPS;
             result.notes.readIOPS = `Capped by card spec (${cardModel})`;
-        } else {
-            result.notes.readIOPS = rawReadIOPS > baselineIOPS
-                ? `Capped by platform baseline: ${formatIOPS(baselineIOPS)}`
-                : `${formatIOPS(readIOPS)} x ${numDrives} = ${formatIOPS(rawReadIOPS)}`;
-        }
-
-        if (finalWriteIOPS > raidLimit.randWriteIOPS) {
-            finalWriteIOPS = raidLimit.randWriteIOPS;
-            result.notes.writeIOPS = `Capped by card spec (${cardModel})`;
-        }
-
-        if (finalReadBW > raidLimit.seqReadBW) {
-            finalReadBW = raidLimit.seqReadBW;
-            result.notes.readBW = `Capped by card spec (${cardModel})`;
-        }
-
-        if (finalWriteBW > raidLimit.seqWriteBW) {
-            finalWriteBW = raidLimit.seqWriteBW;
-            result.notes.writeBW = `Capped by card spec (${cardModel})`;
-        }
-    } else {
-        // V1 Style limits (Generic read limit + RAID 5/6 write limit)
-        if (finalReadIOPS > baselineIOPS) {
+        } else if (finalReadIOPS === systemIopsLimit) {
+            result.notes.readIOPS = `Capped by system (CPU/RAM limit)`;
+        } else if (finalReadIOPS === baselineIOPS) {
             result.notes.readIOPS = `Capped by platform baseline: ${formatIOPS(baselineIOPS)}`;
         } else {
             result.notes.readIOPS = `${formatIOPS(readIOPS)} x ${numDrives} = ${formatIOPS(rawReadIOPS)}`;
         }
 
-        if (effectiveRaidType === 'RAID5' || effectiveRaidType === 'RAID6') {
-            const cardReadLimit = CARD_LIMITS[cardModel]?.randReadIOPS;
-            if (cardReadLimit && finalReadIOPS > cardReadLimit) {
-                finalReadIOPS = cardReadLimit;
-                result.notes.readIOPS = `Capped by card spec (${cardModel}): ${formatIOPS(cardReadLimit)}`;
-            }
+        if (finalReadBW > raidLimit.seqReadBW) {
+            finalReadBW = raidLimit.seqReadBW;
+            result.notes.readBW = `Capped by card spec (${cardModel})`;
+        } else if (finalReadBW === systemBwLimit) {
+            result.notes.readBW = `Capped by RAM bandwidth limit`;
+        }
 
-            const cardWriteLimit = CARD_LIMITS[cardModel]?.randWriteIOPS?.[effectiveRaidType];
-            if (cardWriteLimit && finalWriteIOPS > cardWriteLimit) {
-                finalWriteIOPS = cardWriteLimit;
-                result.notes.writeIOPS = `Capped by card spec (${cardModel}): ${formatIOPS(cardWriteLimit)}`;
-            }
+        if (finalWriteBW > raidLimit.seqWriteBW) {
+            finalWriteBW = raidLimit.seqWriteBW;
+            result.notes.writeBW = `Capped by card spec (${cardModel})`;
+        } else if (finalWriteBW === systemBwLimit) {
+            result.notes.writeBW = `Capped by RAM bandwidth limit`;
+        }
+    } else {
+        const cardReadLimit = CARD_LIMITS[cardModel]?.randReadIOPS;
+        if (cardReadLimit && finalReadIOPS > cardReadLimit) {
+            finalReadIOPS = cardReadLimit;
+            result.notes.readIOPS = `Capped by card spec (${cardModel})`;
+        } else if (finalReadIOPS === systemIopsLimit) {
+            result.notes.readIOPS = `Capped by system (CPU/RAM limit)`;
+        } else if (finalReadIOPS === baselineIOPS) {
+            result.notes.readIOPS = `Capped by platform baseline: ${formatIOPS(baselineIOPS)}`;
+        } else {
+            result.notes.readIOPS = `${formatIOPS(readIOPS)} x ${numDrives} = ${formatIOPS(rawReadIOPS)}`;
+        }
+    }
+
+    // 3. Calculate Write IOPS (incorporating Linux V2 logic)
+    let finalWriteIOPS = 0;
+    if (version === '2.0' && (effectiveRaidType === 'RAID5' || effectiveRaidType === 'RAID6')) {
+        const divisor = (effectiveRaidType === 'RAID5' ? 4 : 6);
+        finalWriteIOPS = (finalReadIOPS / divisor) * 0.9;
+    } else {
+        finalWriteIOPS = rawWriteIOPS;
+    }
+
+    // Card capping for Write
+    if (raidLimit) {
+        if (finalWriteIOPS > raidLimit.randWriteIOPS) {
+            finalWriteIOPS = raidLimit.randWriteIOPS;
+            result.notes.writeIOPS = `Capped by card spec (${cardModel})`;
+        }
+    } else if (effectiveRaidType === 'RAID5' || effectiveRaidType === 'RAID6') {
+        const cardWriteLimit = CARD_LIMITS[cardModel]?.randWriteIOPS?.[effectiveRaidType];
+        if (cardWriteLimit && finalWriteIOPS > cardWriteLimit) {
+            finalWriteIOPS = cardWriteLimit;
+            result.notes.writeIOPS = `Capped by card spec (${cardModel})`;
         }
     }
 
