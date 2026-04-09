@@ -1578,3 +1578,145 @@ label .hint {
     margin: 2cm;
   }
 }
+
+/* ── Stuck-device warning banner ───────────────────────────────────────── */
+.stuck-device-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  background-color: #fff3cd;
+  color: #664d03;
+  border: 1px solid #ffecb5;
+  border-left: 5px solid #ffc107;
+  border-radius: 6px;
+  padding: 14px 18px;
+  margin: 10px 20px;
+  animation: slideDown 0.3s ease-out;
+}
+
+.stuck-device-icon {
+  font-size: 1.4rem;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.stuck-device-content {
+  flex: 1;
+}
+
+.stuck-device-content strong {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 0.95rem;
+}
+
+.stuck-device-list {
+  margin: 0 0 6px 0;
+  padding-left: 18px;
+}
+
+.stuck-device-list li {
+  margin-bottom: 3px;
+  font-size: 0.9rem;
+}
+
+.stuck-device-list code {
+  background: rgba(0,0,0,0.08);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 0.88rem;
+}
+
+.stuck-device-time {
+  opacity: 0.7;
+  font-size: 0.82rem;
+}
+
+.stuck-device-hint {
+  font-size: 0.82rem;
+  opacity: 0.8;
+}
+
+.stuck-device-dismiss {
+  background: none;
+  border: 1px solid #664d03;
+  color: #664d03;
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  flex-shrink: 0;
+  transition: all 0.2s;
+}
+
+.stuck-device-dismiss:hover {
+  background: #664d03;
+  color: #fff3cd;
+}
+
+/* ── PCIe link speed/width indicator ── */
+.pcie-cell {
+  white-space: nowrap;
+  font-size: 0.82rem;
+}
+
+.pcie-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.pcie-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.pcie-ok .pcie-dot   { background: #28a745; }
+.pcie-warn .pcie-dot { background: #dc3545; }
+
+.pcie-warn-text {
+  color: #dc3545;
+  font-size: 0.78rem;
+}
+
+.pcie-na {
+  color: #888;
+  font-size: 0.78rem;
+}
+
+/* ── GPU performance state warning (RAID controller section) ── */
+.gpu-perf-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: #fff3cd;
+  border-left: 4px solid #ffc107;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  color: #664d03;
+}
+
+.gpu-perf-icon {
+  font-size: 1.1rem;
+  flex-shrink: 0;
+  padding-top: 1px;
+}
+
+.gpu-perf-state {
+  opacity: 0.75;
+}
+
+.gpu-perf-reasons {
+  font-style: italic;
+}
+
+.gpu-perf-hint {
+  margin-top: 3px;
+  font-size: 0.78rem;
+  opacity: 0.85;
+}
