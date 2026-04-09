@@ -87,14 +87,13 @@ function check_dependencies() {
 
     # Check if LOG_COMPACT is true
     if [[ "${LOG_COMPACT}" == "true" ]]; then
-        # echo "LOG_COMPACT is set to true. Skipping atop check."
         skip_atop=true
         echo '13'
     else
         skip_atop=false
     fi
 
-
+    # bench-fio is pip-only (not in any distro package repo); handle separately below.
     for name in fio jq nvme graidctl atop nvidia-smi pip3 bc
         do
         if [[ $(which $name 2>/dev/null) ]]; then
@@ -151,7 +150,7 @@ function check_dependencies() {
                             bc) echo "bc";;
                             *) echo "";;
                         esac)
-                        pack='zpper install'
+                        pack='zypper install'
                         ;;
                     *)
                         msg="Distro '$DISTRO_ID' not supported."
@@ -160,7 +159,6 @@ function check_dependencies() {
                         ;;
                 esac
 
-                
                 if [ -z "$package_name" ]; then
                     echo -en "\n$name needs to be installed. Please run \n '$pack $package_name -y' \n";deps=1;
                 else
@@ -172,6 +170,30 @@ function check_dependencies() {
                 ;;
         esac
     done
+
+    # --- bench-fio: installed via pip from GitHub, not via apt/yum ---
+    # Always check and auto-install regardless of USE_BENCH_FIO setting,
+    # since DUT setup runs only once; the user controls usage via USE_BENCH_FIO.
+    if ! command -v bench-fio &>/dev/null; then
+        log_info "bench-fio not found. Installing from GitHub latest release..."
+        BENCH_FIO_TAG=$(curl -fsSL https://api.github.com/repos/louwrentius/fio-plot/releases/latest \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo "")
+        PIP_OPTS=""
+        # Handle PEP 668 externally-managed environments
+        python3 -c "import sys; open('/usr/lib/python{}.{}/EXTERNALLY-MANAGED'.format(*sys.version_info[:2]))" \
+            2>/dev/null && PIP_OPTS="--break-system-packages"
+        if [[ -n "$BENCH_FIO_TAG" ]]; then
+            pip3 install $PIP_OPTS "git+https://github.com/louwrentius/fio-plot.git@${BENCH_FIO_TAG}" 2>&1 \
+                && log_info "bench-fio installed @ $BENCH_FIO_TAG" \
+                || { echo "STATUS: ERROR: Failed to install bench-fio."; sleep 1; exit 1; }
+        else
+            pip3 install $PIP_OPTS "git+https://github.com/louwrentius/fio-plot.git" 2>&1 \
+                && log_info "bench-fio installed (latest main)" \
+                || { echo "STATUS: ERROR: Failed to install bench-fio."; sleep 1; exit 1; }
+        fi
+    else
+        log_info "bench-fio already installed: $(bench-fio --version 2>&1 | head -1)"
+    fi
     
     if [[ $deps -ne 1 ]]; then
         log_info "Dependency check OK"
@@ -198,6 +220,7 @@ function check_dependencies() {
 done < "$REQUIREMENTS_FILE"
 
 }
+
 
 
 function chk_device() {
@@ -283,6 +306,20 @@ function get_basic_para() {
     if [[ -z "$CPU_ALLOWED_RAND" ]]; then
         export CPU_ALLOWED_RAND="0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124"
     fi
+
+    # FIO/bench-fio parameter defaults (overridden by graid-bench.conf)
+    FIO_MODES=(${FIO_MODES[*]:-randread randwrite read write})
+    FIO_BLOCK_SIZES=(${FIO_BLOCK_SIZES[*]:-4k 128k 1m})
+    FIO_IODEPTH=(${FIO_IODEPTH[*]:-1 8 32 64})
+    FIO_NUMJOBS=(${FIO_NUMJOBS[*]:-1 8 16})
+    FIO_ENGINE=${FIO_ENGINE:-libaio}
+    FIO_RWMIX=(${FIO_RWMIX[*]:-75})
+    FIO_DIRECT=${FIO_DIRECT:-1}
+    FIO_EXTRA_OPTS=${FIO_EXTRA_OPTS:-}
+    # USE_BENCH_FIO: set to "true" to use bench-fio for main test runs,
+    # "false" to fall back to direct fio job files (legacy mode).
+    USE_BENCH_FIO=${USE_BENCH_FIO:-true}
+    export FIO_MODES FIO_BLOCK_SIZES FIO_IODEPTH FIO_NUMJOBS FIO_ENGINE FIO_RWMIX FIO_DIRECT FIO_EXTRA_OPTS USE_BENCH_FIO
     timestamp=$(date '+%Y-%m-%d-%s')
     result="$NVME_INFO-result"
     killall -q atop fio
@@ -363,12 +400,21 @@ main() {
     NVME_COUNT=${#NVME_LIST[@]}
     
     # Calculate Global Total Steps
-    if [[ "$QUICK_TEST" == "true" ]]; then
-        WL_COUNT_VD=4
-        if [[ "$DUMMY" == "true" ]]; then WL_COUNT_PD=4; else WL_COUNT_PD=7; fi
+    if [[ "${USE_BENCH_FIO:-true}" == "true" ]]; then
+        M_CNT=$(( ${#FIO_MODES[@]} > 0 ? ${#FIO_MODES[@]} : 1 ))
+        B_CNT=$(( ${#FIO_BLOCK_SIZES[@]} > 0 ? ${#FIO_BLOCK_SIZES[@]} : 1 ))
+        Q_CNT=$(( ${#FIO_IODEPTH[@]} > 0 ? ${#FIO_IODEPTH[@]} : 1 ))
+        J_CNT=$(( ${#FIO_NUMJOBS[@]} > 0 ? ${#FIO_NUMJOBS[@]} : 1 ))
+        WL_COUNT_VD=$(( M_CNT * B_CNT * Q_CNT * J_CNT ))
+        WL_COUNT_PD=$WL_COUNT_VD
     else
-        WL_COUNT_VD=12
-        WL_COUNT_PD=13
+        if [[ "$QUICK_TEST" == "true" ]]; then
+            WL_COUNT_VD=4
+            if [[ "$DUMMY" == "true" ]]; then WL_COUNT_PD=4; else WL_COUNT_PD=7; fi
+        else
+            WL_COUNT_VD=12
+            WL_COUNT_PD=13
+        fi
     fi
 
     TOTAL_BENCH_STEPS=0
@@ -393,16 +439,22 @@ main() {
 
     if [[ "$RUN_VD" == "true" || "$RUN_MD" == "true" ]]; then
         for test in "${TS_LS[@]}"; do
-            if [[ "$LS_JB" == "true" ]]; then
-                TICKS_PER_CONFIG=$(( WL_COUNT_VD * ${#QD_LS[@]} * ${#JOB_LS[@]} ))
-            elif [[ "$LS_BS" == "true" ]]; then
-                 TICKS_PER_CONFIG=$(( WL_COUNT_VD * ${#BS_LS[@]} + WL_COUNT_VD ))
-            elif [[ "$LS_CUST" == "true" ]]; then
-                 TICKS_PER_CONFIG=$(( WL_COUNT_VD * ${#QD_LS[@]} * ${#QD_LS[@]} * ${#JOB_LS[@]} ))
+            if [[ "${USE_BENCH_FIO:-true}" == "true" ]]; then
+                # bench-fio already includes QD and JOB loops inherently inside its matrix
+                TICKS_PER_CONFIG=$WL_COUNT_VD
+                TOTAL_BENCH_STEPS=$((TOTAL_BENCH_STEPS + ${#STA_LS[@]} * ${#RAID_TYPE[@]} * TICKS_PER_CONFIG * PD_STEP_MOD))
             else
-                 TICKS_PER_CONFIG=$WL_COUNT_VD
+                if [[ "$LS_JB" == "true" ]]; then
+                    TICKS_PER_CONFIG=$(( WL_COUNT_VD * ${#QD_LS[@]} * ${#JOB_LS[@]} ))
+                elif [[ "$LS_BS" == "true" ]]; then
+                     TICKS_PER_CONFIG=$(( WL_COUNT_VD * ${#BS_LS[@]} + WL_COUNT_VD ))
+                elif [[ "$LS_CUST" == "true" ]]; then
+                     TICKS_PER_CONFIG=$(( WL_COUNT_VD * ${#QD_LS[@]} * ${#QD_LS[@]} * ${#JOB_LS[@]} ))
+                else
+                     TICKS_PER_CONFIG=$WL_COUNT_VD
+                fi
+                TOTAL_BENCH_STEPS=$((TOTAL_BENCH_STEPS + ${#STA_LS[@]} * ${#RAID_TYPE[@]} * ${#QD_LS[@]} * TICKS_PER_CONFIG * PD_STEP_MOD))
             fi
-            TOTAL_BENCH_STEPS=$((TOTAL_BENCH_STEPS + ${#STA_LS[@]} * ${#RAID_TYPE[@]} * ${#QD_LS[@]} * TICKS_PER_CONFIG * PD_STEP_MOD))
         done
     fi
     

@@ -640,6 +640,10 @@ def collect_data(u_file_path, query_id, file_hder, save_folder_name):
     result_file_lst = [x for x in Path(
         u_file_path).rglob('*') if x.suffix == '.csv' and x.stem[0:(len(query_id))] == query_id]
 
+    if not result_file_lst:
+        print(f"Skipping collect_data: No matching CSV files found for query_id '{query_id}' in {u_file_path}")
+        return None
+
     for entry in result_file_lst:
         # print(entry)
 
@@ -942,21 +946,333 @@ def parser_filename(u_file_path):
     return filename_lst
 
 
+def parse_bench_fio_json(json_path):
+    """Parse a single bench-fio output JSON file and return a metrics dict.
+
+    bench-fio produces standard fio JSON files (--output-format=json).
+    This function extracts metadata from internal 'job options' for maximum accuracy.
+    """
+    import json as _json
+    try:
+        with open(json_path, "r") as fh:
+            data = _json.load(fh)
+    except Exception as exc:
+        print(f"parse_bench_fio_json: cannot open {json_path}: {exc}")
+        return None
+
+    jobs = data.get("jobs", [])
+    if not jobs:
+        return None
+
+    # --- Robust Metadata Extraction ---
+    # Priority 1: Extract from the first job's 'job options' (Ground Truth)
+    opts = jobs[0].get("job options", {})
+    mode   = opts.get("rw", "unknown")
+    bs_str = opts.get("bs", "N/A")
+    qd     = opts.get("iodepth", "N/A")
+    nj     = opts.get("numjobs", "N/A")
+
+    # Priority 2: Fallback to filename/path regex if options are missing
+    fname = Path(json_path).stem
+    if mode == "unknown" or qd == "N/A":
+        # Match format: randread-128-16
+        m = re.match(r"(rand\w+|\w+)-(\d+)-(\d+)", fname)
+        if m:
+            if mode == "unknown": mode = m.group(1)
+            if qd == "N/A": qd = m.group(2)
+            if nj == "N/A": nj = m.group(3)
+        else:
+            # Match format: iodepth_64_numjobs_8
+            m = re.search(r"iodepth_(\d+)_numjobs_(\d+)", fname)
+            if m:
+                if qd == "N/A": qd = m.group(1)
+                if nj == "N/A": nj = m.group(2)
+    
+    if bs_str == "N/A" or bs_str == "":
+        # Extract blocksize from path parts (usually directory named 4k/128k/1m)
+        parts = Path(json_path).parts
+        for p in reversed(parts):
+            if re.match(r"^\d+[kKmMgG]$", p):
+                bs_str = p
+                break
+
+    # Aggregate metrics across all jobs in the JSON.
+    read_iops_k  = 0.0
+    write_iops_k = 0.0
+    read_bw_gbs  = 0.0
+    write_bw_gbs = 0.0
+    read_lat_us  = 0.0
+    write_lat_us = 0.0
+    read_lat_sd  = 0.0
+    write_lat_sd = 0.0
+
+    fio_ver = data.get("fio version", "N/A")
+    
+    num_jobs = len(jobs)
+    for job in jobs:
+        r = job.get("read",  {})
+        w = job.get("write", {})
+        
+        # IOPS/BW ARE SUMMED across all jobs (Total Throughput)
+        read_iops_k  += r.get("iops",  0.0) / 1000.0
+        write_iops_k += w.get("iops",  0.0) / 1000.0
+        
+        # bw is in KiB/s (fio JSON default); convert to GB/s (decimal)
+        read_bw_gbs  += (r.get("bw", 0.0) * 1024.0) / 1e9
+        write_bw_gbs += (w.get("bw", 0.0) * 1024.0) / 1e9
+        
+        # LATENCY IS AVERAGED across all jobs
+        r_lat = r.get("lat_ns", r.get("clat_ns", {}))
+        w_lat = w.get("lat_ns", w.get("clat_ns", {}))
+        if num_jobs > 0:
+            read_lat_us  += (r_lat.get("mean",   0.0) / 1000.0) / num_jobs
+            write_lat_us += (w_lat.get("mean",   0.0) / 1000.0) / num_jobs
+            read_lat_sd  += (r_lat.get("stddev", 0.0) / 1000.0) / num_jobs
+            write_lat_sd += (w_lat.get("stddev", 0.0) / 1000.0) / num_jobs
+
+    # Extract CPU usage from the first job if available (fio reports it per job or globally)
+    usr_cpu = 0.0
+    sys_cpu = 0.0
+    if jobs:
+        usr_cpu = jobs[0].get("usr_cpu", 0.0)
+        sys_cpu = jobs[0].get("sys_cpu", 0.0)
+
+    # Normalise blocksize string to numeric KiB for the 'BlockSize' column.
+    bs_numeric = 0.0
+    bs_clean   = bs_str.strip().lower()
+    try:
+        if bs_clean.endswith("k"):
+            bs_numeric = float(bs_clean[:-1])
+        elif bs_clean.endswith("m"):
+            bs_numeric = float(bs_clean[:-1]) * 1024.0
+        elif bs_clean.endswith("g"):
+            bs_numeric = float(bs_clean[:-1]) * 1024.0 * 1024.0
+        else:
+            bs_numeric = float(bs_clean)
+    except ValueError:
+        bs_numeric = 0.0
+
+    return {
+        "fio-version":            fio_ver,
+        "Type":                   mode,
+        "BlockSize":              bs_numeric,
+        "Queue Depth":            qd,
+        "Threads":                nj,
+        "IOPs(read)":             round(read_iops_k,  2),
+        "IOPs(write)":            round(write_iops_k, 2),
+        "BW(read)-GB/s":          round(read_bw_gbs,  4),
+        "BW(write)-GB/s":         round(write_bw_gbs, 4),
+        "BW(read)-GiB/s":         round((read_bw_gbs * 1e9) / (1024.0**3),  4),
+        "BW(write)-GiB/s":        round((write_bw_gbs * 1e9) / (1024.0**3), 4),
+        "lat_avg(read)[usec]":    round(read_lat_us,  2),
+        "lat_avg(write)[usec]":   round(write_lat_us, 2),
+        "lat_stdev(read)[usec]":  round(read_lat_sd,  2),
+        "lat_stdev(write)[usec]": round(write_lat_sd, 2),
+        "User CPU":               round(usr_cpu, 2),
+        "System CPU":             round(sys_cpu, 2),
+        "Idle CPU":               "0.00",
+    }
+
+
+def collect_bench_fio_results(bench_fio_root, output_prefix, result_dir):
+    """Walk a bench-fio output directory tree and emit a summary CSV.
+
+    bench-fio tree layout:
+        <bench_fio_root>/<mode>/<blocksize>/iodepth_<qd>_numjobs_<nj>.json
+
+    Parameters
+    ----------
+    bench_fio_root : str | Path
+        Root directory that bench-fio wrote to (== --output argument).
+    output_prefix : str
+        Prefix to embed in the CSV filename (usually the benchmark OUTPUT_NAME).
+    result_dir : str | Path
+        Directory where the resulting CSV file is written.
+
+    Returns
+    -------
+    Path | None
+        Path to the written CSV, or None if no JSON files were found.
+    """
+    bench_fio_root = Path(bench_fio_root)
+    result_dir     = Path(result_dir)
+    result_dir.mkdir(parents=True, exist_ok=True)
+
+    # Derive metadata from result_dir path components (mimics parser_filename logic).
+    # result_dir is expected to be: ...<NVME_INFO>-result/<NVME_INFO>/<STAG>/<DEV_NAME>/<STAS>/result
+    # We extract what we can; defaults keep it safe.
+    dir_parts  = bench_fio_root.parts
+    raid_type  = "N/A"
+    pd_count   = "N/A"
+    stage      = "N/A"
+    controller = "N/A"
+    model      = output_prefix
+
+    # Try to parse from output_prefix
+    # Regex 1: Find RAID type (RAID0, RAID1, RAID5, RAID10, etc.)
+    m = re.search(r"(RAID\d+)", output_prefix, re.I)
+    if m:
+        raid_type = m.group(1).upper()
+    else:
+        # Check if it's a SingleTest (usually Linear/RAW)
+        if "SingleTest" in output_prefix:
+            raid_type = "Linear"
+
+    # Regex 2: Find PD count (e.g., 4PD, 8PD)
+    m = re.search(r"(\d+)PD", output_prefix, re.I)
+    if m:
+        pd_count = m.group(1)
+    # Stage from path
+    for p in dir_parts[::-1]:
+        if p in ("Normal", "Rebuild", "afterdiscard", "afterprecondition", "aftersustain"):
+            stage = p
+            break
+    # Controller from path (PD / VD / MD)
+    for p in dir_parts[::-1]:
+        if p in ("VD", "PD", "MD"):
+            controller = p
+            break
+
+    rows = []
+    # Recursively find all JSON files. 
+    # Use a set to avoid processing the same file multiple times if overlapping rglob calls occur.
+    json_files = sorted(set(bench_fio_root.rglob("*.json")))
+    if not json_files:
+        print(f"collect_bench_fio_results: no JSON files found under {bench_fio_root}")
+        return None
+
+    for jf in json_files:
+        metrics = parse_bench_fio_json(jf)
+        if metrics is None:
+            continue
+
+        total_bw_gbs  = metrics["BW(read)-GB/s"]  + metrics["BW(write)-GB/s"]
+        total_bw_gibs = metrics["BW(read)-GiB/s"] + metrics["BW(write)-GiB/s"]
+        total_iops_k  = metrics["IOPs(read)"]      + metrics["IOPs(write)"]
+        lat_us        = (metrics["lat_avg(read)[usec]"] or 0.0) + \
+                        (metrics["lat_avg(write)[usec]"] or 0.0)
+        lat_sd        = (metrics["lat_stdev(read)[usec]"] or 0.0) + \
+                        (metrics["lat_stdev(write)[usec]"] or 0.0)
+
+        row = {
+            # --- Metadata columns (match existing CSV schema) ---
+            "Model":               model,
+            "controller":          controller,
+            "fio-version":         metrics["fio-version"],
+            "SSD":                 output_prefix,
+            "Ben_type":            "bench-fio",
+            "Type":                metrics["Type"],
+            "RAID_status":         stage,
+            "WriteCache":          "N/A",
+            "Tasks_number":        "N/A",
+            "RAID_type":           raid_type,
+            "PD_count":            pd_count,
+            "stage":               stage,
+            "Threads":             metrics["Threads"],
+            "BlockSize":           metrics["BlockSize"],
+            "Queue Depth":         metrics["Queue Depth"],
+            # --- Performance columns ---
+            "Bandwidth (GB/s)":    round(total_bw_gbs,  4),
+            "IOPS(K)":             round(total_iops_k,  2),
+            "Read Latency (us)":   round(metrics["lat_avg(read)[usec]"],  2),
+            "Write Latency (us)":  round(metrics["lat_avg(write)[usec]"], 2),
+            "System CPU":          metrics["System CPU"],
+            "User CPU":            metrics["User CPU"],
+            "Idle CPU":            metrics["Idle CPU"],
+            "Bandwidth (GiB/s)":   round(total_bw_gibs, 4),
+            # Percentile columns (not available from bench-fio; fill with 0)
+            **{col: 0.0 for col in [
+                "1.00th","5.00th","10.00th","20.00th","30.00th","40.00th",
+                "50.00th","60.00th","70.00th","80.00th","90.00th","95.00th",
+                "99.00th","99.50th","99.90th","99.95th","99.99th",
+            ]},
+            # Extra raw columns for downstream compatibility
+            "filename":            str(jf),
+        }
+        rows.append(row)
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    ts  = time.strftime("%Y%m%d_%H%M")
+    out = result_dir / f"fio-test-{output_prefix}-{ts}_bench-fio.csv"
+    df.to_csv(out, index=False, float_format="%.4f")
+    print(f"collect_bench_fio_results: wrote {len(rows)} rows → {out}")
+    return out
+
+
+def is_bench_fio_output(path):
+    """Return True if *path* looks like it contains bench-fio output.
+    Now more inclusive: checks for any .json file with a 'fio version' key.
+    """
+    path = Path(path)
+    if not path.is_dir():
+        return False
+    
+    # Check immediate children first for speed
+    for child in path.glob("*.json"):
+        # Quick check for FIO signature
+        try:
+            with open(child, "r") as f:
+                if '"fio version"' in f.read(1024):
+                    return True
+        except: pass
+        
+    # Check one level deeper for common layouts (e.g. randread/4k/*.json or target/4k/*.json)
+    for sub in path.iterdir():
+        if sub.is_dir():
+            for child in sub.glob("*.json"):
+                try:
+                    with open(child, "r") as f:
+                        if '"fio version"' in f.read(1024):
+                            return True
+                except: pass
+                
+    return False
+
+
 if __name__ == '__main__':
 
-    if len(sys.argv) != 2:
-        print("Usage: python3 fio_parser.py <path_to_fio_logs>")
-    else:
-        # main(sys.argv[1])
+    if len(sys.argv) < 2 or len(sys.argv) > 3:
+        print("Usage: python3 fio_parser.py <path_to_fio_logs> [bench_fio_output_prefix]")
+        sys.exit(1)
 
-        # path = '/Users/liam/Downloads/a2000/disksdp/normal/ntfs/graid-a2000-ntfs-1vd-randread-j32b4kd32.txt'
-        parse_file = sys.argv[1]
+    parse_file = sys.argv[1]
 
-        # preprocess_iostat_files(parse_file)
-        rm_folder(parse_file, 'result')
-        rm_folder(parse_file, 'comparison_data')
-        rm_folder(parse_file, 'query_result')
-        u_name = Path(parse_file).stem.split('-')
-        # print(u_name[-1].split('_')[-2])
-        read_file(parse_file, '.log')
-        # query_data(parse_file)
+    # --- Legacy fio text-output parsing (unchanged) ---
+    # We clean up first so new results aren't immediately deleted.
+    rm_folder(parse_file, 'result')
+    rm_folder(parse_file, 'comparison_data')
+    rm_folder(parse_file, 'query_result')
+    
+    # --- Auto-detect bench-fio output directories inside the result tree ---
+    # We walk the whole result tree and convert any bench-fio directories we find.
+    # We want to pick the SHALLOWEST directories to get consolidated reports.
+    bench_fio_dirs_converted = 0
+    all_potential = []
+    for entry in Path(parse_file).rglob("*"):
+        if entry.is_dir() and is_bench_fio_output(entry):
+            all_potential.append(entry)
+            
+    # Filter: if A is parent of B, keep only A.
+    all_potential.sort(key=lambda p: len(p.parts))
+    roots = []
+    for p in all_potential:
+        if not any(p.name == r.name or str(p).startswith(str(r) + "/") for r in roots):
+            roots.append(p)
+            
+    for entry in roots:
+        # Derive a clean prefix from the directory name.
+        prefix = entry.name
+        result_subdir = entry.parent / "result"
+        collect_bench_fio_results(entry, prefix, result_subdir)
+        bench_fio_dirs_converted += 1
+
+    if bench_fio_dirs_converted:
+        print(f"fio_parser: converted {bench_fio_dirs_converted} bench-fio output dir(s) to CSV.")
+
+
+    # Process legacy .log files
+    read_file(parse_file, '.log')
+

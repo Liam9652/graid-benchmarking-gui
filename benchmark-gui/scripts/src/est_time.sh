@@ -115,65 +115,116 @@ RAID_INIT_BUFFER=200 # Waiting for DG optimal + 15s sleep
 # Total Estimated Time Calculation
 TOTAL_SECONDS=0
 
-# 1. PD Test Phase
-if [[ "$PD_RUN" == 1 ]]; then
-    # Loops in graid-bench.sh: for STAG in "${TS_LS[@]}"
-    for STAG in "${TS_LS[@]}"; do
-        # bench.sh is called once with all PDs if RUN_PD_ALL=true, or N times if false
-        # But inside bench.sh, it loops over task_list
-        # For each task, it runs prestat and then FIO
-        
-        # Discard happens once per bench.sh call
-        TOTAL_SECONDS=$((TOTAL_SECONDS + DISCARD_TIME * PD_PARALLEL_FACTOR))
-        
-        # Tasks
-        PHASE_TIME=0
-        for task_idx in $(seq 1 $WL_COUNT_PD); do
-            # Preparation in prestat
-            PREP_TIME=0
+if [[ "${USE_BENCH_FIO:-true}" == "true" ]]; then
+    # --- BENCH-FIO TIME ESTIMATION ---
+    FIO_GAP=${FIO_GAP_SLEEP:-10}
+    # Safely get array lengths (defaulting to 1 if empty)
+    M_CNT=$(( ${#FIO_MODES[@]} > 0 ? ${#FIO_MODES[@]} : 1 ))
+    B_CNT=$(( ${#FIO_BLOCK_SIZES[@]} > 0 ? ${#FIO_BLOCK_SIZES[@]} : 1 ))
+    Q_CNT=$(( ${#FIO_IODEPTH[@]} > 0 ? ${#FIO_IODEPTH[@]} : 1 ))
+    J_CNT=$(( ${#FIO_NUMJOBS[@]} > 0 ? ${#FIO_NUMJOBS[@]} : 1 ))
+    TOTAL_BENCHMARKS=$(( M_CNT * B_CNT * Q_CNT * J_CNT ))
+    
+    # 1. PD Test Phase
+    if [[ "$PD_RUN" == 1 ]]; then
+        for STAG in "${TS_LS[@]}"; do
+            TOTAL_SECONDS=$((TOTAL_SECONDS + DISCARD_TIME * PD_PARALLEL_FACTOR))
+            
+            # Preconditioning happens exactly ONCE per device per STAG in run_benchfio_matrix
             if [[ "$STAG" == "afterprecondition" ]]; then
-                PREP_TIME=$((PREP_TIME + PRECOND_TIME))
+                TOTAL_SECONDS=$((TOTAL_SECONDS + PRECOND_TIME * PD_PARALLEL_FACTOR))
             elif [[ "$STAG" == "aftersustain" ]]; then
-                PREP_TIME=$((PREP_TIME + PRECOND_TIME + SUSTAIN_TIME))
+                TOTAL_SECONDS=$((TOTAL_SECONDS + (PRECOND_TIME + SUSTAIN_TIME) * PD_PARALLEL_FACTOR))
             fi
             
-            # Sub-test FIO loop (QD/Jobs)
-            TEST_TIME=$(( (PD_RUNTIME + 10) * PD_LOOP_FACTOR ))
-            
-            PHASE_TIME=$((PHASE_TIME + PREP_TIME + TEST_TIME))
+            # Each benchmark takes RUNTIME + sleep overhead
+            TEST_TIME=$(( TOTAL_BENCHMARKS * (PD_RUNTIME + FIO_GAP + 2) ))
+            TOTAL_SECONDS=$(( TOTAL_SECONDS + TEST_TIME * PD_PARALLEL_FACTOR ))
         done
-        
-        TOTAL_SECONDS=$((TOTAL_SECONDS + PHASE_TIME * PD_PARALLEL_FACTOR))
-    done
-fi
+    fi
 
-# 2. VD/MD Test Phase
-if [[ "$VD_RUN" == 1 ]]; then
-    # Loops in graid-bench.sh: for STATUS x for STAG x for RAID
-    RAID_TYPES_ACTIVE=$RAID_TYPE_COUNT
-    STATUS_ACTIVE=$RAID_STATUS_COUNT
-    STAG_ACTIVE=$TS_LS_COUNT
-    
-    # Each combination calls bench.sh
-    COMBO_COUNT=$((RAID_TYPES_ACTIVE * STATUS_ACTIVE * STAG_ACTIVE))
-    
-    # Let's recalibrate the VD loop more accurately
-    VD_PHASE_TIME=0
-    for STAG in "${TS_LS[@]}"; do
-        # Time for one STAG phase (e.g., afterprecondition)
-        STAG_PREP=0
-        if [[ "$STAG" == "afterprecondition" ]]; then
-            STAG_PREP=$PRECOND_TIME
-        elif [[ "$STAG" == "aftersustain" ]]; then
-            STAG_PREP=$((PRECOND_TIME + SUSTAIN_TIME))
-        fi
+    # 2. VD/MD Test Phase
+    if [[ "$VD_RUN" == 1 ]]; then
+        RAID_TYPES_ACTIVE=$RAID_TYPE_COUNT
+        STATUS_ACTIVE=$RAID_STATUS_COUNT
+        STAG_ACTIVE=$TS_LS_COUNT
         
-        # One bench.sh run for this STAG x RAID x STATUS
-        ONE_RUN_TIME=$(( (DISCARD_TIME + RAID_INIT_BUFFER) + (STAG_PREP + (VD_RUNTIME + 10) * VD_LOOP_FACTOR) * WL_COUNT_VD ))
+        VD_PHASE_TIME=0
+        for STAG in "${TS_LS[@]}"; do
+            STAG_PREP=0
+            if [[ "$STAG" == "afterprecondition" ]]; then
+                STAG_PREP=$PRECOND_TIME
+            elif [[ "$STAG" == "aftersustain" ]]; then
+                STAG_PREP=$((PRECOND_TIME + SUSTAIN_TIME))
+            fi
+            
+            # Each STAG x RAID x STATUS combination runs prestat ONCE, then the full benchmark matrix
+            TEST_TIME=$(( TOTAL_BENCHMARKS * (VD_RUNTIME + FIO_GAP + 2) ))
+            ONE_RUN_TIME=$(( DISCARD_TIME + RAID_INIT_BUFFER + STAG_PREP + TEST_TIME ))
+            
+            VD_PHASE_TIME=$((VD_PHASE_TIME + ONE_RUN_TIME * RAID_TYPES_ACTIVE * STATUS_ACTIVE))
+        done
+        TOTAL_SECONDS=$((TOTAL_SECONDS + VD_PHASE_TIME))
+    fi
+
+else
+    # --- LEGACY FIO TIME ESTIMATION ---
+    # 1. PD Test Phase
+    if [[ "$PD_RUN" == 1 ]]; then
+        # Loops in graid-bench.sh: for STAG in "${TS_LS[@]}"
+        for STAG in "${TS_LS[@]}"; do
+            # Discard happens once per bench.sh call
+            TOTAL_SECONDS=$((TOTAL_SECONDS + DISCARD_TIME * PD_PARALLEL_FACTOR))
+            
+            # Tasks
+            PHASE_TIME=0
+            for task_idx in $(seq 1 $WL_COUNT_PD); do
+                # Preparation in prestat
+                PREP_TIME=0
+                if [[ "$STAG" == "afterprecondition" ]]; then
+                    PREP_TIME=$((PREP_TIME + PRECOND_TIME))
+                elif [[ "$STAG" == "aftersustain" ]]; then
+                    PREP_TIME=$((PREP_TIME + PRECOND_TIME + SUSTAIN_TIME))
+                fi
+                
+                # Sub-test FIO loop (QD/Jobs)
+                TEST_TIME=$(( (PD_RUNTIME + 10) * PD_LOOP_FACTOR ))
+                
+                PHASE_TIME=$((PHASE_TIME + PREP_TIME + TEST_TIME))
+            done
+            
+            TOTAL_SECONDS=$((TOTAL_SECONDS + PHASE_TIME * PD_PARALLEL_FACTOR))
+        done
+    fi
+
+    # 2. VD/MD Test Phase
+    if [[ "$VD_RUN" == 1 ]]; then
+        # Loops in graid-bench.sh: for STATUS x for STAG x for RAID
+        RAID_TYPES_ACTIVE=$RAID_TYPE_COUNT
+        STATUS_ACTIVE=$RAID_STATUS_COUNT
+        STAG_ACTIVE=$TS_LS_COUNT
         
-        VD_PHASE_TIME=$((VD_PHASE_TIME + ONE_RUN_TIME * RAID_TYPES_ACTIVE * STATUS_ACTIVE))
-    done
-    TOTAL_SECONDS=$((TOTAL_SECONDS + VD_PHASE_TIME))
+        # Each combination calls bench.sh
+        COMBO_COUNT=$((RAID_TYPES_ACTIVE * STATUS_ACTIVE * STAG_ACTIVE))
+        
+        # Let's recalibrate the VD loop more accurately
+        VD_PHASE_TIME=0
+        for STAG in "${TS_LS[@]}"; do
+            # Time for one STAG phase (e.g., afterprecondition)
+            STAG_PREP=0
+            if [[ "$STAG" == "afterprecondition" ]]; then
+                STAG_PREP=$PRECOND_TIME
+            elif [[ "$STAG" == "aftersustain" ]]; then
+                STAG_PREP=$((PRECOND_TIME + SUSTAIN_TIME))
+            fi
+            
+            # One bench.sh run for this STAG x RAID x STATUS
+            ONE_RUN_TIME=$(( (DISCARD_TIME + RAID_INIT_BUFFER) + (STAG_PREP + (VD_RUNTIME + 10) * VD_LOOP_FACTOR) * WL_COUNT_VD ))
+            
+            VD_PHASE_TIME=$((VD_PHASE_TIME + ONE_RUN_TIME * RAID_TYPES_ACTIVE * STATUS_ACTIVE))
+        done
+        TOTAL_SECONDS=$((TOTAL_SECONDS + VD_PHASE_TIME))
+    fi
 fi
 
 # Final adjustment with RAID_FACTOR
