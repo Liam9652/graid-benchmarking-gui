@@ -608,6 +608,15 @@ function list_file(){
             sleep_time=10
         fi
     fi
+
+    if [[ "${USE_BENCH_FIO:-true}" == "true" && ${#task_list[@]} -gt 0 ]]; then
+        task_list=("${task_list[0]}")
+    fi
+
+    # Allow configuration array override for gap sleep 
+    if [[ -n "${FIO_GAP_SLEEP}" ]]; then
+        sleep_time=${FIO_GAP_SLEEP}
+    fi
 }
 
 function prestat() {
@@ -627,12 +636,12 @@ function prestat() {
         sustain_time=3600
         #Micron 7450
         tvid="0x1344"
-        local common_args="--size=${runsize}g --offset_increment=${runsize}g --iodepth=${IODEPTH:-1} "
+        local common_args="--size=${runsize}g --offset_increment=${runsize}g --iodepth=${IODEPTH:-1} --status-interval=60"
     else
         echo $vid
         sustain_time=36
         tvid="0x1af4"
-        local common_args="--size=${runsize}g --offset_increment=${runsize}g --runtime=5 --iodepth=${IODEPTH:-1}"
+        local common_args="--size=${runsize}g --offset_increment=${runsize}g --runtime=5 --iodepth=${IODEPTH:-1} --status-interval=5"
     fi
     
     if [[ "${STAG}" == "afterprecondition" ]];  then
@@ -684,29 +693,7 @@ function prestat() {
         log_info "STATUS: STATE: SUSTAINING"
         log_info "STATUS: WORKLOAD: Sustain Write"
         if [[ "$DEV_NAME" != "PD" ]]; then
-            fio src/fio-loop/09-randwrite-graid --filename="/dev/$FIO_NAME" --runtime=$sustain_time --numjobs="$CPUJOBS" --cpus_allowed="$CPU_ALLOWED_SEQ" --iodepth=${IODEPTH} --output="$out_dir/$OUTPUT_NAME-sustain.log"
-            sleep 5
-        elif [[ "$DEV_NAME" == "PD" ]]; then
-            if [[ $RUN_PD_ALL == "true" ]]; then
-                rm -rf tfie
-                sed -e 's/\[graid-test\]//' "$src_path/09-randwrite-graid" > tfie
-                for PD_NAME in "${NVME_LIST[@]}"; do
-                    printf "[${PD_NAME}]\nfilename=/dev/${PD_NAME}\n" >> tfie
-                done
-                fio tfie --runtime=$sustain_time --numjobs=8 --iodepth=${IODEPTH} --output="$result/$OUTPUT_NAME-PD_ALL-sustain.log"
-                rm -rf tfie
-            else
-                fio "$src_path/09-randwrite-graid" --filename=/dev/"$PD_NAME" --runtime=$sustain_time --numjobs=8 --iodepth=${IODEPTH} --output="$out_dir/$OUTPUT_NAME-$PD_NAME-sustain.log"
-            fi
-        fi
-    fi
-    # if [[ "${STAG}" == "aftersustain" ]] && [[ "$vid" == '0x1af4' ]]; then
-    if [[ "${STAG}" == "aftersustain" ]] && [[ "$vid" == "$tvid" ]]; then
-        log_info "----aftersustain----"
-        log_info "STATUS: STATE: SUSTAINING"
-        log_info "STATUS: WORKLOAD: Sustain Write"
-        if [[ "$DEV_NAME" != "PD" ]]; then
-            fio src/fio-loop/09-randwrite-graid --filename="/dev/$FIO_NAME" --runtime=$sustain_time --numjobs="$CPUJOBS" --cpus_allowed="$CPU_ALLOWED_SEQ" --iodepth=${IODEPTH:-1} --output="$out_dir/$OUTPUT_NAME-sustain.log" &
+            fio src/fio-loop/09-randwrite-graid --filename="/dev/$FIO_NAME" --runtime=$sustain_time --numjobs="$CPUJOBS" --cpus_allowed="$CPU_ALLOWED_SEQ" --status-interval=60 --iodepth=${IODEPTH} --output="$out_dir/$OUTPUT_NAME-sustain.log" &
             fio_pid=$!
             
             # Use polling instead of static sleep
@@ -734,10 +721,72 @@ function prestat() {
                 for PD_NAME in "${NVME_LIST[@]}"; do
                     printf "[${PD_NAME}]\nfilename=/dev/${PD_NAME}\n" >> tfie
                 done
-                fio tfie --runtime=$sustain_time --numjobs=8 --iodepth=${IODEPTH:-1} --output="$result/$OUTPUT_NAME-PD_ALL-sustain.log"
+                fio tfie --runtime=$sustain_time --numjobs=8 --iodepth=${IODEPTH} --status-interval=60 --output="$result/$OUTPUT_NAME-PD_ALL-sustain.log" &
+                fio_pid=$!
                 rm -rf tfie
             else
-                fio "$src_path/09-randwrite-graid" --filename=/dev/"$PD_NAME" --runtime=$sustain_time --numjobs=8 --iodepth=${IODEPTH:-1} --output="$out_dir/$OUTPUT_NAME-$PD_NAME-sustain.log"
+                fio "$src_path/09-randwrite-graid" --filename=/dev/"$PD_NAME" --runtime=$sustain_time --numjobs=8 --iodepth=${IODEPTH} --status-interval=60 --output="$out_dir/$OUTPUT_NAME-$PD_NAME-sustain.log" &
+                fio_pid=$!
+            fi
+            
+            # Use polling instead of static sleep
+            if (( sustain_time > 15 )); then
+                wait_time=$((sustain_time - 12))
+                start_wait=$(date +%s)
+                while (( $(date +%s) - start_wait < wait_time )); do
+                    if ! kill -0 $fio_pid 2>/dev/null; then
+                        log_info "WARNING: fio sustain process ended early."
+                        break
+                    fi
+                    sleep 10
+                done
+            else
+                sleep $((sustain_time / 2))
+            fi
+            
+            trigger_snapshot "${OUTPUT_NAME}-${STAG}-sustain" "${fio_dir:-$out_dir}"
+            wait $fio_pid
+            sleep 2
+        fi
+    fi
+    # if [[ "${STAG}" == "aftersustain" ]] && [[ "$vid" == '0x1af4' ]]; then
+    if [[ "${STAG}" == "aftersustain" ]] && [[ "$vid" == "$tvid" ]]; then
+        log_info "----aftersustain----"
+        log_info "STATUS: STATE: SUSTAINING"
+        log_info "STATUS: WORKLOAD: Sustain Write"
+        if [[ "$DEV_NAME" != "PD" ]]; then
+            fio src/fio-loop/09-randwrite-graid --filename="/dev/$FIO_NAME" --runtime=$sustain_time --numjobs="$CPUJOBS" --cpus_allowed="$CPU_ALLOWED_SEQ" --iodepth=${IODEPTH:-1} --status-interval=60 --output="$out_dir/$OUTPUT_NAME-sustain.log" &
+            fio_pid=$!
+            
+            # Use polling instead of static sleep
+            if (( sustain_time > 15 )); then
+                wait_time=$((sustain_time - 12))
+                start_wait=$(date +%s)
+                while (( $(date +%s) - start_wait < wait_time )); do
+                    if ! kill -0 $fio_pid 2>/dev/null; then
+                        log_info "WARNING: fio sustain process ended early."
+                        break
+                    fi
+                    sleep 10
+                done
+            else
+                sleep $((sustain_time / 2))
+            fi
+            
+            trigger_snapshot "${OUTPUT_NAME}-${STAG}-sustain" "${fio_dir:-$out_dir}"
+            wait $fio_pid
+            sleep 2
+        elif [[ "$DEV_NAME" == "PD" ]]; then
+            if [[ $RUN_PD_ALL == "true" ]]; then
+                rm -rf tfie
+                sed -e 's/\[graid-test\]//' "$src_path/09-randwrite-graid" > tfie
+                for PD_NAME in "${NVME_LIST[@]}"; do
+                    printf "[${PD_NAME}]\nfilename=/dev/${PD_NAME}\n" >> tfie
+                done
+                fio tfie --runtime=$sustain_time --numjobs=8 --iodepth=${IODEPTH:-1} --status-interval=60 --output="$result/$OUTPUT_NAME-PD_ALL-sustain.log"
+                rm -rf tfie
+            else
+                fio "$src_path/09-randwrite-graid" --filename=/dev/"$PD_NAME" --runtime=$sustain_time --numjobs=8 --iodepth=${IODEPTH:-1} --status-interval=60 --output="$out_dir/$OUTPUT_NAME-$PD_NAME-sustain.log"
             fi
         fi
     fi
@@ -753,7 +802,10 @@ function kill_pid(){
 
 function discard_device() {
     local device="$1"
-    # echo "Discarding $device..."
+    local device_name="${device#/dev/}"
+
+    log_info "STATUS: DEVICE_START: ${device_name}"
+
     # Try with "-f" option
     blkdiscard "$device" -f > /dev/null 2>&1
     local RESULT=$?
@@ -769,39 +821,66 @@ function discard_device() {
         nvme sanitize -a 2 "$device" > /dev/null 2>&1
         check_sanitize_done "$device"
     fi
+
+    log_info "STATUS: DEVICE_DONE: ${device_name}"
 }
 
 check_sanitize_done() {
     local device_path="$1"
     local device="${device_path#/dev/}"
-    
+
+    local last_sprog=""
+    local last_change_time
+    last_change_time=$(date +%s)
+    local stuck_warned=false
+    local STUCK_THRESHOLD=30   # seconds without progress before warning
+
     while true; do
         local sprog=""
-        
+
         # 1. Try JSON output
         local json_out
         json_out=$(nvme sanitize-log "$device_path" -o json 2>/dev/null)
-        
+
         if [[ -n "$json_out" ]]; then
-            # Attempt to parse as JSON, handling both flat and nested structure
             sprog=$(echo "$json_out" | jq -r --arg device "$device" '.sprog // .[$device].sprog' 2>/dev/null)
         fi
-        
+
         # 2. Fallback to text output if JSON failed to produce value
         if [[ -z "$sprog" || "$sprog" == "null" ]]; then
-             local text_out
-             text_out=$(nvme sanitize-log "$device_path" 2>/dev/null)
-             # Parse 'Sanitize Progress (SPROG) : 65535'
-             sprog=$(echo "$text_out" | grep -i "SPROG" | awk -F':' '{print $2}' | tr -d '[:space:]')
+            local text_out
+            text_out=$(nvme sanitize-log "$device_path" 2>/dev/null)
+            # Parse 'Sanitize Progress (SPROG) : 65535'
+            sprog=$(echo "$text_out" | grep -i "SPROG" | awk -F':' '{print $2}' | tr -d '[:space:]')
         fi
 
         if [[ "$sprog" == "65535" ]]; then
-             # echo "Sanitization finished on $device"
-             return 0
-        else
-             # echo "Sanitization in progress, checking again in 5 seconds..."
-             sleep 5
+            log_info "STATUS: DEVICE_SANITIZE_DONE: ${device}"
+            # Clear any previous stuck warning
+            if [[ "$stuck_warned" == "true" ]]; then
+                log_info "STATUS: DEVICE_UNSTUCK: ${device}"
+            fi
+            return 0
         fi
+
+        # Check if progress has changed
+        local now
+        now=$(date +%s)
+        if [[ "$sprog" != "$last_sprog" ]]; then
+            last_sprog="$sprog"
+            last_change_time=$now
+            stuck_warned=false
+            log_info "STATUS: DEVICE_SANITIZE_PROGRESS: ${device} ${sprog}"
+        fi
+
+        # Detect stuck: no progress change within threshold
+        local elapsed=$(( now - last_change_time ))
+        if [[ $elapsed -ge $STUCK_THRESHOLD && "$stuck_warned" == "false" ]]; then
+            log_info "STATUS: DEVICE_STUCK: ${device}"
+            stuck_warned=true
+        fi
+
+        sleep 5
     done
 }
 
@@ -817,45 +896,138 @@ function run_task(){
         fio_dir=$6
         of_name=$7
         qd=$8
-        # echo ---run task----
         log_info "$1 $2 $3 $4 $5 $6 $7 $8"
         fio_cmd_dir=${fio_dir}/cmd
         mkdir -p $fio_cmd_dir
         fio_pid_list=""
-        # echo $fio_dir
-        # echo $fio_cmd_dir
-        if [[ $qd != "" ]] && [[ "$DEV_NAME" == "VD" || "$DEV_NAME" == "MD" ]]; then
-            fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --iodepth=$qd   --showcmd >> ${fio_cmd_dir}/${of_name}
-            fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --iodepth=$qd  --output=$fio_dir/$of_name.txt  &
-            fio_pid_list="${fio_pid_list} $!"
 
-        elif [[ $qd == "" ]] && [[ "$DEV_NAME" != "PD" ]] ; then
-            # Default to first configured QD if not in batch mode loop
-            local final_qd=${QD_LS[0]:-64}
-            fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --iodepth=$final_qd --showcmd >> ${fio_cmd_dir}/${of_name}
-            fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --iodepth=$final_qd --output=$fio_dir/$of_name.txt  &
-            fio_pid_list="${fio_pid_list} $!"
+        # ---------------------------------------------------------------
+        # Tool selection via USE_BENCH_FIO (from graid-bench.conf).
+        #   true  → bench-fio (reads FIO_* config variables, outputs JSON)
+        #   false → legacy direct fio job file calls (original behaviour)
+        # ---------------------------------------------------------------
+        if [[ "${USE_BENCH_FIO:-true}" == "true" ]]; then
 
-        elif [[ $qd == "" ]] && [[ $RUN_PD_ALL == "true" ]]; then
-	    
-            fio $fio_file --runtime=$run_time --showcmd >> ${fio_cmd_dir}/${of_name}
-            fio $fio_file --runtime=$run_time --output=$fio_dir/$of_name.txt  &
-            fio_pid_list="${fio_pid_list} $!"
-        elif [[ $qd == "" ]] && [[ $RUN_PD_ALL != "true" ]]; then
-	    
-            fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus  --showcmd >> ${fio_cmd_dir}/${of_name}
-            fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus  --output=$fio_dir/$of_name.txt  &
-            fio_pid_list="${fio_pid_list} $!"
+            # ------- bench-fio path -----------------------------------
+            local bench_modes="${FIO_MODES[*]:-randread randwrite read write}"
+            local bench_bs="${FIO_BLOCK_SIZES[*]:-4k 128k 1m}"
+            local bench_iodepth="${FIO_IODEPTH[*]:-$qd}"
+            local bench_numjobs="${FIO_NUMJOBS[*]:-$job}"
+            local bench_engine="${FIO_ENGINE:-libaio}"
+            local bench_direct="${FIO_DIRECT:-1}"
+            local bench_rwmix="${FIO_RWMIX[*]:-75}"
+            local bench_extra="${FIO_EXTRA_OPTS:-}"
+
+            local bench_parallel_flag=""
+            if [[ "$DEV_NAME" == "VD" || "$DEV_NAME" == "MD" ]]; then
+                bench_target="/dev/$device"
+            elif [[ "$RUN_PD_ALL" == "true" && "$DEV_NAME" == "PD" ]]; then
+                local all_targets=""
+                for pd in "${NVME_LIST[@]}"; do
+                    all_targets="${all_targets:+$all_targets }/dev/$pd"
+                done
+                bench_target="$all_targets"
+                bench_parallel_flag="--parallel"
+            else
+                bench_target="/dev/$device"
+            fi
+
+            # Let bench-fio control its own directory generations (mode/bs/) under fio_dir
+            # rather than wrapping every test in a separate unique of_name folder.
+            local bench_output="${fio_dir}"
+            mkdir -p "$bench_output"
+
+            local bench_extra_space=""
+            if [[ -n "$bench_extra" ]]; then
+                # bench-fio expects space-separated key=value pairs for --extra-opts.
+                # FIO_EXTRA_OPTS may be comma-separated (legacy fio format), so convert.
+                bench_extra_space="${bench_extra//,/ }"
+            fi
+
+            # Automatically map the calculated NUMA cpus_allowed for VD/MD/PD.
+            if [[ -n "$cpu" && "$cpu" != "0" ]]; then
+                bench_extra_space="${bench_extra_space} cpus_allowed=$cpu"
+            fi
+
+            local bench_extra_flags=""
+            bench_extra_space=$(echo "$bench_extra_space" | xargs)
+            if [[ -n "$bench_extra_space" ]]; then
+                bench_extra_flags="--extra-opts ${bench_extra_space}"
+            fi
+
+            if [[ "${USE_BENCH_FIO:-true}" == "true" ]]; then
+                log_info "STATUS: WORKLOAD: bench-fio [Modes: ${bench_modes// /,} | BS: ${bench_bs// /,} | QD: ${bench_iodepth// /,} | Jobs: ${bench_numjobs// /,}]"
+            fi
+            
+            log_info "bench-fio: target=$bench_target modes=[$bench_modes] bs=[$bench_bs] iodepth=[$bench_iodepth] numjobs=[$bench_numjobs]"
+
+            # Log exact bench-fio command to cmd/ directory for manual replay
+            echo "bench-fio \\
+                --target    $bench_target \\
+                --type      device \\
+                --mode      $bench_modes \\
+                --block-size $bench_bs \\
+                --iodepth   $bench_iodepth \\
+                --numjobs   $bench_numjobs \\
+                --runtime   \"$run_time\" \\
+                --engine    \"$bench_engine\" \\
+                --direct    \"$bench_direct\" \\
+                --rwmixread $bench_rwmix \\
+                --output    \"$bench_output\" \\
+                $bench_parallel_flag \\
+                $bench_extra_flags \\
+                --destructive" >> "${fio_cmd_dir}/${of_name}"
+
+            bench-fio \
+                --target    $bench_target \
+                --type      device \
+                --mode      $bench_modes \
+                --block-size $bench_bs \
+                --iodepth   $bench_iodepth \
+                --numjobs   $bench_numjobs \
+                --runtime   "$run_time" \
+                --engine    "$bench_engine" \
+                --direct    "$bench_direct" \
+                --rwmixread $bench_rwmix \
+                --output    "$bench_output" \
+                $bench_parallel_flag \
+                $bench_extra_flags \
+                --destructive --quiet &
+
+            fio_pid_list="$!"
 
         else
-            #fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --iodepth=$qd --showcmd >> ${fio_cmd_dir}/${of_name}
-            fio $fio_file  --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --iodepth=$qd --showcmd >> ${fio_cmd_dir}/${of_name}
-	    #cat $fio_file
-            #fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --iodepth=$qd --output=$fio_dir/$of_name.txt  &
-            fio $fio_file  --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --iodepth=$qd --output=$fio_dir/$of_name.txt  &
-            fio_pid_list="${fio_pid_list} $!"
-        fi
-        
+
+            # ------- Legacy direct fio job file path ------------------
+            if [[ $qd != "" ]] && [[ "$DEV_NAME" == "VD" || "$DEV_NAME" == "MD" ]]; then
+                fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --iodepth=$qd --showcmd >> ${fio_cmd_dir}/${of_name}
+                fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --iodepth=$qd --output=$fio_dir/$of_name.txt &
+                fio_pid_list="${fio_pid_list} $!"
+
+            elif [[ $qd == "" ]] && [[ "$DEV_NAME" != "PD" ]]; then
+                local final_qd=${QD_LS[0]:-64}
+                fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --iodepth=$final_qd --showcmd >> ${fio_cmd_dir}/${of_name}
+                fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --iodepth=$final_qd --output=$fio_dir/$of_name.txt &
+                fio_pid_list="${fio_pid_list} $!"
+
+            elif [[ $qd == "" ]] && [[ $RUN_PD_ALL == "true" ]]; then
+                fio $fio_file --runtime=$run_time --showcmd >> ${fio_cmd_dir}/${of_name}
+                fio $fio_file --runtime=$run_time --output=$fio_dir/$of_name.txt &
+                fio_pid_list="${fio_pid_list} $!"
+
+            elif [[ $qd == "" ]] && [[ $RUN_PD_ALL != "true" ]]; then
+                fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --showcmd >> ${fio_cmd_dir}/${of_name}
+                fio $fio_file --filename=/dev/$device --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --output=$fio_dir/$of_name.txt &
+                fio_pid_list="${fio_pid_list} $!"
+
+            else
+                fio $fio_file --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --iodepth=$qd --showcmd >> ${fio_cmd_dir}/${of_name}
+                fio $fio_file --runtime=$run_time --numjobs=$job --cpus_allowed=$cpus --iodepth=$qd --output=$fio_dir/$of_name.txt &
+                fio_pid_list="${fio_pid_list} $!"
+            fi
+
+        fi  # end USE_BENCH_FIO
+
         # echo ${iostat_pid_list}
 
         # Trigger Snapshot roughly 10 seconds before the end of the run
@@ -864,7 +1036,6 @@ function run_task(){
             start_wait=$(date +%s)
             while (( $(date +%s) - start_wait < wait_time )); do
                 if ! kill -0 ${fio_pid_list} 2>/dev/null; then
-                    log_info "WARNING: fio process ended unexpectedly."
                     break
                 fi
                 sleep 5
@@ -895,7 +1066,108 @@ function run_task(){
 
 }
 
+function run_benchfio_matrix() {
+    fio_dir=${out_dir}/${STAS}
+    get_cpu_count
+    
+    log_info "---$NVME_INFO-${STAS}-$RAID_MODE-${PD_NUMBER}PD-benchfio---"
+    
+    if [[ $DEV_NAME != "PD" ]]; then
+        create_vd
+        prestat "src/fio-loop/09-randwrite-graid"
+        if [[ $STAS == "Rebuild" ]]; then
+            rebuild_raid
+        fi
+        log_info "STATUS: STATE: BENCHMARKING: ${RAID_MODE} - ${STAS^^}"
+    else
+        prestat "src/fio-loop-pd/09-randwrite-graid"
+        log_info "STATUS: STATE: BENCHMARKING: ${STAS^^}"
+    fi
+
+    local bench_modes_arr=(${FIO_MODES[@]})
+    local bench_bs_arr=(${FIO_BLOCK_SIZES[@]})
+    local bench_qd_arr=(${FIO_IODEPTH[@]})
+    local bench_jobs_arr=(${FIO_NUMJOBS[@]})
+    
+    # Store globally to restore later as proper arrays
+    local G_MODES=("${FIO_MODES[@]}")
+    local G_BS=("${FIO_BLOCK_SIZES[@]}")
+    local G_QD=("${FIO_IODEPTH[@]}")
+    local G_JOBS=("${FIO_NUMJOBS[@]}")
+
+    # Calculate total steps for UI locally, but do not emit TOTAL_STEPS to backend to avoid resetting progress!
+    local total_steps=$(( ${#bench_modes_arr[@]} * ${#bench_bs_arr[@]} * ${#bench_qd_arr[@]} * ${#bench_jobs_arr[@]} ))
+
+    for mode in "${bench_modes_arr[@]}"; do
+        for bs in "${bench_bs_arr[@]}"; do
+            for qd in "${bench_qd_arr[@]}"; do
+                for job in "${bench_jobs_arr[@]}"; do
+                    # Smart evaluation of MAX directly into physical core counts
+                    if [[ "${job^^}" == "MAX" ]]; then
+                        job="$cpus_counts"
+                    fi
+
+                    # Temporarily limit globals so run_task generates a single FIO command for bench-fio
+                    # Must use array syntax to overwrite the entire array instead of just index 0
+                    FIO_MODES=("$mode")
+                    FIO_BLOCK_SIZES=("$bs")
+                    FIO_IODEPTH=("$qd")
+                    FIO_NUMJOBS=("$job")
+
+                    # CPU Allowing mechanism mirroring the legacy loops
+                    cpu_seq=""
+                    cpu_lst_node=$(cat /sys/devices/system/node/online | awk -F'-' '{print $NF}')
+                    for node in $(seq 0 $cpu_lst_node); do
+                        cpu_list=$(find_cpu_list_by_numa_node $node)
+                        cpu_value=($(cut_cpu_list $cpu_list))
+                        cpu_node_start_loc="${cpu_value[0]}"
+                        cpu_seq=$cpu_seq,"$cpu_node_start_loc-$(($cpu_node_start_loc+$job-1))"
+                    done
+                    
+                    if [[ "$job" -eq 1 ]]; then
+                        CPU_ALLOWED=0
+                    elif [[ "$job" -ge "$cpus_counts" ]]; then
+                        CPU_ALLOWED=$CPU_ALLOWED_SEQ
+                    else
+                        CPU_ALLOWED=${cpu_seq:1}
+                    fi
+
+                    local benchmark_id="${mode}_${bs}_qd${qd}_${job}J"
+                    local OUTPUT_NAME_NEW="${OUTPUT_NAME}-${benchmark_id}-${STAS}"
+
+                    log_info "STATUS: WORKLOAD: $benchmark_id"
+                    update_progress
+                    
+                    collect_log $OUTPUT_NAME_NEW $fio_dir
+                    
+                    # Call run_task to encapsulate all the monitor/snapshot behavior per 30s workload
+                    run_task "bench_fio" $FIO_NAME $RUNTIME $job $CPU_ALLOWED $fio_dir $OUTPUT_NAME_NEW $qd
+
+                    if [[ $WCD == "true" ]]; then
+                        wait_for_low_cpu_temp
+                    fi
+                done
+            done
+        done
+    done
+
+    # Restore globals as proper arrays
+    FIO_MODES=("${G_MODES[@]}")
+    FIO_BLOCK_SIZES=("${G_BS[@]}")
+    FIO_IODEPTH=("${G_QD[@]}")
+    FIO_NUMJOBS=("${G_JOBS[@]}")
+
+    if [[ $DEV_NAME != "PD" ]]; then
+        del_devcie
+    fi
+}
+
 function run_test(){
+    if [[ "${USE_BENCH_FIO:-true}" == "true" ]]; then
+        run_benchfio_matrix
+        return
+    fi
+
     fio_dir=${out_dir}/${STAS}
     get_cpu_count
     # fio_cmd_dir=${vd_dir}/cmd

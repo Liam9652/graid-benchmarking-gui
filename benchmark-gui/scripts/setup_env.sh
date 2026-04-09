@@ -220,6 +220,25 @@ fi
 
 $PIP_CMD install $PIP_OPTS pandas || echo -e "${RED}Warning: Failed to install pandas via pip.${NC}"
 
+# Install bench-fio from the latest GitHub release of fio-plot
+# (avoids PyPI version lag; fetches the actual latest tagged release)
+if ! command -v bench-fio &> /dev/null; then
+    echo -e "${YELLOW}Installing bench-fio from GitHub latest release...${NC}"
+    BENCH_FIO_TAG=$(curl -fsSL https://api.github.com/repos/louwrentius/fio-plot/releases/latest \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo "")
+    if [[ -n "$BENCH_FIO_TAG" ]]; then
+        echo -e "${YELLOW}Found latest fio-plot release: $BENCH_FIO_TAG${NC}"
+        $PIP_CMD install $PIP_OPTS "git+https://github.com/louwrentius/fio-plot.git@${BENCH_FIO_TAG}" \
+            || echo -e "${RED}Warning: Failed to install bench-fio from GitHub.${NC}"
+    else
+        echo -e "${YELLOW}Could not determine latest release tag, falling back to default branch.${NC}"
+        $PIP_CMD install $PIP_OPTS "git+https://github.com/louwrentius/fio-plot.git" \
+            || echo -e "${RED}Warning: Failed to install bench-fio from GitHub.${NC}"
+    fi
+else
+    echo -e "${GREEN}bench-fio is already installed.${NC}"
+fi
+
 if [[ -f "src/requirements.txt" ]]; then
     $PIP_CMD install $PIP_OPTS -r src/requirements.txt || echo -e "${RED}Warning: Failed to install dependencies from src/requirements.txt${NC}"
 fi
@@ -232,7 +251,7 @@ fi
 
 # --- 5. Verify Installation ---
 echo -e "\n${GREEN}--- Verification Summary ---${NC}"
-for cmd in fio nvme jq docker python3 pip3 bc; do
+for cmd in fio bench-fio nvme jq docker python3 pip3 bc; do
     if command -v $cmd &> /dev/null; then
         echo -e "${GREEN}[OK] $cmd is installed: $($cmd --version 2>&1 | head -n 1)${NC}"
     else

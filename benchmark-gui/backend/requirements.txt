@@ -8,3 +8,7 @@ python-dotenv==1.0.0
 pandas
 paramiko==3.4.0
 scp
+# FastAPI backend
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9

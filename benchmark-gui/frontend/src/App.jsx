@@ -104,7 +104,7 @@ function App() {
   const [loadingResults, setLoadingResults] = useState(false);
   const [reportImages, setReportImages] = useState([]);
   const [activeResultTab, setActiveResultTab] = useState('dashboard'); // 'dashboard' or 'gallery'
-  const [systemInfo, setSystemInfo] = useState({ nvme_info: [], controller_info: [] });
+  const [systemInfo, setSystemInfo] = useState({ nvme_info: [], controller_info: [], gpu_perf: [] });
   const [language, setLanguage] = useState('ZH');
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [activeDevices, setActiveDevices] = useState(new Set());
@@ -113,6 +113,9 @@ function App() {
   const [showAdvancedLog, setShowAdvancedLog] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [galleryFilters, setGalleryFilters] = useState({ raid: 'All', status: 'All', type: 'All' });
+  const [fioStatus, setFioStatus] = useState("");
+  // { device: string, timestamp: string }[] — cleared when benchmark ends
+  const [stuckDevices, setStuckDevices] = useState([]);
   const [connectionStatus, setConnectionStatus] = useState(() => {
     const saved = localStorage.getItem('connectionStatus');
     return saved ? JSON.parse(saved) : { loading: false, success: null, message: '', dependencies: null };
@@ -481,12 +484,14 @@ function App() {
         setBenchmarkRunning(false);
         setCurrentStage(null);
         currentStageRef.current = null;
+        setStuckDevices([]);
       } else if (data.status === 'started') {
         setBenchmarkRunning(true);
         setCurrentStage({ stage: 'INIT', label: 'Initializing...' });
         currentStageRef.current = { stage: 'INIT', label: 'Initializing...' };
         setRealTimeData([]); // Clear old data
         setActiveDevices(new Set()); // Clear old devices
+        setFioStatus(""); // Clear old FIO ETA
         setProgress({ percentage: 0, elapsed: 0, remaining: 0, current_step: 0, total_steps: 0 });
         setRunStatus('BENCHMARKING');
       }
@@ -507,6 +512,17 @@ function App() {
       setRunStatus(data.status.toUpperCase());
     });
 
+    newSocket.on('device_stuck', (data) => {
+      setStuckDevices(prev => {
+        if (prev.some(d => d.device === data.device)) return prev;
+        return [...prev, { device: data.device, timestamp: data.timestamp }];
+      });
+    });
+
+    newSocket.on('device_unstuck', (data) => {
+      setStuckDevices(prev => prev.filter(d => d.device !== data.device));
+    });
+
     newSocket.on('giostat_data_v2', (data) => {
       if (updateRealTimeDataRef.current) {
         updateRealTimeDataRef.current(data);
@@ -525,6 +541,13 @@ function App() {
     });
 
     newSocket.on('bench_log', (data) => {
+      // Sniff FIO status-interval lines
+      if (data.line.includes('Jobs:') && data.line.toLowerCase().includes('eta')) {
+        setFioStatus(data.line);
+      } else if (data.line.includes('STATUS: WORKLOAD:')) {
+        setFioStatus(""); // Clear when workload switches
+      }
+
       setAdvancedLogs(prev => {
         const newLogs = [...prev, data.line];
         return newLogs.slice(-20); // Keep last 20 lines (tail -n 20)
@@ -780,10 +803,10 @@ function App() {
   const handleConfigChange = (key, value) => {
     setConfig(prev => {
       const newConfig = { ...prev, [key]: value };
-      // Auto-set NVME_INFO based on selected devices if it's the first time
-      if (key === 'NVME_LIST' && Array.isArray(value) && value.length > 0 && !prev.NVME_INFO) {
+      // Auto-update NVME_INFO based on first selected device whenever NVME_LIST changes
+      if (key === 'NVME_LIST' && Array.isArray(value) && value.length > 0) {
         const firstDev = systemInfo.nvme_info.find(d => d.DevPath.includes(value[0]));
-        if (firstDev) newConfig.NVME_INFO = firstDev.Model.replace(/\s+/g, '-');
+        if (firstDev) newConfig.NVME_INFO = firstDev.Model.replace(/\s+/g, '_');
       }
       configRefObj.current = newConfig; // Update ref
 
@@ -828,8 +851,8 @@ function App() {
           const firstDevName = next[0];
           const device = systemInfo.nvme_info.find(d => d.DevPath.endsWith(firstDevName));
           if (device) {
-            // Replace spaces with hyphens to avoid script issues
-            newConfig.NVME_INFO = device.Model.replace(/\s+/g, '-');
+            // Replace spaces with underscores to match folder naming convention
+            newConfig.NVME_INFO = device.Model.replace(/\s+/g, '_');
           }
         }
       }
@@ -1082,6 +1105,25 @@ function App() {
         </div>
       )}
 
+      {stuckDevices.length > 0 && (
+        <div className="stuck-device-banner">
+          <span className="stuck-device-icon">&#9888;</span>
+          <div className="stuck-device-content">
+            <strong>裝置 Sanitize/Format 超時警告</strong>
+            <ul className="stuck-device-list">
+              {stuckDevices.map(({ device, timestamp }) => (
+                <li key={device}>
+                  <code>{device}</code> — 超過 30 秒無進度更新
+                  <span className="stuck-device-time"> ({new Date(timestamp).toLocaleTimeString()})</span>
+                </li>
+              ))}
+            </ul>
+            <span className="stuck-device-hint">裝置可能卡住，請檢查設備狀態或等待操作完成。</span>
+          </div>
+          <button className="stuck-device-dismiss" onClick={() => setStuckDevices([])}>&#x2715;</button>
+        </div>
+      )}
+
       {/* ✅ 添加验证错误显示 */}
       {validationErrors.length > 0 && (
         <div className="validation-errors">
@@ -1312,10 +1354,14 @@ function App() {
                             NUMA
                             <SortButton columnKey="Numa" currentConfig={nvmeSortConfig} />
                           </th>
+                          <th title="PCIe current vs max link speed/width">PCIe Link</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {sortedNvmeInfo.map((dev, idx) => (
+                        {sortedNvmeInfo.map((dev, idx) => {
+                          const hasPcie = dev.pcie_current_speed !== undefined;
+                          const atMax = dev.pcie_at_max;
+                          return (
                           <tr key={idx} onClick={() => toggleSelection('NVME_LIST', dev.DevPath.split('/').pop())} className={(config.NVME_LIST || []).includes(dev.DevPath.split('/').pop()) ? 'selected' : ''}>
                             <td>
                               <input
@@ -1328,8 +1374,21 @@ function App() {
                             <td>{dev.Model}</td>
                             <td>{(dev.Capacity / (1024 ** 3)).toFixed(2)} GiB</td>
                             <td>{dev.Numa}</td>
+                            <td className="pcie-cell" onClick={e => e.stopPropagation()}>
+                              {hasPcie ? (
+                                <span
+                                  className={`pcie-indicator ${atMax ? 'pcie-ok' : 'pcie-warn'}`}
+                                  title={`Current: ${dev.pcie_current_speed} x${dev.pcie_current_width}\nMax: ${dev.pcie_max_speed} x${dev.pcie_max_width}`}
+                                >
+                                  <span className="pcie-dot" />
+                                  {dev.pcie_current_speed} x{dev.pcie_current_width}
+                                  {!atMax && <span className="pcie-warn-text"> ≠ max (x{dev.pcie_max_width})</span>}
+                                </span>
+                              ) : <span className="pcie-na">N/A</span>}
+                            </td>
                           </tr>
-                        ))}
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -1350,6 +1409,20 @@ function App() {
                       <p>Detecting controller...</p>
                     )}
                   </div>
+                  {/* GPU performance warnings */}
+                  {(systemInfo.gpu_perf || []).filter(g => !g.idle).map((g, i) => (
+                    <div key={i} className="gpu-perf-warning">
+                      <span className="gpu-perf-icon">&#9888;</span>
+                      <div>
+                        <strong>GPU Active: </strong>{g.id}
+                        <span className="gpu-perf-state"> (P-State: {g.performance_state})</span>
+                        {g.active_reasons.length > 0 && (
+                          <span className="gpu-perf-reasons"> — {g.active_reasons.join(', ')}</span>
+                        )}
+                        <div className="gpu-perf-hint">Controller GPU is not idle — this may affect benchmark accuracy.</div>
+                      </div>
+                    </div>
+                  ))}
                 </div>
 
                 {/* 4. RAID Type Selection */}
@@ -1408,26 +1481,29 @@ function App() {
                         </div>
                       </div>
 
-                      <div className="grid-2-cols">
-                        <div className="form-group">
-                          <label>QD List:</label>
-                          <input
-                            type="text"
-                            value={getArrayDisplayValue(config.QD_LS)}
-                            onChange={(e) => handleArrayChange('QD_LS', e.target.value)}
-                            onBlur={(e) => handleArrayBlur('QD_LS', e.target.value)}
-                          />
+                      {/* Legacy fio: QD List + PD Jobs — hidden when bench-fio is active */}
+                      {config.USE_BENCH_FIO === false && (
+                        <div className="grid-2-cols">
+                          <div className="form-group">
+                            <label>QD List:</label>
+                            <input
+                              type="text"
+                              value={getArrayDisplayValue(config.QD_LS)}
+                              onChange={(e) => handleArrayChange('QD_LS', e.target.value)}
+                              onBlur={(e) => handleArrayBlur('QD_LS', e.target.value)}
+                            />
+                          </div>
+                          <div className="form-group">
+                            <label>PD Jobs:</label>
+                            <input
+                              type="text"
+                              value={getArrayDisplayValue(config.pd_jobs)}
+                              onChange={(e) => handleArrayChange('pd_jobs', e.target.value)}
+                              onBlur={(e) => handleArrayBlur('pd_jobs', e.target.value)}
+                            />
+                          </div>
                         </div>
-                        <div className="form-group">
-                          <label>PD Jobs:</label>
-                          <input
-                            type="text"
-                            value={getArrayDisplayValue(config.pd_jobs)}
-                            onChange={(e) => handleArrayChange('pd_jobs', e.target.value)}
-                            onBlur={(e) => handleArrayBlur('pd_jobs', e.target.value)}
-                          />
-                        </div>
-                      </div>
+                      )}
 
                       <div className="grid-2-cols">
                         <div className="form-group">
@@ -1457,7 +1533,8 @@ function App() {
                           { key: 'RUN_PD', label: 'Run PD Test' },
                           { key: 'RUN_VD', label: 'Run VD Test' },
                           { key: 'RUN_MD', label: 'Run MD Test' },
-                          { key: 'RUN_PD_ALL', label: 'Test All PDs' }
+                          { key: 'RUN_PD_ALL', label: 'Test All PDs' },
+                          { key: 'USE_BENCH_FIO', label: '⚡ Use bench-fio' },
                         ].map(sw => (
                           <label key={sw.key} className="switch-label">
                             <input
@@ -1469,6 +1546,128 @@ function App() {
                           </label>
                         ))}
                       </div>
+
+                      {/* 7. bench-fio Test Parameters — only shown when bench-fio is active */}
+                      {config.USE_BENCH_FIO !== false && (
+                      <div style={{ marginTop: '20px', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '16px' }}>
+                        <h4 style={{ marginBottom: '12px', color: '#7cb9e8', fontSize: '14px', letterSpacing: '0.5px' }}>
+                          🗂️ FIO Test Parameters (bench-fio)
+                        </h4>
+                        <p style={{ fontSize: '12px', color: '#888', marginBottom: '14px' }}>
+                          Configure parameters passed to <code>bench-fio</code>. These values are stored in the config and used when bench-fio is invoked.
+                        </p>
+
+                        {/* IO Mode */}
+                        <div className="form-group">
+                          <label>IO Mode (<code>--mode</code>):</label>
+                          <div className="button-group-select">
+                            {['randread', 'randwrite', 'read', 'write', 'randrw'].map(mode => (
+                              <button
+                                key={mode}
+                                className={`selection-btn ${(config.FIO_MODES || []).includes(mode) ? 'active' : ''}`}
+                                onClick={() => toggleSelection('FIO_MODES', mode)}
+                              >
+                                {mode}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+
+                        <div className="grid-2-cols" style={{ marginTop: '10px' }}>
+                          {/* Block Size */}
+                          <div className="form-group">
+                            <label>Block Size(s) (<code>--block-size</code>):</label>
+                            <input
+                              type="text"
+                              value={getArrayDisplayValue(config.FIO_BLOCK_SIZES)}
+                              onChange={(e) => handleArrayChange('FIO_BLOCK_SIZES', e.target.value)}
+                              onBlur={(e) => handleArrayBlur('FIO_BLOCK_SIZES', e.target.value)}
+                              placeholder="4k 128k 1m"
+                            />
+                          </div>
+                          {/* IO Depth */}
+                          <div className="form-group">
+                            <label>IO Depth List (<code>--iodepth</code>):</label>
+                            <input
+                              type="text"
+                              value={getArrayDisplayValue(config.FIO_IODEPTH)}
+                              onChange={(e) => handleArrayChange('FIO_IODEPTH', e.target.value)}
+                              onBlur={(e) => handleArrayBlur('FIO_IODEPTH', e.target.value)}
+                              placeholder="1 8 32 64"
+                            />
+                          </div>
+                          {/* Num Jobs */}
+                          <div className="form-group">
+                            <label>Num Jobs List (<code>--numjobs</code>):</label>
+                            <input
+                              type="text"
+                              value={getArrayDisplayValue(config.FIO_NUMJOBS)}
+                              onChange={(e) => handleArrayChange('FIO_NUMJOBS', e.target.value)}
+                              onBlur={(e) => handleArrayBlur('FIO_NUMJOBS', e.target.value)}
+                              placeholder="1 8 16"
+                            />
+                          </div>
+                          {/* IO Engine */}
+                          <div className="form-group">
+                            <label>IO Engine (<code>--engine</code>):</label>
+                            <input
+                              type="text"
+                              value={config.FIO_ENGINE || 'libaio'}
+                              onChange={(e) => handleConfigChange('FIO_ENGINE', e.target.value)}
+                              placeholder="libaio"
+                            />
+                          </div>
+                          {/* RW Mix */}
+                          <div className="form-group">
+                            <label>RW Mix Read % (<code>--rwmixread</code>, randrw only):</label>
+                            <input
+                              type="text"
+                              value={getArrayDisplayValue(config.FIO_RWMIX)}
+                              onChange={(e) => handleArrayChange('FIO_RWMIX', e.target.value)}
+                              onBlur={(e) => handleArrayBlur('FIO_RWMIX', e.target.value)}
+                              placeholder="75"
+                            />
+                          </div>
+                          {/* Direct I/O */}
+                          <div className="form-group">
+                            <label>Direct I/O (<code>--direct</code>, 1=yes 0=no):</label>
+                            <input
+                              type="number"
+                              min="0"
+                              max="1"
+                              value={config.FIO_DIRECT ?? 1}
+                              onChange={(e) => handleConfigChange('FIO_DIRECT', parseInt(e.target.value))}
+                            />
+                          </div>
+                        </div>
+
+
+                        
+                        <div className="grid-2-cols" style={{ marginTop: '10px' }}>
+                          {/* Extra Options */}
+                          <div className="form-group">
+                            <label>Extra FIO Options (<code>--extra-opts</code>):</label>
+                            <input
+                              type="text"
+                              value={config.FIO_EXTRA_OPTS || ''}
+                              onChange={(e) => handleConfigChange('FIO_EXTRA_OPTS', e.target.value)}
+                              placeholder="e.g. norandommap=1 refill_buffers=1"
+                            />
+                          </div>
+                          {/* Workload Gap Sleep */}
+                          <div className="form-group">
+                            <label>Workload Gap Sleep (sec):</label>
+                            <input
+                              type="number"
+                              min="0"
+                              value={config.FIO_GAP_SLEEP ?? 10}
+                              onChange={(e) => handleConfigChange('FIO_GAP_SLEEP', parseInt(e.target.value) || 0)}
+                              placeholder="10"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -1553,6 +1752,26 @@ function App() {
                   </div>
                 )}
               </div>
+
+              {fioStatus && benchmarkRunning && (
+                <div className="fio-status-box" style={{ 
+                    marginBottom: '20px', 
+                    padding: '12px 15px', 
+                    backgroundColor: '#1e1e2f', 
+                    borderRadius: '8px', 
+                    borderLeft: '4px solid #00d2ff',
+                    color: '#00d2ff', 
+                    fontFamily: 'monospace', 
+                    fontSize: '14px',
+                    boxShadow: '0 4px 6px rgba(0,0,0,0.3)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '10px'
+                  }}>
+                  <strong style={{ whiteSpace: 'nowrap' }}><i className="fas fa-satellite-dish"></i> FIO ETA:</strong>
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{fioStatus}</span>
+                </div>
+              )}
 
               {benchmarkRunning && (
                 <div className="progress-section">
