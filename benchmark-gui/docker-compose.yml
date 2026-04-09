@@ -27,6 +27,32 @@ services:
     pid: "host"
     restart: unless-stopped
 
+  fastapi:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: uvicorn fastapi_app:combined_app --host 0.0.0.0 --port 50073 --reload
+    ports:
+      - "50073:50073"
+    volumes:
+      - ./scripts:/app/scripts
+      - ./results:/app/results
+      - ./logs:/app/logs
+      - ./backend/app.py:/app/app.py
+      - ./backend/fastapi_app.py:/app/fastapi_app.py
+      - ./graid-bench.conf:/app/graid-bench.conf
+      - /dev:/dev
+    environment:
+      - PYTHONUNBUFFERED=1
+      - BENCHMARK_API_KEY=${BENCHMARK_API_KEY:-}
+    networks:
+      - graid-network
+    privileged: true
+    pid: "host"
+    restart: unless-stopped
+    depends_on:
+      - backend
+
   frontend:
     # Change to image: your-account/graid-bench-frontend:v1.0 after push
     build:
