@@ -11,6 +11,7 @@ import shutil
 import base64
 import threading
 import time
+import logging
 from datetime import datetime
 from pathlib import Path
 import psutil
@@ -21,6 +22,16 @@ import csv
 import selectors
 import paramiko
 from scp import SCPClient
+
+# ---------------------------------------------------------------------------
+# Logging setup — replaces scattered print(f"DEBUG: ...") calls
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+)
+logger = logging.getLogger('benchmark-gui')
 
 WORKLOAD_MAP = {
     '00-randread': '4k Random Read',
@@ -59,6 +70,27 @@ giostat_process = None
 giostat_thread = None
 stop_giostat_event = threading.Event()
 
+# ---------------------------------------------------------------------------
+# Optional API key authentication
+# Set the BENCHMARK_API_KEY environment variable to enable.
+# State-changing endpoints will require the header:  X-API-Key: <key>
+# If the variable is not set, auth is disabled and a startup warning is logged.
+# ---------------------------------------------------------------------------
+_API_KEY: str | None = os.environ.get('BENCHMARK_API_KEY')
+
+def _require_api_key(f):
+    """Decorator that enforces X-API-Key header when BENCHMARK_API_KEY is configured."""
+    import functools
+    from flask import request as _req
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        if _API_KEY:
+            provided = _req.headers.get('X-API-Key', '')
+            if provided != _API_KEY:
+                return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
 REMOTE_BASE_DIR = Path("/tmp/benchmark-gui")
 ACTIVE_STATE_FILE = LOGS_DIR / "active_benchmark.json"
 
@@ -66,20 +98,11 @@ class BenchmarkState:
     @staticmethod
     def save(state):
         try:
-            # Defensive mkdir
             LOGS_DIR.mkdir(exist_ok=True)
-            print(f"DEBUG: Saving state to {ACTIVE_STATE_FILE}", flush=True)
-            print(f"DEBUG: LOGS_DIR exists: {LOGS_DIR.exists()}, is_dir: {LOGS_DIR.is_dir()}", flush=True)
             with open(ACTIVE_STATE_FILE, 'w') as f:
                 json.dump(state, f)
         except Exception as e:
-            print(f"DEBUG: Error saving benchmark state: {e}", flush=True)
-            # Try to see what's in /app/
-            try:
-                print(f"DEBUG: /app contents: {os.listdir('/app')}", flush=True)
-                if os.path.exists('/app/logs'):
-                    print(f"DEBUG: /app/logs contents: {os.listdir('/app/logs')}", flush=True)
-            except: pass
+            logger.error("Error saving benchmark state: %s", e)
 
     @staticmethod
     def load():
@@ -88,7 +111,7 @@ class BenchmarkState:
                 with open(ACTIVE_STATE_FILE, 'r') as f:
                     return json.load(f)
         except Exception as e:
-            print(f"Error loading benchmark state: {e}")
+            logger.error("Error loading benchmark state: %s", e)
         return None
 
     @staticmethod
@@ -97,7 +120,7 @@ class BenchmarkState:
             if ACTIVE_STATE_FILE.exists():
                 ACTIVE_STATE_FILE.unlink()
         except Exception as e:
-            print(f"Error clearing benchmark state: {e}")
+            logger.error("Error clearing benchmark state: %s", e)
 
 # ANSI Escape sequence regex for stripping terminal colors
 ANSI_ESCAPE = re.compile(r'(?:\x1B[@-_][0-?]*[ -/]*[@-~])')
@@ -129,8 +152,10 @@ class RemoteExecutor:
                 except Exception:
                     pass
                 # Connection dead, clean up
-                try: self.ssh.close()
-                except: pass
+                try:
+                    self.ssh.close()
+                except Exception:
+                    pass
                 self.ssh = None
             
             hostname = self.config.get('DUT_IP')
@@ -141,34 +166,31 @@ class RemoteExecutor:
             password = self.config.get('DUT_PASSWORD')
             port = int(self.config.get('DUT_PORT', 22))
             
-            print(f"DEBUG: Connecting to remote DUT {hostname} as {username}...", flush=True)
+            logger.info("Connecting to remote DUT %s as %s...", hostname, username)
             try:
                 self.ssh = paramiko.SSHClient()
                 self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                 self.ssh.connect(hostname, port=port, username=username, password=password, timeout=10)
-                
+
                 # Check permissions
                 self.is_root = False
                 self.has_sudo = False
                 self.need_sudo_password = False
-                
+
                 _, stdout, _ = self.ssh.exec_command('id -u')
                 uid = stdout.read().decode().strip()
                 if uid == '0':
                     self.is_root = True
                 else:
                     # 1. Try passwordless sudo first
-                    print(f"DEBUG: Checking passwordless sudo for {username}...", flush=True)
                     stdin, stdout, stderr = self.ssh.exec_command('sudo -n id -u')
                     if stdout.channel.recv_exit_status() == 0:
                         sudo_uid = stdout.read().decode().strip()
                         if sudo_uid == '0':
                             self.has_sudo = True
-                    
+
                     # 2. If passwordless fails, try sudo with password if we have one
                     if not self.has_sudo and password:
-                        print(f"DEBUG: Passwordless sudo failed, trying with password for {username}...", flush=True)
-                        # Using sudo -S to read password from stdin
                         stdin, stdout, stderr = self.ssh.exec_command('sudo -S id -u')
                         stdin.write(password + '\n')
                         stdin.flush()
@@ -177,20 +199,22 @@ class RemoteExecutor:
                             if sudo_uid == '0':
                                 self.has_sudo = True
                                 self.need_sudo_password = True
-                                print(f"DEBUG: Sudo with password verified for {username}", flush=True)
-                    
+                                logger.info("Sudo with password verified for %s", username)
+
                     if not self.has_sudo:
                         self.ssh.close()
                         self.ssh = None
                         raise PermissionError(f"User '{username}' does not have root privileges or sudo access on {hostname}. Hardware control requires root access.")
-                
+
                 return self.ssh
             except Exception as e:
                 if self.ssh:
-                    try: self.ssh.close()
-                    except: pass
+                    try:
+                        self.ssh.close()
+                    except Exception:
+                        pass
                 self.ssh = None
-                print(f"DEBUG: SSH Connection or Permission check failed: {e}", flush=True)
+                logger.error("SSH connection or permission check failed: %s", e)
                 raise ConnectionError(f"Failed to connect or verify permissions on remote DUT {hostname}: {str(e)}")
 
     def _to_remote_path(self, path):
@@ -310,9 +334,9 @@ class RemoteExecutor:
         try:
             line = stdout.readline()
             remote_pid = line.strip()
-            print(f"DEBUG: Remote process started with PID: {remote_pid}", flush=True)
+            logger.info("Remote process started with PID: %s", remote_pid)
         except Exception as e:
-            print(f"DEBUG: Failed to read remote PID: {e}", flush=True)
+            logger.warning("Failed to read remote PID: %s", e)
             remote_pid = None
 
         class RemoteProcess:
@@ -339,14 +363,14 @@ class RemoteExecutor:
 
             def terminate(self):
                 if self.pid:
-                    print(f"DEBUG: Terminating remote process group {self.pid}...", flush=True)
+                    logger.info("Terminating remote process group %s", self.pid)
                     # We kill the process group (using negative PID) to ensure all children are killed
                     self.executor.run(['kill', '-TERM', f'-{self.pid}'])
                 self.stdout.channel.close()
 
             def kill(self):
                 if self.pid:
-                    print(f"DEBUG: Killing remote process group {self.pid}...", flush=True)
+                    logger.info("Killing remote process group %s", self.pid)
                     self.executor.run(['kill', '-9', f'-{self.pid}'])
                 self.stdout.channel.close()
 
@@ -390,12 +414,12 @@ class RemoteExecutor:
             return
         ssh = self._get_ssh_client()
         remote_path_mapped = self._to_remote_path(remote_path)
-        print(f"DEBUG: sync_from_remote: {remote_path} -> {remote_path_mapped} (local: {local_path})", flush=True)
-        
+        logger.debug("sync_from_remote: %s -> %s (local: %s)", remote_path, remote_path_mapped, local_path)
+
         # Check if remote path exists before getting
         res = self.run(['ls', '-d', remote_path_mapped], capture_output=True)
         if res.returncode != 0:
-            print(f"DEBUG: Remote path {remote_path_mapped} does not exist, skipping sync_from_remote", flush=True)
+            logger.warning("Remote path %s does not exist, skipping sync_from_remote", remote_path_mapped)
             return
 
         # Ensure local directory exists
@@ -403,12 +427,12 @@ class RemoteExecutor:
 
         transport = ssh.get_transport()
         if not transport:
-             raise ConnectionError("SSH transport is not available for SCP")
+            raise ConnectionError("SSH transport is not available for SCP")
         try:
             with SCPClient(transport) as scp:
                 scp.get(remote_path_mapped, local_path, recursive=True)
         except Exception as e:
-            print(f"DEBUG: SCP get failed: {e}", flush=True)
+            logger.error("SCP get failed: %s", e)
 
     def __del__(self):
         if self.ssh:
@@ -463,7 +487,7 @@ class BenchmarkManager:
             # Looking for 'graid-bench.sh' or 'bench.sh' on remote
             res = executor.run(['pgrep', '-f', 'graid-bench.sh'], capture_output=True, text=True)
             if res.returncode == 0:
-                print(f"DEBUG: Recovering active benchmark on session {session_id}", flush=True)
+                logger.info("Recovering active benchmark on session %s", session_id)
                 benchmark_running = True
                 
                 # Start a thread to wait for completion and sync
@@ -486,10 +510,10 @@ class BenchmarkManager:
                 
                 return True
             else:
-                print("DEBUG: Active state found but no remote benchmark process detected. Clearing state.")
+                logger.info("Active state found but no remote benchmark process detected — clearing state.")
                 BenchmarkState.clear()
         except Exception as e:
-            print(f"Error during state recovery: {e}")
+            logger.error("Error during state recovery: %s", e)
         return False
 
     def _wait_for_completion(self, executor, session_id, config):
@@ -508,7 +532,7 @@ class BenchmarkManager:
                     executor.sync_from_remote(str(RESULTS_DIR.parent), str(RESULTS_DIR))
                     executor.sync_from_remote(str(LOGS_DIR.parent), str(LOGS_DIR))
                 except Exception as e:
-                    print(f"Error syncing back after recovery: {e}")
+                    logger.error("Error syncing back after recovery: %s", e)
                     
             socketio.emit('status', {
                 'status': 'completed',
@@ -554,9 +578,8 @@ class BenchmarkManager:
                 executor.run(['rm', '-rf', remote_script_dir])
                 executor.sync_to_remote(str(SCRIPT_DIR), str(SCRIPT_DIR.parent))
                 
-                # Debug: Verify remote file content
                 checksum = executor.run(['md5sum', str(SCRIPT_DIR / 'graid-bench.sh')], capture_output=True, text=True)
-                print(f"DEBUG: Remote script checksum: {checksum.stdout.strip()}", flush=True)
+                logger.debug("Remote script checksum: %s", checksum.stdout.strip())
 
             # Convert JSON config to Bash format
             target_config = SCRIPT_DIR / "graid-bench.conf"
@@ -634,9 +657,9 @@ class BenchmarkManager:
                     if match:
                         days, hours, minutes = map(int, match.groups())
                         total_est_seconds = days * 86400 + hours * 3600 + minutes * 60
-                        print(f"DEBUG: Total estimated seconds: {total_est_seconds}", flush=True)
+                        logger.info("Total estimated seconds: %d", total_est_seconds)
             except Exception as e:
-                print(f"Error getting estimated time: {e}", flush=True)
+                logger.warning("Error getting estimated time: %s", e)
 
             # Open log file for writing
             with open(log_file, 'w') as log:
@@ -668,33 +691,31 @@ class BenchmarkManager:
                             if not any(x in msg for x in ["DEBUG:", "Emitting giostat", "snapshot_request"]):
                                  socketio.emit('bench_log', {'line': msg}, room=session_id)
 
-                            # Debug: print to docker logs
-                            print(f"BENCH_LOG: {msg}", flush=True)
+                            logger.debug("BENCH_LOG: %s", msg)
 
                             # Detect STATUS markers
                             if "STATUS: STATE:" in msg:
                                  try:
                                      state = msg.split("STATUS: STATE:")[1].strip()
-                                     print(f"DETECTED STATE: {state}", flush=True)
+                                     logger.info("DETECTED STATE: %s", state)
                                      socketio.emit('run_status_update', {
                                         'status': state,
                                         'timestamp': datetime.now().isoformat()
                                      }, room=session_id)
                                  except Exception as e:
-                                     print(f"Error parsing state: {e}", flush=True)
+                                     logger.warning("Error parsing state: %s", e)
 
                             elif "STATUS: ERROR:" in msg:
                                  try:
                                      error_msg = msg.split("STATUS: ERROR:")[1].strip()
-                                     print(f"DETECTED ERROR: {error_msg}", flush=True)
+                                     logger.warning("DETECTED ERROR: %s", error_msg)
                                      self.last_error = error_msg
-                                     # Optional: Emit error immediately if needed, but we usually wait for exit
                                  except Exception as e:
-                                     print(f"Error parsing error message: {e}", flush=True)
+                                     logger.warning("Error parsing error message: %s", e)
 
 
                             elif "STATUS: STAGE_PD_START" in msg:
-                                 print("DETECTED STAGE PD START", flush=True)
+                                 logger.info("DETECTED STAGE PD START")
                                  current_base_label = 'Baseline Performance Test\n'
                                  self.current_stage_info = {'stage': 'PD', 'label': current_base_label}
                                  socketio.emit('status_update', {
@@ -713,7 +734,7 @@ class BenchmarkManager:
                                  })
 
                             elif "STATUS: STAGE_VD_START" in msg:
-                                 print("DETECTED STAGE VD START", flush=True)
+                                 logger.info("DETECTED STAGE VD START")
                                  current_base_label = 'RAID Performance Test\n'
                                  self.current_stage_info = {'stage': 'VD', 'label': current_base_label}
                                  socketio.emit('status_update', {
@@ -732,7 +753,7 @@ class BenchmarkManager:
                                  })
 
                             elif "STATUS: STAGE_MD_START" in msg:
-                                 print("DETECTED STAGE MD START", flush=True)
+                                 logger.info("DETECTED STAGE MD START")
                                  current_base_label = 'MDADM Performance Test\n'
                                  self.current_stage_info = {'stage': 'MD', 'label': current_base_label}
                                  socketio.emit('status_update', {
@@ -760,7 +781,7 @@ class BenchmarkManager:
                                             break
                                     
                                     new_label = f"{current_base_label} - {friendly_name}"
-                                    print(f"DETECTED WORKLOAD: {filename} -> {new_label}", flush=True)
+                                    logger.info("DETECTED WORKLOAD: %s -> %s", filename, new_label)
                                     stage_code = 'PD' if 'Baseline' in current_base_label else 'MD' if 'MDADM' in current_base_label else 'VD'
                                     
                                     self.current_stage_info = {'stage': stage_code, 'label': new_label}
@@ -779,14 +800,15 @@ class BenchmarkManager:
                                         'stage_info': self.current_stage_info
                                     })
                                 except Exception as e:
-                                    print(f"Error parsing workload: {e}", flush=True)
+                                    logger.warning("Error parsing workload: %s", e)
 
                             elif "STATUS: TOTAL_STEPS:" in msg:
                                 try:
                                     self.total_steps = int(msg.split("STATUS: TOTAL_STEPS:")[1].strip())
                                     self.current_step = 0
-                                    print(f"DEBUG: Global Total Steps set to {self.total_steps}", flush=True)
-                                except: pass
+                                    logger.debug("Total steps set to %d", self.total_steps)
+                                except Exception:
+                                    pass
 
                             elif "STATUS: SNAPSHOT:" in msg:
                                  try:
@@ -797,13 +819,56 @@ class BenchmarkManager:
                                      tn = test_match.group(1) if test_match else "unknown"
                                      od = dir_match.group(1) if dir_match else ""
                                      
-                                     print(f"TRIGGER SNAPSHOT -> test={tn}, dir={od}", flush=True)
+                                     logger.info("TRIGGER SNAPSHOT -> test=%s, dir=%s", tn, od)
                                      socketio.emit('snapshot_request', {
                                          'test_name': tn,
                                          'output_dir': od
                                      }, room=session_id)
                                  except Exception as e:
-                                     print(f"Error parsing snapshot marker: {e}", flush=True)
+                                     logger.warning("Error parsing snapshot marker: %s", e)
+
+                            elif "STATUS: DEVICE_START:" in msg:
+                                try:
+                                    dev = msg.split("STATUS: DEVICE_START:")[1].strip()
+                                    socketio.emit('device_discard_update', {
+                                        'device': dev,
+                                        'state': 'started',
+                                        'timestamp': datetime.now().isoformat()
+                                    }, room=session_id)
+                                except Exception as e:
+                                    logger.warning("Error parsing DEVICE_START: %s", e)
+
+                            elif "STATUS: DEVICE_DONE:" in msg:
+                                try:
+                                    dev = msg.split("STATUS: DEVICE_DONE:")[1].strip()
+                                    socketio.emit('device_discard_update', {
+                                        'device': dev,
+                                        'state': 'done',
+                                        'timestamp': datetime.now().isoformat()
+                                    }, room=session_id)
+                                except Exception as e:
+                                    logger.warning("Error parsing DEVICE_DONE: %s", e)
+
+                            elif "STATUS: DEVICE_STUCK:" in msg:
+                                try:
+                                    dev = msg.split("STATUS: DEVICE_STUCK:")[1].strip()
+                                    logger.warning("DEVICE_STUCK detected: %s", dev)
+                                    socketio.emit('device_stuck', {
+                                        'device': dev,
+                                        'timestamp': datetime.now().isoformat()
+                                    }, room=session_id)
+                                except Exception as e:
+                                    logger.warning("Error parsing DEVICE_STUCK: %s", e)
+
+                            elif "STATUS: DEVICE_UNSTUCK:" in msg:
+                                try:
+                                    dev = msg.split("STATUS: DEVICE_UNSTUCK:")[1].strip()
+                                    socketio.emit('device_unstuck', {
+                                        'device': dev,
+                                        'timestamp': datetime.now().isoformat()
+                                    }, room=session_id)
+                                except Exception as e:
+                                    logger.warning("Error parsing DEVICE_UNSTUCK: %s", e)
 
                             elif "STATUS: TICK" in msg:
                                 try:
@@ -812,13 +877,29 @@ class BenchmarkManager:
                                         percentage = (self.current_step / self.total_steps) * 100
                                         elapsed = int(time.time() - start_time)
                                     
-                                    # Refined remaining time
+                                    # Refined remaining time logic
                                     remaining = 0
-                                    if percentage > 0:
+                                    if total_est_seconds > 0:
+                                        # Use initial estimate minus elapsed as baseline
+                                        est_remaining = total_est_seconds - elapsed
+                                        if est_remaining < 0: est_remaining = 0
+                                        
+                                        if percentage > 10:
+                                            # After 10% progress, blend with extrapolation for real-time correction
+                                            # This avoids massive drops due to fast init/preconditioning steps
+                                            extrapolated_total = elapsed / (percentage / 100)
+                                            extrapolated_remaining = int(extrapolated_total - elapsed)
+                                            
+                                            # Transition factor (0.0 at 10% progress, 1.0 at 100% progress)
+                                            alpha = (percentage - 10) / 90
+                                            remaining = int(est_remaining * (1 - alpha) + extrapolated_remaining * alpha)
+                                        else:
+                                            # Early stage (<10%): prioritize initial estimate
+                                            remaining = est_remaining
+                                    elif percentage > 0:
+                                        # Fallback to pure extrapolation if no initial estimate was parsed
                                         total_projected = elapsed / (percentage / 100)
                                         remaining = int(total_projected - elapsed)
-                                    elif total_est_seconds > 0:
-                                        remaining = total_est_seconds - elapsed
                                     
                                     if remaining < 0: remaining = 0
                                     
@@ -838,10 +919,10 @@ class BenchmarkManager:
                                             saved = BenchmarkState.load() or {}
                                             saved['progress'] = self.latest_progress
                                             BenchmarkState.save(saved)
-                                        except:
+                                        except Exception:
                                             pass
                                 except Exception as e:
-                                    print(f"Error handling progress tick: {e}", flush=True)
+                                    logger.warning("Error handling progress tick: %s", e)
                     else:
                         # No data or EOF
                         if self.process.poll() is not None:
@@ -850,7 +931,7 @@ class BenchmarkManager:
                 
                 # Wait for completion
                 self.process.wait()
-                print(f"BENCH_PROCESS_EXIT: rc={self.process.returncode}", flush=True)
+                logger.info("BENCH_PROCESS_EXIT: rc=%d", self.process.returncode)
 
 
             if self.process.returncode == 0:
@@ -878,7 +959,7 @@ class BenchmarkManager:
                     executor.sync_from_remote(str(RESULTS_DIR.parent), str(RESULTS_DIR))
                     executor.sync_from_remote(str(LOGS_DIR.parent), str(LOGS_DIR))
                 except Exception as e:
-                    print(f"Error syncing back results: {e}", flush=True)
+                    logger.error("Error syncing back results: %s", e)
 
             benchmark_running = False
             stop_giostat_monitoring()
@@ -980,8 +1061,10 @@ def monitor_giostat(session_id, executor=None):
                     def get_val(keys, default=0.0):
                         for k in keys:
                             if k in header_map:
-                                try: return float(parts[header_map[k]])
-                                except: pass
+                                try:
+                                    return float(parts[header_map[k]])
+                                except (ValueError, IndexError):
+                                    pass
                         return default
 
                     data = {
@@ -1002,14 +1085,14 @@ def monitor_giostat(session_id, executor=None):
                     # Also keep v1 for simple terminal display if needed
                     socketio.emit('giostat_data', {'line': line}, room=session_id)
                 except Exception as e:
-                    print(f"Error parsing giostat line: {e}")
+                    logger.debug("Error parsing giostat line: %s", e)
                     socketio.emit('giostat_data', {'line': line}, room=session_id)
             else:
                 # Fallback for raw lines
                 socketio.emit('giostat_data', {'line': line}, room=session_id)
                 
     except Exception as e:
-        print(f"Error in giostat monitoring: {e}")
+        logger.error("Error in giostat monitoring: %s", e)
     finally:
         try:
             debug_log.write(f"--- giostat monitoring ended at {datetime.now().isoformat()} ---\n")
@@ -1039,6 +1122,7 @@ def get_config():
 
 
 @app.route('/api/config', methods=['POST'])
+@_require_api_key
 def update_config():
     try:
         data = request.json
@@ -1046,6 +1130,86 @@ def update_config():
         return jsonify({'success': True, 'message': 'Config updated'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+_PCIE_INFO_CMD = r"""
+for d in /sys/block/nvme*n1; do
+  [ -e "$d" ] || continue
+  b=$(basename "$d")
+  p=$(readlink -f "$d")
+  while [ "$p" != "/" ] && [ -n "$p" ]; do
+    if [ -f "$p/current_link_speed" ]; then
+      printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$b" \
+        "$(cat "$p/current_link_speed" 2>/dev/null)" \
+        "$(cat "$p/current_link_width" 2>/dev/null)" \
+        "$(cat "$p/max_link_speed" 2>/dev/null)" \
+        "$(cat "$p/max_link_width" 2>/dev/null)"
+      break
+    fi
+    p=$(dirname "$p")
+  done
+done
+""".strip()
+
+
+def _collect_nvme_pcie_info(executor):
+    """Return dict keyed by block device name (e.g. 'nvme0n1') with PCIe link fields."""
+    pcie = {}
+    try:
+        res = executor.run(['bash', '-c', _PCIE_INFO_CMD], capture_output=True, text=True)
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                parts = line.split('\t')
+                if len(parts) == 5:
+                    dev, cur_spd, cur_w, max_spd, max_w = parts
+                    try:
+                        cur_w_int = int(cur_w.strip())
+                        max_w_int = int(max_w.strip())
+                    except ValueError:
+                        cur_w_int = max_w_int = 0
+                    pcie[dev.strip()] = {
+                        'pcie_current_speed': cur_spd.strip(),
+                        'pcie_current_width': cur_w_int,
+                        'pcie_max_speed': max_spd.strip(),
+                        'pcie_max_width': max_w_int,
+                        'pcie_at_max': (cur_spd.strip() == max_spd.strip() and cur_w_int == max_w_int),
+                    }
+    except Exception as e:
+        logger.debug("PCIe info collection failed: %s", e)
+    return pcie
+
+
+def _collect_gpu_perf(executor):
+    """Run nvidia-smi -q -d performance and parse throttle-reason states per GPU."""
+    gpus = []
+    try:
+        res = executor.run(['nvidia-smi', '-q', '-d', 'performance'], capture_output=True, text=True)
+        if res.returncode == 0:
+            current = None
+            in_throttle = False
+            for line in res.stdout.splitlines():
+                s = line.strip()
+                if s.startswith('GPU '):
+                    current = {'id': s, 'performance_state': None, 'idle': True, 'active_reasons': []}
+                    gpus.append(current)
+                    in_throttle = False
+                elif current is not None:
+                    if 'Performance State' in s:
+                        current['performance_state'] = s.split(':', 1)[1].strip()
+                    elif 'Clocks Throttle Reasons' in s or 'Clocks Event Reasons' in s:
+                        in_throttle = True
+                    elif in_throttle and ':' in s:
+                        reason, _, state = s.partition(':')
+                        reason = reason.strip()
+                        state = state.strip()
+                        if reason == 'Idle' and state == 'Not Active':
+                            current['idle'] = False
+                        elif reason != 'Idle' and state == 'Active':
+                            current['active_reasons'].append(reason)
+    except Exception as e:
+        logger.debug("nvidia-smi performance check failed: %s", e)
+    return gpus
 
 
 @app.route('/api/system-info', methods=['GET', 'POST'])
@@ -1075,7 +1239,13 @@ def get_system_info():
                 if start_idx != -1:
                     nvme_info = json.loads(stdout[start_idx:]).get('Result', [])
         except Exception as e:
-            print(f"Error getting graidctl nd info: {e}")
+            logger.warning("Error getting graidctl nd info: %s", e)
+
+        # Augment each NVMe device with PCIe link speed/width from sysfs
+        pcie_map = _collect_nvme_pcie_info(executor)
+        for dev in nvme_info:
+            dev_name = Path(dev.get('DevPath', '')).name  # e.g. "nvme0n1"
+            dev.update(pcie_map.get(dev_name, {}))
 
         # Get Controller info via graidctl
         controller_info = []
@@ -1088,7 +1258,10 @@ def get_system_info():
                 if start_idx != -1:
                     controller_info = json.loads(stdout[start_idx:]).get('Result', [])
         except Exception as e:
-            print(f"Error getting graidctl cx info: {e}")
+            logger.warning("Error getting graidctl cx info: %s", e)
+
+        # Check GPU performance state (warns if RAID controller GPU is not idle)
+        gpu_perf = _collect_gpu_perf(executor)
 
         # Get remote hostname
         hostname_dut = "Unknown"
@@ -1096,7 +1269,8 @@ def get_system_info():
             res = executor.run(['hostname'], capture_output=True, text=True)
             if res.returncode == 0:
                 hostname_dut = res.stdout.strip()
-        except: pass
+        except Exception:
+            pass
 
         return jsonify({
             'success': True,
@@ -1107,6 +1281,7 @@ def get_system_info():
                 'memory_available_gb': memory.available / (1024**3),
                 'nvme_info': nvme_info,
                 'controller_info': controller_info,
+                'gpu_perf': gpu_perf,
                 'hostname': hostname_dut
             }
         })
@@ -1135,7 +1310,7 @@ def get_license_info():
                 if start_idx != -1:
                     license_info = json.loads(stdout[start_idx:]).get('Result', {})
         except Exception as e:
-            print(f"Error getting license info: {e}")
+            logger.warning("Error getting license info: %s", e)
 
         return jsonify({'success': True, 'data': license_info})
     except Exception as e:
@@ -1143,6 +1318,7 @@ def get_license_info():
 
 
 @app.route('/api/benchmark/test-connection', methods=['POST'])
+@_require_api_key
 def test_connection():
     try:
         data = request.json
@@ -1174,6 +1350,7 @@ def test_connection():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/benchmark/setup-dut', methods=['POST'])
+@_require_api_key
 def setup_dut():
     try:
         config = request.json.get('config')
@@ -1206,6 +1383,7 @@ def setup_dut():
 
 
 @app.route('/api/benchmark/start', methods=['POST'])
+@_require_api_key
 def start_benchmark():
     global benchmark_running
     if benchmark_running:
@@ -1313,6 +1491,7 @@ def check_graid_resources():
 
 
 @app.route('/api/graid/reset', methods=['POST'])
+@_require_api_key
 def reset_graid_resources():
     global benchmark_running
     if benchmark_running:
@@ -1328,52 +1507,47 @@ def reset_graid_resources():
             
         executor = RemoteExecutor(config)
         results = []
-        print("DEBUG: Starting Graid resources reset...", flush=True)
-        
+        logger.info("Starting GRAID resources reset...")
+
         # 1. Delete VDs
-        print("DEBUG: Checking VDs...", flush=True)
         res_vd = executor.run(['graidctl', 'ls', 'vd', '--format', 'json'], capture_output=True, text=True)
         if res_vd.returncode == 0:
             try:
                 vds = parse_graidctl_json(res_vd.stdout).get('Result', [])
-                print(f"DEBUG: Found VDs: {vds}", flush=True)
+                logger.info("Found VDs: %s", vds)
                 for vd in vds:
                     dg_id = vd.get('DgId')
                     vd_id = vd.get('VdId')
                     if dg_id is not None and vd_id is not None:
                         cmd = ['graidctl', 'del', 'vd', str(dg_id), str(vd_id), '--confirm-to-delete']
-                        print(f"DEBUG: Executing: {' '.join(cmd)}", flush=True)
                         del_res = executor.run(cmd, capture_output=True, text=True)
-                        print(f"DEBUG: VD Delete output: stdout='{del_res.stdout.strip()}', stderr='{del_res.stderr.strip()}'", flush=True)
+                        logger.info("VD %s/%s delete: %s", dg_id, vd_id, del_res.stdout.strip() or del_res.stderr.strip())
                         results.append(f"Deleted VD {vd_id} in DG {dg_id}")
             except Exception as e:
-                print(f"DEBUG: VD Parsing error: {e}", flush=True)
+                logger.error("VD parsing error: %s", e)
 
         # 2. Delete DGs
-        print("DEBUG: Checking DGs...", flush=True)
         res_dg = executor.run(['graidctl', 'ls', 'dg', '--format', 'json'], capture_output=True, text=True)
         if res_dg.returncode == 0:
             try:
                 dgs = parse_graidctl_json(res_dg.stdout).get('Result', [])
-                print(f"DEBUG: Found DGs: {dgs}", flush=True)
+                logger.info("Found DGs: %s", dgs)
                 for dg in dgs:
                     dg_id = dg.get('DgId')
                     if dg_id is not None:
                         cmd = ['graidctl', 'del', 'dg', str(dg_id), '--confirm-to-delete']
-                        print(f"DEBUG: Executing: {' '.join(cmd)}", flush=True)
                         del_res = executor.run(cmd, capture_output=True, text=True)
-                        print(f"DEBUG: DG Delete output: stdout='{del_res.stdout.strip()}', stderr='{del_res.stderr.strip()}'", flush=True)
+                        logger.info("DG %s delete: %s", dg_id, del_res.stdout.strip() or del_res.stderr.strip())
                         results.append(f"Deleted DG {dg_id}")
             except Exception as e:
-                print(f"DEBUG: DG Parsing error: {e}", flush=True)
+                logger.error("DG parsing error: %s", e)
 
         # 3. Delete PDs
-        print("DEBUG: Checking PDs...", flush=True)
         res_pd = executor.run(['graidctl', 'ls', 'pd', '--format', 'json'], capture_output=True, text=True)
         if res_pd.returncode == 0:
             try:
                 pds = parse_graidctl_json(res_pd.stdout).get('Result', [])
-                print(f"DEBUG: Found PDs: {pds}", flush=True)
+                logger.info("Found PDs: %s", pds)
                 if pds:
                     pd_ids = [p.get('PdId') for p in pds if p.get('PdId') is not None]
                     if pd_ids:
@@ -1381,20 +1555,20 @@ def reset_graid_resources():
                         max_pd = max(pd_ids)
                         pd_range = f"{min_pd}-{max_pd}"
                         cmd = ['graidctl', 'del', 'pd', pd_range]
-                        print(f"DEBUG: Executing: {' '.join(cmd)}", flush=True)
                         del_res = executor.run(cmd, capture_output=True, text=True)
-                        print(f"DEBUG: PD Delete output: stdout='{del_res.stdout.strip()}', stderr='{del_res.stderr.strip()}'", flush=True)
+                        logger.info("PD range %s delete: %s", pd_range, del_res.stdout.strip() or del_res.stderr.strip())
                         results.append(f"Deleted PDs in range {pd_range}")
             except Exception as e:
-                print(f"DEBUG: PD Parsing error: {e}", flush=True)
+                logger.error("PD parsing error: %s", e)
 
         return jsonify({'success': True, 'message': 'Reset complete', 'details': results})
     except Exception as e:
-        print(f"Error during reset: {e}", flush=True)
+        logger.error("Error during reset: %s", e)
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/benchmark/stop', methods=['POST'])
+@_require_api_key
 def stop_benchmark():
     global benchmark_process, benchmark_running
     try:
@@ -1422,15 +1596,14 @@ def stop_benchmark():
 def trigger_snapshot():
     try:
         if not benchmark_running:
-            print("Snapshot trigger ignored: Benchmark is not running", flush=True)
+            logger.info("Snapshot trigger ignored: benchmark not running")
             return jsonify({'success': True, 'message': 'Snapshot ignored: Benchmark stopped'})
 
         data = request.json
         test_name = data.get('test_name', 'unknown_test')
         output_dir = data.get('output_dir', '')
-        
-        # Emit event to frontend to take snapshot
-        print(f"Triggering snapshot for {test_name}", flush=True)
+
+        logger.info("Triggering snapshot for %s", test_name)
         socketio.emit('snapshot_request', {
             'test_name': test_name,
             'output_dir': output_dir
@@ -1486,24 +1659,23 @@ def save_snapshot():
         with open(file_path, 'wb') as f:
             f.write(image_binary)
             
-        print(f"Snapshot saved to {file_path}", flush=True)
+        logger.info("Snapshot saved to %s", file_path)
 
         # Sync to remote if needed
         config = ConfigManager.load_config()
         executor = RemoteExecutor(config)
         if executor.is_remote:
-             try:
-                 # Map local path to remote path
-                 remote_save_dir = executor._to_remote_path(str(save_dir))
-                 executor.run(['mkdir', '-p', remote_save_dir])
-                 executor.sync_to_remote(str(file_path), str(save_dir / filename))
-                 print(f"Snapshot synced to remote: {remote_save_dir}/{filename}", flush=True)
-             except Exception as e:
-                 print(f"Error syncing snapshot to remote: {e}", flush=True)
+            try:
+                remote_save_dir = executor._to_remote_path(str(save_dir))
+                executor.run(['mkdir', '-p', remote_save_dir])
+                executor.sync_to_remote(str(file_path), str(save_dir / filename))
+                logger.info("Snapshot synced to remote: %s/%s", remote_save_dir, filename)
+            except Exception as e:
+                logger.error("Error syncing snapshot to remote: %s", e)
 
         return jsonify({'success': True, 'message': 'Snapshot saved'})
     except Exception as e:
-        print(f"Error saving snapshot: {e}", flush=True)
+        logger.error("Error saving snapshot: %s", e)
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
@@ -1535,7 +1707,7 @@ def get_benchmark_status():
             if res.returncode == 0:
                 # Remote benchmark is still running! Restore state
                 benchmark_running = True
-                print(f"DEBUG: Recovered running benchmark from persistent state", flush=True)
+                logger.info("Recovered running benchmark from persistent state")
                 
                 # Try to restore progress from saved state
                 progress = saved_state.get('progress', benchmark_manager.latest_progress)
@@ -1554,10 +1726,10 @@ def get_benchmark_status():
                 })
             else:
                 # Remote benchmark finished, clear state
-                print(f"DEBUG: Persistent state exists but remote benchmark not running, clearing", flush=True)
+                logger.info("Persistent state exists but remote benchmark not running — clearing.")
                 BenchmarkState.clear()
         except Exception as e:
-            print(f"DEBUG: Error checking remote state: {e}", flush=True)
+            logger.error("Error checking remote state: %s", e)
     
     return jsonify({
         'success': True, 
@@ -1683,8 +1855,9 @@ def get_result_info(result_name):
                 try:
                     with open(info_file, 'r') as f:
                         info_data = json.load(f)
-                except: pass
-            
+                except Exception:
+                    pass
+
             # 2. Try recursive search for basic.log
             if not info_data:
                 for log_file in target_path.rglob('basic.log'):
@@ -1694,11 +1867,11 @@ def get_result_info(result_name):
                             info_data = parse_basic_log(content)
                             if info_data.get('graid_version') != 'N/A' or info_data.get('os_info') != 'N/A':
                                 break
-                    except: pass
+                    except Exception:
+                        pass
 
         else:
             # Handle archive
-            import tarfile
             with tarfile.open(target_path, 'r') as tar:
                 # 1. Try system_info.json in archive
                 try:
@@ -1708,10 +1881,12 @@ def get_result_info(result_name):
                             if f:
                                 info_data = json.load(f)
                                 break
-                except: pass
+                except Exception:
+                    pass
 
                 # 2. Try nested log archive or basic.log directly
                 if not info_data:
+                    import io
                     for member in tar.getmembers():
                         m_name = member.name.lower()
                         # Direct basic.log
@@ -1722,16 +1897,14 @@ def get_result_info(result_name):
                                     content = f.read().decode('utf-8', errors='ignore')
                                     info_data = parse_basic_log(content)
                                     if info_data.get('graid_version') != 'N/A': break
-                                except: pass
-                        
+                                except Exception:
+                                    pass
+
                         # Nested archive: looks for something with 'log' and 'tar.gz/tgz'
                         elif ('log' in m_name) and (m_name.endswith('.tar.gz') or m_name.endswith('.tgz')):
                             f_obj = tar.extractfile(member)
                             if f_obj:
                                 try:
-                                    # Create a secondary tar object from the extracted nested file
-                                    # Since extractfile returns a file-like object, it might need to be wrapped or read into BytesIO
-                                    import io
                                     nested_data = f_obj.read()
                                     with tarfile.open(fileobj=io.BytesIO(nested_data), mode='r:gz') as inner_tar:
                                         for inner in inner_tar.getmembers():
@@ -1741,13 +1914,14 @@ def get_result_info(result_name):
                                                     content = inner_f.read().decode('utf-8', errors='ignore')
                                                     info_data = parse_basic_log(content)
                                                     break
-                                except: pass
+                                except Exception:
+                                    pass
                                 if info_data and info_data.get('graid_version') != 'N/A':
                                     break
-        
+
         return jsonify({'success': True, 'data': info_data or {}})
     except Exception as e:
-        print(f"ERROR in get_result_info: {str(e)}", flush=True)
+        logger.error("Error in get_result_info: %s", e)
         return jsonify({'success': True, 'data': {}})
 
 @app.route('/api/results/<result_name>/download', methods=['GET'])
@@ -1857,8 +2031,8 @@ def get_result_data(result_name):
                     workload = f"{size_label} {type_label}"
                 
             except Exception as e:
-                print(f"Error parsing workload: {e}")
-            
+                logger.debug("Error parsing workload: %s", e)
+
             return workload
 
         if result_path.is_dir():
@@ -1903,7 +2077,7 @@ def get_result_data(result_name):
                         # Optional: Add source file info if needed, but schema might need to match
                         csv_data.extend(file_data)
                     except Exception as e:
-                        print(f"Error parsing {csv_file}: {e}")
+                        logger.warning("Error parsing %s: %s", csv_file, e)
             else:
                  return jsonify({'success': False, 'error': 'No CSV data found'}), 404
 
@@ -1968,7 +2142,7 @@ def get_result_data(result_name):
                             
                             csv_data.append(row)
                     except Exception as e:
-                        print(f"Error parsing tar member {member.name}: {e}")
+                        logger.warning("Error parsing tar member %s: %s", member.name, e)
 
         return jsonify({'success': True, 'data': csv_data})
     except Exception as e:
@@ -2130,11 +2304,17 @@ def on_join_session(data):
 
 
 if __name__ == '__main__':
+    if not _API_KEY:
+        logger.warning(
+            "BENCHMARK_API_KEY is not set — API authentication is DISABLED. "
+            "Set this environment variable to protect state-changing endpoints."
+        )
+
     # Try to recover state on startup
     state = BenchmarkState.load()
     if state:
         benchmark_manager.recover_state(state)
-        
+
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true' or os.environ.get('FLASK_ENV') == 'development'
     socketio.run(app, host='0.0.0.0', port=50071,
                  debug=debug_mode, allow_unsafe_werkzeug=True)
