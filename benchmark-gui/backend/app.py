@@ -22,6 +22,7 @@ import csv
 import selectors
 import paramiko
 from scp import SCPClient
+from uuid import uuid4
 
 # ---------------------------------------------------------------------------
 # Logging setup — replaces scattered print(f"DEBUG: ...") calls
@@ -32,6 +33,9 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
 )
 logger = logging.getLogger('benchmark-gui')
+audit_logger = logging.getLogger('benchmark-gui.audit')
+
+SENSITIVE_CONFIG_KEYS = {'DUT_PASSWORD'}
 
 WORKLOAD_MAP = {
     '00-randread': '4k Random Read',
@@ -63,6 +67,17 @@ CACHE_DIR = RESULTS_DIR / ".cache"
 RESULTS_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+if not any(isinstance(handler, logging.FileHandler) and getattr(handler, 'baseFilename', '').endswith('audit.log')
+           for handler in audit_logger.handlers):
+    audit_handler = logging.FileHandler(LOGS_DIR / 'audit.log')
+    audit_handler.setFormatter(logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    ))
+    audit_logger.addHandler(audit_handler)
+    audit_logger.setLevel(logging.INFO)
+    audit_logger.propagate = False
 
 benchmark_process = None
 benchmark_running = False
@@ -472,14 +487,46 @@ class ConfigManager:
 
     @staticmethod
     def save_config(config):
+        sanitized = {
+            key: value for key, value in config.items()
+            if key not in SENSITIVE_CONFIG_KEYS
+        }
         with open(CONFIG_FILE, 'w') as f:
-            json.dump(config, f, indent=2)
+            json.dump(sanitized, f, indent=2)
+
+
+def sanitize_config(config):
+    if not isinstance(config, dict):
+        return {}
+    return {
+        key: value for key, value in config.items()
+        if key not in SENSITIVE_CONFIG_KEYS
+    }
+
+
+def public_config(config):
+    redacted = dict(sanitize_config(config))
+    if isinstance(config, dict) and config.get('DUT_PASSWORD'):
+        redacted['DUT_PASSWORD'] = '***'
+    return redacted
+
+
+def generate_run_id():
+    return f"run-{uuid4().hex[:12]}"
+
+
+def audit_event(action, **details):
+    payload = {'action': action, **details}
+    audit_logger.info(json.dumps(payload, default=str, sort_keys=True))
 
 
 class BenchmarkManager:
     def __init__(self):
         self.process = None
         self.running = False
+        self.active_run_id = None
+        self.session_id = None
+        self.runtime_config = None
         self.current_log_file = None
         self.latest_progress = {
             'percentage': 0,
@@ -491,6 +538,7 @@ class BenchmarkManager:
             'stage': '',
             'label': ''
         }
+        self._lock = threading.Lock()
 
     def recover_state(self, state):
         global benchmark_running
@@ -498,6 +546,7 @@ class BenchmarkManager:
             self.current_log_file = Path(state['log_file'])
             session_id = state['session_id']
             config = state['config']
+            run_id = state.get('run_id')
             start_time = state['start_time']
             
             start_time = state['start_time']
@@ -512,6 +561,10 @@ class BenchmarkManager:
             if res.returncode == 0:
                 logger.info("Recovering active benchmark on session %s", session_id)
                 benchmark_running = True
+                self.running = True
+                self.active_run_id = run_id
+                self.session_id = session_id
+                self.runtime_config = config
                 
                 # Start a thread to wait for completion and sync
                 thread = threading.Thread(
@@ -560,20 +613,31 @@ class BenchmarkManager:
             socketio.emit('status', {
                 'status': 'completed',
                 'message': 'Benchmark completed (recovered)',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'run_id': self.active_run_id,
             }, room=session_id)
             
         finally:
             benchmark_running = False
+            self.running = False
+            self.active_run_id = None
+            self.session_id = None
+            self.runtime_config = None
             BenchmarkState.clear()
             stop_giostat_monitoring()
 
-    def run_benchmark(self, config, session_id):
+    def run_benchmark(self, config, session_id, run_id=None):
         global benchmark_running, benchmark_process
+        run_id = run_id or generate_run_id()
         try:
             ConfigManager.save_config(config)
             executor = RemoteExecutor(config)
             benchmark_running = True
+            with self._lock:
+                self.running = True
+                self.active_run_id = run_id
+                self.session_id = session_id
+                self.runtime_config = dict(config)
             
             # Start giostat monitoring
             start_giostat_monitoring(session_id, executor)
@@ -625,7 +689,8 @@ class BenchmarkManager:
             socketio.emit('status', {
                 'status': 'started',
                 'message': 'Benchmark started',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'run_id': run_id,
             }, room=session_id)
 
             self.latest_progress = {
@@ -643,9 +708,10 @@ class BenchmarkManager:
             
             # Save active state for recovery
             BenchmarkState.save({
+                'run_id': run_id,
                 'session_id': session_id,
                 'log_file': str(log_file),
-                'config': config,
+                'config': sanitize_config(config),
                 'start_time': start_time,
                 'status': 'started'
             })
@@ -749,8 +815,9 @@ class BenchmarkManager:
                                  # Update persistent state
                                  BenchmarkState.save({
                                      'session_id': session_id,
+                                     'run_id': run_id,
                                      'log_file': str(self.current_log_file),
-                                     'config': config,
+                                     'config': sanitize_config(config),
                                      'start_time': start_time,
                                      'status': 'started',
                                      'stage_info': self.current_stage_info
@@ -768,8 +835,9 @@ class BenchmarkManager:
                                  # Update persistent state
                                  BenchmarkState.save({
                                      'session_id': session_id,
+                                     'run_id': run_id,
                                      'log_file': str(self.current_log_file),
-                                     'config': config,
+                                     'config': sanitize_config(config),
                                      'start_time': start_time,
                                      'status': 'started',
                                      'stage_info': self.current_stage_info
@@ -787,8 +855,9 @@ class BenchmarkManager:
                                  # Update persistent state
                                  BenchmarkState.save({
                                      'session_id': session_id,
+                                     'run_id': run_id,
                                      'log_file': str(self.current_log_file),
-                                     'config': config,
+                                     'config': sanitize_config(config),
                                      'start_time': start_time,
                                      'status': 'started',
                                      'stage_info': self.current_stage_info
@@ -816,8 +885,9 @@ class BenchmarkManager:
                                     # Update persistent state
                                     BenchmarkState.save({
                                         'session_id': session_id,
+                                        'run_id': run_id,
                                         'log_file': str(self.current_log_file),
-                                        'config': config,
+                                        'config': sanitize_config(config),
                                         'start_time': start_time,
                                         'status': 'started',
                                         'stage_info': self.current_stage_info
@@ -961,19 +1031,22 @@ class BenchmarkManager:
                 socketio.emit('status', {
                     'status': 'completed',
                     'message': 'Benchmark completed',
-                    'timestamp': datetime.now().isoformat()
+                    'timestamp': datetime.now().isoformat(),
+                    'run_id': run_id,
                 }, room=session_id)
             else:
                 fail_msg = self.last_error if self.last_error else f'Failed: {self.process.returncode} (No error captured)'
                 socketio.emit('status', {
                     'status': 'failed',
                     'message': fail_msg,
-                    'timestamp': datetime.now().isoformat()
+                    'timestamp': datetime.now().isoformat(),
+                    'run_id': run_id,
                 }, room=session_id)
         except Exception as e:
             socketio.emit('error', {
                 'message': str(e),
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'run_id': run_id,
             }, room=session_id)
         finally:
             if executor.is_remote:
@@ -985,6 +1058,11 @@ class BenchmarkManager:
                     logger.error("Error syncing back results: %s", e)
 
             benchmark_running = False
+            with self._lock:
+                self.running = False
+                self.active_run_id = None
+                self.session_id = None
+                self.runtime_config = None
             stop_giostat_monitoring()
 
 
@@ -2435,4 +2513,3 @@ if __name__ == '__main__':
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true' or os.environ.get('FLASK_ENV') == 'development'
     socketio.run(app, host='0.0.0.0', port=50071,
                  debug=debug_mode, allow_unsafe_werkzeug=True)
-

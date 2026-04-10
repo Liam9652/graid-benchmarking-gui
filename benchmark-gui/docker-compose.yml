@@ -1,39 +1,13 @@
 version: "3.8"
 
 services:
-  backend:
-    # Change to image: your-account/graid-bench-backend:v1.0 after push
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    ports:
-      - "50071:50071"
-    volumes:
-      - ./scripts:/app/scripts
-      - ./results:/app/results
-      - ./logs:/app/logs
-      - ./backend/app.py:/app/app.py
-      - ./graid-bench.conf:/app/graid-bench.conf
-      # Access to host /dev is required for RAID and NVMe operations
-      - /dev:/dev
-    environment:
-      - FLASK_ENV=production
-      - PYTHONUNBUFFERED=1
-    networks:
-      - graid-network
-    # Privileged is necessary to manage hardware RAID and NVMe devices
-    privileged: true
-    # pid: host is necessary for tools like atop to monitor host processes
-    pid: "host"
-    restart: unless-stopped
-
   fastapi:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    command: uvicorn fastapi_app:combined_app --host 0.0.0.0 --port 50073 --reload
+    command: uvicorn fastapi_app:combined_app --host 0.0.0.0 --port 50071
     ports:
-      - "50073:50073"
+      - "50071:50071"
     volumes:
       - ./scripts:/app/scripts
       - ./results:/app/results
@@ -45,13 +19,12 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - BENCHMARK_API_KEY=${BENCHMARK_API_KEY:-}
+      - BENCHMARK_ALLOWED_ORIGINS=${BENCHMARK_ALLOWED_ORIGINS:-http://localhost:50072,http://127.0.0.1:50072}
     networks:
       - graid-network
     privileged: true
     pid: "host"
     restart: unless-stopped
-    depends_on:
-      - backend
 
   frontend:
     # Change to image: your-account/graid-bench-frontend:v1.0 after push
@@ -63,7 +36,7 @@ services:
     environment:
       - REACT_APP_API_URL=
     depends_on:
-      - backend
+      - fastapi
     networks:
       - graid-network
     restart: unless-stopped

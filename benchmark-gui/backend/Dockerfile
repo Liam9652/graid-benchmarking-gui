@@ -49,5 +49,4 @@ COPY templates ./templates
 RUN mkdir -p /app/scripts /app/results /app/logs
 
 EXPOSE 50071
-EXPOSE 50073
-CMD ["python", "app.py"]
+CMD ["uvicorn", "fastapi_app:combined_app", "--host", "0.0.0.0", "--port", "50071"]
