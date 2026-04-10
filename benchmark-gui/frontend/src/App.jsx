@@ -871,18 +871,21 @@ function App() {
 
   const handleSelectAllToggle = () => {
     const maxLimit = getMaxPdLimit();
-    const allDevices = systemInfo.nvme_info.map(d => d.DevPath.split('/').pop());
+    // Exclude devices flagged as in-use from select-all
+    const selectableDevices = systemInfo.nvme_info
+      .filter(d => !d.in_use)
+      .map(d => d.DevPath.split('/').pop());
     const currentSelected = config.NVME_LIST || [];
 
-    // If all possible are already selected, deselect all
-    if (currentSelected.length === Math.min(allDevices.length, maxLimit)) {
+    // If all selectable are already selected, deselect all
+    if (currentSelected.length === Math.min(selectableDevices.length, maxLimit)) {
       handleConfigChange('NVME_LIST', []);
       return;
     }
 
     // Otherwise, select up to limit
-    const toSelect = allDevices.slice(0, maxLimit);
-    if (toSelect.length < allDevices.length) {
+    const toSelect = selectableDevices.slice(0, maxLimit);
+    if (toSelect.length < selectableDevices.length) {
       setStatus(`⚠️ License limit reached: Selected top ${maxLimit} devices.`);
       setTimeout(() => setStatus(''), 3000);
     }
@@ -966,9 +969,11 @@ function App() {
             config: config
           });
           if (resetRes.data.success) {
-            setStatus('✅ Graid resources cleared successfully');
-            loadSystemInfo(config); // Refresh device lists with current config
-            setTimeout(() => setStatus(''), 3000);
+            setStatus('✅ Graid resources cleared. Reloading configuration...');
+            await loadConfig();
+            await loadSystemInfo(config);
+            setStatus('✅ Reset complete: Graid resources cleared and configuration reloaded.');
+            setTimeout(() => setStatus(''), 4000);
           }
           setIsResetting(false); // Reset state after completion
         } else {
@@ -1180,8 +1185,8 @@ function App() {
                 <h2>Configuration Editor</h2>
                 <div className="config-actions-top">
                   <button className="btn btn-primary" onClick={saveConfig}>💾 Save</button>
-                  <button className="btn btn-secondary" onClick={loadConfig}>🔄 Reload</button>
-                  <button className="btn btn-danger" onClick={handleResetConfig} title="Clear existing VD/DG/PD configurations">♻️ Reset</button>
+                  <button className="btn btn-secondary" onClick={() => loadSystemInfo()} title="Refresh NVMe device list and PCIe / usage status">🔄 Reload</button>
+                  <button className="btn btn-danger" onClick={handleResetConfig} title="Reload config file + clear all Graid VD/DG/PD">♻️ Reset</button>
                 </div>
               </div>
 
@@ -1361,16 +1366,36 @@ function App() {
                         {sortedNvmeInfo.map((dev, idx) => {
                           const hasPcie = dev.pcie_current_speed !== undefined;
                           const atMax = dev.pcie_at_max;
+                          const inUse = !!dev.in_use;
+                          const devKey = dev.DevPath.split('/').pop();
+                          const isSelected = (config.NVME_LIST || []).includes(devKey);
+                          let rowClass = '';
+                          if (inUse) rowClass = 'dev-in-use';
+                          else if (isSelected) rowClass = 'selected';
                           return (
-                          <tr key={idx} onClick={() => toggleSelection('NVME_LIST', dev.DevPath.split('/').pop())} className={(config.NVME_LIST || []).includes(dev.DevPath.split('/').pop()) ? 'selected' : ''}>
+                          <tr
+                            key={idx}
+                            onClick={() => { if (!inUse) toggleSelection('NVME_LIST', devKey); }}
+                            className={rowClass}
+                            title={inUse ? `⚠️ Device may be in use: ${dev.use_reasons.join(', ')}` : undefined}
+                          >
                             <td>
                               <input
                                 type="checkbox"
-                                checked={(config.NVME_LIST || []).includes(dev.DevPath.split('/').pop())}
+                                checked={isSelected}
+                                disabled={inUse}
                                 readOnly
                               />
                             </td>
-                            <td>{dev.DevPath}</td>
+                            <td>
+                              {dev.DevPath}
+                              {inUse && (
+                                <span
+                                  className="dev-in-use-badge"
+                                  title={`Device may be in use:\n• ${dev.use_reasons.join('\n• ')}`}
+                                >⚠ in use</span>
+                              )}
+                            </td>
                             <td>{dev.Model}</td>
                             <td>{(dev.Capacity / (1024 ** 3)).toFixed(2)} GiB</td>
                             <td>{dev.Numa}</td>
@@ -1410,7 +1435,7 @@ function App() {
                     )}
                   </div>
                   {/* GPU performance warnings */}
-                  {(systemInfo.gpu_perf || []).filter(g => !g.idle).map((g, i) => (
+                  {(systemInfo.gpu_perf || []).filter(g => g.active_reasons && g.active_reasons.length > 0).map((g, i) => (
                     <div key={i} className="gpu-perf-warning">
                       <span className="gpu-perf-icon">&#9888;</span>
                       <div>
@@ -1677,8 +1702,11 @@ function App() {
                 <button className="btn btn-primary" onClick={saveConfig}>
                   💾 Save Configuration
                 </button>
-                <button className="btn btn-secondary" onClick={loadConfig}>
-                  🔄 Reload Configuration
+                <button className="btn btn-secondary" onClick={() => loadSystemInfo()} title="Refresh NVMe device list and PCIe / usage status">
+                  🔄 Reload
+                </button>
+                <button className="btn btn-danger" onClick={handleResetConfig} title="Reload config file + clear all Graid VD/DG/PD">
+                  ♻️ Reset
                 </button>
               </div>
 
