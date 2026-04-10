@@ -1309,6 +1309,7 @@ function App() {
                 <div className="config-section">
                   <h3>🔐 API Access</h3>
                   <p className="section-desc">Protected actions use an API key stored in this browser only. It is not written into the benchmark config.</p>
+                  <p className="section-desc">Generate this key on the backend first, for example with <code>openssl rand -hex 32</code>, set it as <code>BENCHMARK_API_KEY</code>, then paste the exact same value here.</p>
                   {!hasApiKey && (
                     <div className="connection-message error" style={{ marginBottom: '12px' }}>
                       Protected actions such as save, connect, setup, start, stop, reset, and snapshot will fail until an API key is configured.

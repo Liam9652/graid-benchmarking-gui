@@ -47,9 +47,15 @@ The backend serves the API and can also serve the static frontend files if built
 ```bash
 cd backend
 pip3 install -r requirements.txt
-BENCHMARK_API_KEY=change-this python3 fastapi_app.py
+BENCHMARK_API_KEY=$(openssl rand -hex 32) python3 fastapi_app.py
 ```
 *The backend will start on port 50071.*
+
+If `openssl` is not available, generate a key with:
+```bash
+python3 -c "import secrets; print(secrets.token_hex(32))"
+```
+Use that same value for `BENCHMARK_API_KEY`.
 
 ### 2. Start the Frontend
 You have two options:
@@ -73,4 +79,5 @@ To benchmark a remote server (DUT) from this Host Mode instance:
 3. Enable **Remote Mode**.
 4. Enter the **IP**, **User**, and **Password** of the machine with the SupremeRAID™ card.
 5. Enter the same API key in the UI **API Access** section if the backend is protected.
+   The UI does not generate this key for you; it must match the backend environment variable exactly.
 6. Save and Start Benchmark.
