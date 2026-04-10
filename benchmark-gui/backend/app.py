@@ -548,13 +548,20 @@ class BenchmarkManager:
             config = state['config']
             run_id = state.get('run_id')
             start_time = state['start_time']
-            
+
             start_time = state['start_time']
             # Restore stage info if available
             self.current_stage_info = state.get('stage_info', {'stage': '', 'label': ''})
-            
+
+            # The saved config has no password (stripped for security).
+            # Without credentials we cannot reconnect — clear state and bail out.
+            if config.get('REMOTE_MODE') and not config.get('DUT_PASSWORD'):
+                logger.info("Benchmark state found but no credentials available for recovery — clearing state.")
+                BenchmarkState.clear()
+                return False
+
             executor = RemoteExecutor(config)
-            
+
             # Check if remote process is alive
             # Looking for 'graid-bench.sh' or 'bench.sh' on remote
             res = executor.run(['pgrep', '-f', 'graid-bench.sh'], capture_output=True, text=True)
