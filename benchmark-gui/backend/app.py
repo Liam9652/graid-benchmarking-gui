@@ -2059,6 +2059,18 @@ def download_result(result_name):
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+def _extract_raid_from_cmd_dir(parent_dir):
+    """Extract RAID type from filenames in cmd/ or raid_config/ sibling directory."""
+    for subdir_name in ('cmd', 'raid_config'):
+        candidate = Path(parent_dir) / subdir_name
+        if candidate.is_dir():
+            for f in candidate.iterdir():
+                m = re.search(r'(RAID\d+)', f.name)
+                if m:
+                    return m.group(1)
+    return None
+
+
 @app.route('/api/results/<result_name>/data', methods=['GET'])
 def get_result_data(result_name):
     try:
@@ -2167,36 +2179,68 @@ def get_result_data(result_name):
             
             # If explicit filter yielded nothing, or no filter, use all found (maybe filter for test results)
             if not filtered_files:
-                 # If we had a type but found nothing, maybe fallback? or return empty?
-                 # If user specified baseline but no PD found, likely no PD data.
-                 # But let's be safe and fallback to all if no specific filter matches (only if type not specified?)
-                 if not req_type:
+                if not req_type:
                     filtered_files = csv_files
-                 # If req_type was set but empty, we return empty list essentially
-            
+                # If req_type=baseline but no PD CSV found, check for bench-fio JSON dirs and generate CSVs
+                elif req_type == 'baseline':
+                    try:
+                        import sys as _sys
+                        _sys.path.insert(0, str(SCRIPT_DIR / 'src'))
+                        from fio_parser import collect_bench_fio_results, is_bench_fio_output
+                        for status_dir in result_path.rglob('PD/*/'):
+                            if not status_dir.is_dir():
+                                continue
+                            for entry in status_dir.iterdir():
+                                if entry.is_dir() and is_bench_fio_output(entry):
+                                    result_subdir = entry.parent / 'result'
+                                    result_subdir.mkdir(parents=True, exist_ok=True)
+                                    out = collect_bench_fio_results(entry, entry.name, result_subdir)
+                                    if out:
+                                        filtered_files.append(Path(out))
+                        if filtered_files:
+                            logger.info("Generated %d bench-fio baseline CSV(s) on-the-fly", len(filtered_files))
+                    except Exception as e:
+                        logger.warning("bench-fio baseline CSV generation failed: %s", e)
+
             # Further filter for fio/diskspd files to avoid random csvs
             target_csvs = [f for f in filtered_files if 'fio-test' in f.name or 'diskspd-test' in f.name]
-             
+
             # If no target csvs found, but we have filtered files, take them
             if not target_csvs and filtered_files:
                 target_csvs = filtered_files
-            
+
+            # Prefer summary CSVs (fio-test-r-* format) over raw bench-fio CSVs, matching tar handler behavior
+            summary_csvs = [f for f in target_csvs if re.search(r'fio-test-r-', f.name)]
+            if summary_csvs:
+                target_csvs = summary_csvs
+
             # Parse all target CSVs and aggregate
             if target_csvs:
                 for csv_file in target_csvs:
                     try:
                         file_data = parse_csv(csv_file)
-                        
-                        # Add workload to each row
+
                         for row in file_data:
                             row['Workload'] = get_workload_name(row)
-                            
-                        # Optional: Add source file info if needed, but schema might need to match
+                            # Backfill RAID_type from sibling cmd/ or raid_config/ dir
+                            if not row.get('RAID_type') or row.get('RAID_type') in ('N/A', ''):
+                                if req_type == 'baseline':
+                                    # PD (baseline) rows are SingleTest — required for frontend hasBaseline check
+                                    row['RAID_type'] = 'SingleTest'
+                                else:
+                                    raid = _extract_raid_from_cmd_dir(csv_file.parent.parent)
+                                    if raid:
+                                        row['RAID_type'] = raid
+                            # controller field (mirrors tar handler)
+                            if not row.get('controller') or row.get('controller') in ('N/A', ''):
+                                fname = row.get('filename', '')
+                                row['controller'] = 'MDADM' if 'graid-mdadm' in fname else 'SupremeRAID'
+
                         csv_data.extend(file_data)
                     except Exception as e:
                         logger.warning("Error parsing %s: %s", csv_file, e)
             else:
-                 return jsonify({'success': False, 'error': 'No CSV data found'}), 404
+                return jsonify({'success': False, 'error': 'No CSV data found'}), 404
 
         elif result_path.is_file() and result_path.name.lower().endswith(('.tar', '.tar.gz', '.tgz')):
             # Handle tar file
@@ -2309,18 +2353,16 @@ def get_result_images(result_name):
             elif 'randwrite' in filename: tags['workload'] = 'Rand Write'
             elif 'randrw73' in filename: tags['workload'] = 'Mix(70/30)'
             elif 'randrw55' in filename: tags['workload'] = 'Mix(50/50)'
-            
-            # Extract BS from filename more robustly
+            elif 'read' in filename: tags['workload'] = 'Seq Read'
+            elif 'write' in filename: tags['workload'] = 'Seq Write'
+
+            # Extract BS from filename — support both dash and underscore separators
             known_bs = ['4k', '8k', '16k', '32k', '64k', '128k', '256k', '512k', '1m', '1M', '2m', '4m']
             for b in known_bs:
-                if f"-{b}-" in filename or filename.endswith(f"-{b}"):
+                if (f"-{b}-" in filename or filename.endswith(f"-{b}") or
+                        f"_{b}_" in filename or filename.endswith(f"_{b}")):
                     tags['bs'] = b.upper()
                     break
-            
-            # Fallback for BS if not found in filename but workload is known
-            if tags['bs'] == 'Unknown':
-                if 'rand' in tags['workload'].lower(): tags['bs'] = '4K'
-                elif 'seq' in tags['workload'].lower(): tags['bs'] = '1M'
             
             if tags['category'] == 'PD':
                 tags['raid'] = 'BASELINE'
