@@ -130,6 +130,13 @@ def strip_ansi(text):
         return text
     return ANSI_ESCAPE.sub('', text)
 
+class _AutoUpdateHostKeyPolicy(paramiko.MissingHostKeyPolicy):
+    """Auto-accept and update host keys for lab/DUT environments without blocking."""
+    def missing_host_key(self, client, hostname, key):
+        client._host_keys.add(hostname, key.get_name(), key)
+        logger.warning("SSH: auto-accepted host key for %s (%s)", hostname, key.get_name())
+
+
 class RemoteExecutor:
     """Handles command execution locally or remotely via SSH."""
     _lock = threading.Lock()
@@ -168,11 +175,27 @@ class RemoteExecutor:
             
             logger.info("Connecting to remote DUT %s as %s...", hostname, username)
             try:
+                # Phase 1: establish SSH connection (with host-key-change retry)
                 self.ssh = paramiko.SSHClient()
-                self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                self.ssh.connect(hostname, port=port, username=username, password=password, timeout=10)
+                self.ssh.set_missing_host_key_policy(_AutoUpdateHostKeyPolicy())
+                try:
+                    self.ssh.connect(hostname, port=port, username=username, password=password,
+                                     timeout=10, banner_timeout=15,
+                                     look_for_keys=False, allow_agent=False)
+                except paramiko.ssh_exception.SSHException as e:
+                    err_str = str(e).lower()
+                    if any(kw in err_str for kw in ('not found in known_hosts', 'key mismatch', 'host key')):
+                        logger.warning("SSH host key conflict for %s, clearing and retrying: %s", hostname, e)
+                        try: self.ssh.close()
+                        except Exception: pass
+                        self.ssh = paramiko.SSHClient()
+                        self.ssh.set_missing_host_key_policy(_AutoUpdateHostKeyPolicy())
+                        self.ssh.connect(hostname, port=port, username=username, password=password,
+                                         timeout=10, look_for_keys=False, allow_agent=False)
+                    else:
+                        raise
 
-                # Check permissions
+                # Phase 2: check permissions
                 self.is_root = False
                 self.has_sudo = False
                 self.need_sudo_password = False
@@ -1133,22 +1156,32 @@ def update_config():
 
 
 _PCIE_INFO_CMD = r"""
-for d in /sys/block/nvme*n1; do
-  [ -e "$d" ] || continue
-  b=$(basename "$d")
-  p=$(readlink -f "$d")
-  while [ "$p" != "/" ] && [ -n "$p" ]; do
-    if [ -f "$p/current_link_speed" ]; then
-      printf '%s\t%s\t%s\t%s\t%s\n' \
-        "$b" \
-        "$(cat "$p/current_link_speed" 2>/dev/null)" \
-        "$(cat "$p/current_link_width" 2>/dev/null)" \
-        "$(cat "$p/max_link_speed" 2>/dev/null)" \
-        "$(cat "$p/max_link_width" 2>/dev/null)"
-      break
-    fi
-    p=$(dirname "$p")
+for ctrl_dir in /sys/class/nvme/nvme*; do
+  [ -d "$ctrl_dir" ] || continue
+  ctrl=$(basename "$ctrl_dir")
+  pci_dev=$(readlink -f "$ctrl_dir/device" 2>/dev/null)
+  [ -d "$pci_dev" ] || continue
+  [ -f "$pci_dev/current_link_speed" ] || continue
+  found_ns=0
+  for ns_dir in "$ctrl_dir"/"$ctrl"n*; do
+    [ -e "$ns_dir" ] || continue
+    ns=$(basename "$ns_dir")
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$ns" \
+      "$(cat "$pci_dev/current_link_speed" 2>/dev/null)" \
+      "$(cat "$pci_dev/current_link_width" 2>/dev/null)" \
+      "$(cat "$pci_dev/max_link_speed" 2>/dev/null)" \
+      "$(cat "$pci_dev/max_link_width" 2>/dev/null)"
+    found_ns=1
   done
+  if [ "$found_ns" = "0" ]; then
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "${ctrl}n1" \
+      "$(cat "$pci_dev/current_link_speed" 2>/dev/null)" \
+      "$(cat "$pci_dev/current_link_width" 2>/dev/null)" \
+      "$(cat "$pci_dev/max_link_speed" 2>/dev/null)" \
+      "$(cat "$pci_dev/max_link_width" 2>/dev/null)"
+  fi
 done
 """.strip()
 
@@ -1178,6 +1211,84 @@ def _collect_nvme_pcie_info(executor):
     except Exception as e:
         logger.debug("PCIe info collection failed: %s", e)
     return pcie
+
+
+def _collect_device_usage(executor):
+    """Return dict keyed by block device name (e.g. 'nvme0n1') listing reasons it's in use.
+
+    Checks for: partitions with filesystem/mount, mdadm RAID membership,
+    LVM physical volumes, LUKS encryption, direct mounts.
+    Uses `lsblk -J` so a single SSH call covers all devices at once.
+    """
+    usage = {}
+    try:
+        res = executor.run(
+            ['lsblk', '-J', '-o', 'NAME,TYPE,FSTYPE,MOUNTPOINT'],
+            capture_output=True, text=True,
+        )
+        if res.returncode != 0:
+            return usage
+
+        data = json.loads(res.stdout)
+
+        def _scan(node, reasons):
+            """Recursively inspect a lsblk node and its children for usage indicators."""
+            ctype  = node.get('type', '')
+            fstype = node.get('fstype') or ''
+            mount  = node.get('mountpoint') or ''
+
+            if fstype == 'linux_raid_member':
+                reasons.append('mdadm RAID member')
+            elif 'raid' in ctype.lower():
+                reasons.append('mdadm RAID')
+
+            if ctype == 'lvm' or 'lvm2' in fstype.lower():
+                reasons.append('LVM physical volume')
+
+            if 'crypt' in ctype:
+                reasons.append('LUKS encrypted')
+
+            if mount:
+                reasons.append(f'mounted at {mount}')
+            elif fstype and ctype == 'part' and fstype not in ('', 'swap'):
+                reasons.append(f'partition ({fstype})')
+            elif ctype == 'part' and not fstype and not mount:
+                reasons.append('partition exists')
+
+            for child in node.get('children') or []:
+                _scan(child, reasons)
+
+        for blkdev in data.get('blockdevices', []):
+            name = blkdev.get('name', '')
+            if not name.startswith('nvme'):
+                continue
+            reasons = []
+            # Check device-level mount/fs (raw device without partitions)
+            top_fstype = blkdev.get('fstype') or ''
+            top_mount  = blkdev.get('mountpoint') or ''
+            if top_mount:
+                reasons.append(f'mounted at {top_mount}')
+            if top_fstype == 'linux_raid_member':
+                reasons.append('mdadm RAID member')
+            elif top_fstype and top_fstype not in ('', 'NVMe'):
+                reasons.append(f'filesystem: {top_fstype}')
+
+            for child in blkdev.get('children') or []:
+                _scan(child, reasons)
+
+            if reasons:
+                # Deduplicate while preserving order
+                seen = set()
+                deduped = []
+                for r in reasons:
+                    if r not in seen:
+                        seen.add(r)
+                        deduped.append(r)
+                usage[name] = deduped
+
+    except Exception as e:
+        logger.debug("Device usage check failed: %s", e)
+    return usage
 
 
 def _collect_gpu_perf(executor):
@@ -1243,9 +1354,15 @@ def get_system_info():
 
         # Augment each NVMe device with PCIe link speed/width from sysfs
         pcie_map = _collect_nvme_pcie_info(executor)
+        # Augment each NVMe device with other-controller usage info
+        usage_map = _collect_device_usage(executor)
         for dev in nvme_info:
             dev_name = Path(dev.get('DevPath', '')).name  # e.g. "nvme0n1"
             dev.update(pcie_map.get(dev_name, {}))
+            reasons = usage_map.get(dev_name)
+            if reasons:
+                dev['in_use'] = True
+                dev['use_reasons'] = reasons
 
         # Get Controller info via graidctl
         controller_info = []
