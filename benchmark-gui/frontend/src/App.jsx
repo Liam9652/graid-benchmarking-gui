@@ -1,16 +1,13 @@
 import React, { useState, useEffect } from 'react';
-import axios from 'axios';
 import html2canvas from 'html2canvas';
 import './App.css';
-import io from 'socket.io-client';
 import RealTimeDashboard from './components/RealTimeDashboard';
 import ComparisonDashboard from './components/ComparisonDashboard';
 import TheoreticalCalculator from './components/TheoreticalCalculator';
 import HelpButton from './components/HelpButton';
 import PrintReport from './components/PrintReport';
 import { helpContent } from './utils/helpContent';
-
-const API_BASE_URL = `http://${window.location.hostname}:50071`;
+import { API_BASE_URL, apiClient, apiFetch, apiUrl, createSocketClient, getApiKey, setApiKey } from './api';
 
 const HIDDEN_PARAMS = [
   'storcli_command',
@@ -80,11 +77,18 @@ const validateConfig = (cfg) => {
 };
 
 function App() {
+  const sanitizeConfigForPersistence = (cfg) => {
+    if (!cfg || typeof cfg !== 'object') return {};
+    const next = { ...cfg };
+    delete next.DUT_PASSWORD;
+    return next;
+  };
+
   const [activeTab, setActiveTab] = useState(localStorage.getItem('activeTab') || 'config');
   const [activeViewMode, setActiveViewMode] = useState('chart'); // Lifted state
   const [config, setConfig] = useState(() => {
     const savedConfig = localStorage.getItem('configDraft');
-    return savedConfig ? JSON.parse(savedConfig) : {};
+    return savedConfig ? sanitizeConfigForPersistence(JSON.parse(savedConfig)) : {};
   });
   const [configRef, setConfigRef] = useState(config); // Ref to access latest config in callbacks (Use state for reactivity if needed, or useRef)
   const configRefObj = React.useRef(config); // Renamed to avoid confusion with useState
@@ -112,6 +116,9 @@ function App() {
   const [advancedLogs, setAdvancedLogs] = useState([]);
   const [showAdvancedLog, setShowAdvancedLog] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
+  const [activeRunId, setActiveRunId] = useState(() => localStorage.getItem('activeRunId') || '');
+  const [apiKeyInput, setApiKeyInput] = useState(() => getApiKey());
+  const [socketAuthVersion, setSocketAuthVersion] = useState(0);
   const [galleryFilters, setGalleryFilters] = useState({ raid: 'All', status: 'All', type: 'All' });
   const [fioStatus, setFioStatus] = useState("");
   // { device: string, timestamp: string }[] — cleared when benchmark ends
@@ -122,6 +129,7 @@ function App() {
   });
   const logEndRef = React.useRef(null);
   const [nvmeSortConfig, setNvmeSortConfig] = useState({ key: 'DevPath', direction: 'asc' });
+  const hasApiKey = Boolean((apiKeyInput || '').trim());
 
   const sortedNvmeInfo = React.useMemo(() => {
     if (!systemInfo.nvme_info) return [];
@@ -157,6 +165,13 @@ function App() {
     }));
   };
 
+  const handleSaveApiKey = () => {
+    setApiKey(apiKeyInput);
+    setSocketAuthVersion(prev => prev + 1);
+    setStatus(apiKeyInput.trim() ? '🔐 API key saved for this browser.' : '🔓 API key cleared.');
+    setTimeout(() => setStatus(''), 3000);
+  };
+
   const SortButton = ({ columnKey, currentConfig }) => {
     const isActive = currentConfig.key === columnKey;
     return (
@@ -182,10 +197,11 @@ function App() {
 
   const loadConfig = async () => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/api/config`);
+      const response = await apiClient.get(apiUrl('/api/config'));
       if (response.data.success) {
-        setConfig(response.data.data);
-        configRefObj.current = response.data.data; // Sync ref
+        const safeConfig = sanitizeConfigForPersistence(response.data.data);
+        setConfig(safeConfig);
+        configRefObj.current = safeConfig; // Sync ref
         setError('');
       }
     } catch (err) {
@@ -196,7 +212,7 @@ function App() {
   const loadSystemInfo = async (cfg = null) => {
     try {
       const currentCfg = cfg || configRefObj.current;
-      const response = await axios.post(`${API_BASE_URL}/api/system-info`, {
+      const response = await apiClient.post(apiUrl('/api/system-info'), {
         config: currentCfg
       });
       if (response.data.success) {
@@ -210,7 +226,7 @@ function App() {
   const loadLicenseInfo = async (cfg = null) => {
     try {
       const currentCfg = cfg || configRefObj.current;
-      const response = await axios.post(`${API_BASE_URL}/api/license-info`, {
+      const response = await apiClient.post(apiUrl('/api/license-info'), {
         config: currentCfg
       });
       if (response.data.success) {
@@ -223,7 +239,7 @@ function App() {
 
   const fetchLogs = async () => {
     try {
-      const res = await axios.get(`${API_BASE_URL}/api/benchmark/logs`);
+      const res = await apiClient.get(apiUrl('/api/benchmark/logs'));
       if (res.data.success) {
         setAdvancedLogs(res.data.logs);
       }
@@ -234,9 +250,12 @@ function App() {
 
   const checkBenchmarkStatus = async () => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/api/benchmark/status`);
+      const response = await apiClient.get(apiUrl('/api/benchmark/status'));
       if (response.data.success && response.data.data.running) {
         setBenchmarkRunning(true);
+        if (response.data.data.run_id) {
+          setActiveRunId(response.data.data.run_id);
+        }
 
         // Restore progress if available
         if (response.data.data.progress) {
@@ -343,11 +362,12 @@ function App() {
         setShowAdvancedLog(previousShowLog);
       }
 
-      const response = await axios.post(`${API_BASE_URL}/api/benchmark/save_snapshot`, {
+      const response = await apiClient.post(apiUrl('/api/benchmark/save_snapshot'), {
         image: imgData,
         test_name: data.test_name,
         output_dir: data.output_dir,
-        session_id: data.session_id || 'default'
+        session_id: data.session_id || 'default',
+        run_id: data.run_id || activeRunId || undefined
       });
 
       if (response.data.success) {
@@ -469,7 +489,7 @@ function App() {
   }, [handleSnapshot]);
 
   useEffect(() => {
-    const newSocket = io(API_BASE_URL);
+    const newSocket = createSocketClient();
     setSocket(newSocket);
 
     newSocket.on('connect', () => {
@@ -478,13 +498,21 @@ function App() {
       newSocket.emit('join_session', { session_id: sessionId });
     });
 
+    newSocket.on('connect_error', (err) => {
+      setError(`🔐 ${err?.message || 'Socket connection failed. Check the API key and allowed origin settings.'}`);
+    });
+
     newSocket.on('status', (data) => {
       setStatus(`[${data.timestamp}] ${data.message}`);
+      if (data.run_id) {
+        setActiveRunId(data.run_id);
+      }
       if (data.status === 'completed' || data.status === 'failed') {
         setBenchmarkRunning(false);
         setCurrentStage(null);
         currentStageRef.current = null;
         setStuckDevices([]);
+        setActiveRunId('');
       } else if (data.status === 'started') {
         setBenchmarkRunning(true);
         setCurrentStage({ stage: 'INIT', label: 'Initializing...' });
@@ -556,7 +584,7 @@ function App() {
 
     const fetchLogs = async () => {
       try {
-        const res = await axios.get(`${API_BASE_URL}/api/benchmark/logs`);
+        const res = await apiClient.get(apiUrl('/api/benchmark/logs'));
         if (res.data.success) {
           setAdvancedLogs(res.data.logs);
         }
@@ -581,7 +609,7 @@ function App() {
     init();
 
     return () => newSocket.close();
-  }, []);
+  }, [socketAuthVersion]);
 
   // Save activeTab to localStorage
   useEffect(() => {
@@ -591,9 +619,28 @@ function App() {
   // Save config draft to localStorage
   useEffect(() => {
     if (Object.keys(config).length > 0) {
-      localStorage.setItem('configDraft', JSON.stringify(config));
+      localStorage.setItem('configDraft', JSON.stringify(sanitizeConfigForPersistence(config)));
     }
   }, [config]);
+
+  useEffect(() => {
+    if (activeRunId) {
+      localStorage.setItem('activeRunId', activeRunId);
+    } else {
+      localStorage.removeItem('activeRunId');
+    }
+  }, [activeRunId]);
+
+  useEffect(() => {
+    const onAuthError = (event) => {
+      const message = event.detail?.message || 'Protected action failed. Configure the API key and try again.';
+      setError(`🔐 ${message}`);
+      setActiveTab('config');
+    };
+
+    window.addEventListener('benchmark-auth-error', onAuthError);
+    return () => window.removeEventListener('benchmark-auth-error', onAuthError);
+  }, []);
 
   // Effect to load system info once config is loaded if we have connection success
   useEffect(() => {
@@ -691,12 +738,13 @@ function App() {
 
     try {
       setAdvancedLogs([]); // Clear logs when starting
-      const response = await axios.post(`${API_BASE_URL}/api/benchmark/start`, {
+      const response = await apiClient.post(apiUrl('/api/benchmark/start'), {
         config: processedConfig
       });
       if (response.data.success) {
         setStatus('✅ Benchmark started');
         setBenchmarkRunning(true);
+        setActiveRunId(response.data.data?.run_id || '');
         setError('');
         setValidationErrors([]);
       }
@@ -708,10 +756,13 @@ function App() {
 
   const handleStopTest = async () => {
     try {
-      const response = await axios.post(`${API_BASE_URL}/api/benchmark/stop`);
+      const response = await apiClient.post(apiUrl('/api/benchmark/stop'), {
+        run_id: activeRunId || undefined
+      });
       if (response.data.success) {
         setStatus('⏹️ Benchmark stopped');
         setBenchmarkRunning(false);
+        setActiveRunId('');
       }
     } catch (err) {
       setError('❌ Stopping benchmark failed: ' + err.message);
@@ -721,7 +772,7 @@ function App() {
   const handleTestConnection = async () => {
     try {
       setConnectionStatus({ loading: true, success: null, message: '' });
-      const response = await fetch(`${API_BASE_URL}/api/benchmark/test-connection`, {
+      const response = await apiFetch('/api/benchmark/test-connection', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ config })
@@ -753,7 +804,7 @@ function App() {
   const handleSetupDUT = async () => {
     try {
       setConnectionStatus(prev => ({ ...prev, loading: true, message: 'Installing dependencies on DUT...' }));
-      const response = await fetch(`${API_BASE_URL}/api/benchmark/setup-dut`, {
+      const response = await apiFetch('/api/benchmark/setup-dut', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ config })
@@ -784,7 +835,7 @@ function App() {
 
   const loadResults = async () => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/api/results`);
+      const response = await apiClient.get(apiUrl('/api/results'));
       if (response.data.success) {
         setResults(response.data.data);
       }
@@ -926,7 +977,7 @@ function App() {
     }
 
     try {
-      const response = await axios.post(`${API_BASE_URL}/api/config`, processed);
+      const response = await apiClient.post(apiUrl('/api/config'), processed);
       if (response.data.success) {
         setConfig(processed);
         configRef.current = processed; // Sync ref
@@ -944,7 +995,7 @@ function App() {
     try {
       setStatus('🔍 Checking Graid resources...');
       // Use POST to pass current config (including unsaved remote settings)
-      const checkRes = await axios.post(`${API_BASE_URL}/api/graid/check`, {
+      const checkRes = await apiClient.post(apiUrl('/api/graid/check'), {
         config: config
       });
 
@@ -965,7 +1016,7 @@ function App() {
         if (confirmReset) {
           setIsResetting(true); // Set resetting state to true
           setStatus('♻️ Resetting Graid resources...');
-          const resetRes = await axios.post(`${API_BASE_URL}/api/graid/reset`, {
+          const resetRes = await apiClient.post(apiUrl('/api/graid/reset'), {
             config: config
           });
           if (resetRes.data.success) {
@@ -1006,10 +1057,10 @@ function App() {
 
     try {
       const [res1, res2, resImg, resInfo] = await Promise.all([
-        axios.get(`${API_BASE_URL}/api/results/${resultName}/data?type=baseline`),
-        axios.get(`${API_BASE_URL}/api/results/${resultName}/data?type=graid`),
-        axios.get(`${API_BASE_URL}/api/results/${resultName}/images`),
-        axios.get(`${API_BASE_URL}/api/results/${resultName}/info`)
+        apiClient.get(apiUrl(`/api/results/${resultName}/data?type=baseline`)),
+        apiClient.get(apiUrl(`/api/results/${resultName}/data?type=graid`)),
+        apiClient.get(apiUrl(`/api/results/${resultName}/images`)),
+        apiClient.get(apiUrl(`/api/results/${resultName}/info`))
       ]);
 
       if (resImg.data.success) {
@@ -1077,6 +1128,9 @@ function App() {
       <header className="app-header">
         <h1>🚀 SupremeRAID Benchmark Web GUI</h1>
         <div className="header-controls">
+          <div className="api-key-badge" title={hasApiKey ? 'API key is configured for protected actions.' : 'Protected actions may fail until an API key is configured.'}>
+            {hasApiKey ? '🔐 API Key Ready' : '🔓 No API Key'}
+          </div>
           <div className="header-status">
             {benchmarkRunning ? (
               <span className="status-running">● Running</span>
@@ -1208,6 +1262,44 @@ function App() {
               })()}
 
               <div className="config-form">
+                <div className="config-section">
+                  <h3>🔐 API Access</h3>
+                  <p className="section-desc">Protected actions use an API key stored in this browser only. It is not written into the benchmark config.</p>
+                  {!hasApiKey && (
+                    <div className="connection-message error" style={{ marginBottom: '12px' }}>
+                      Protected actions such as save, connect, setup, start, stop, reset, and snapshot will fail until an API key is configured.
+                    </div>
+                  )}
+                  <div className="remote-setup-grid grid-2-cols api-key-panel">
+                    <div className="form-group">
+                      <label>API Key:</label>
+                      <input
+                        type="password"
+                        placeholder="Paste BENCHMARK_API_KEY"
+                        value={apiKeyInput}
+                        onChange={(e) => setApiKeyInput(e.target.value)}
+                      />
+                    </div>
+                    <div className="form-group api-key-actions">
+                      <button className="btn btn-primary" onClick={handleSaveApiKey}>
+                        {hasApiKey ? '💾 Update API Key' : '💾 Save API Key'}
+                      </button>
+                      <button
+                        className="btn btn-secondary"
+                        onClick={() => {
+                          setApiKeyInput('');
+                          setApiKey('');
+                          setSocketAuthVersion(prev => prev + 1);
+                          setStatus('🔓 API key cleared.');
+                          setTimeout(() => setStatus(''), 3000);
+                        }}
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
                 {/* 0. Target Machine Setup */}
                 <div className="config-section">
                   <h3>🖥️ Target Machine Setup</h3>
@@ -1934,7 +2026,7 @@ function App() {
                     <div style={{ display: 'flex', gap: '8px' }}>
                       <button
                         className="btn btn-success"
-                        onClick={() => window.open(`${API_BASE_URL}/api/results/${selectedResults[0]}/download`, '_blank')}
+                        onClick={() => window.open(apiUrl(`/api/results/${selectedResults[0]}/download`), '_blank')}
                         title="Download full result archive (.tar)"
                       >
                         ⬇️ Download

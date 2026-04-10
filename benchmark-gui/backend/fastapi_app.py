@@ -1,140 +1,119 @@
 #!/usr/bin/env python3
-"""GRAID Benchmark Web GUI — FastAPI backend
-
-Provides the same REST API as app.py with:
-  • Auto-generated OpenAPI docs at /docs and /redoc
-  • Pydantic request / response validation
-  • Socket.IO real-time events (python-socketio ASGI mode)
-  • Optional API-key authentication (BENCHMARK_API_KEY env var)
-
-Run with uvicorn:
-    uvicorn fastapi_app:combined_app --host 0.0.0.0 --port 50073 --reload
-"""
+"""GRAID Benchmark Web GUI — FastAPI backend."""
 
 from __future__ import annotations
 
 import base64
+import csv
+import io
 import json
 import logging
 import os
+import re
+import tarfile
+import tempfile
 import threading
 import time
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import psutil
 import socketio
-from fastapi import Depends, FastAPI, HTTPException, Security, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field
 
-# ---------------------------------------------------------------------------
-# Re-use the core business logic from the Flask app (no Flask objects imported)
-# ---------------------------------------------------------------------------
 from app import (
     BASE_DIR,
+    CACHE_DIR,
     LOGS_DIR,
     RESULTS_DIR,
-    BenchmarkManager,
     BenchmarkState,
     ConfigManager,
     RemoteExecutor,
+    _collect_device_usage,
     _collect_gpu_perf,
     _collect_nvme_pcie_info,
+    _extract_raid_from_cmd_dir,
+    audit_event,
     benchmark_manager,
+    generate_run_id,
     parse_graidctl_json,
-    strip_ansi,
+    public_config,
+    sanitize_config,
 )
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+
 logger = logging.getLogger("fastapi-benchmark")
 
-# ---------------------------------------------------------------------------
-# Socket.IO (async ASGI mode)
-# ---------------------------------------------------------------------------
-sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
-
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
 app = FastAPI(
     title="GRAID Benchmark GUI API",
     description=(
-        "REST API for the GRAID Benchmark Web GUI.  "
-        "Provides device configuration, benchmark control, result browsing, "
-        "and real-time status via Socket.IO.\n\n"
-        "Set the `BENCHMARK_API_KEY` environment variable to enable API-key "
-        "authentication for mutating endpoints."
+        "REST API for the GRAID Benchmark Web GUI. "
+        "Provides configuration, benchmark control, results browsing, "
+        "and real-time status via Socket.IO."
     ),
-    version="1.0.0",
+    version="1.1.0",
     contact={"name": "GRAID Technology"},
     license_info={"name": "Proprietary"},
 )
 
+_API_KEY: str | None = os.environ.get("BENCHMARK_API_KEY")
+_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        "BENCHMARK_ALLOWED_ORIGINS",
+        "http://localhost:50072,http://127.0.0.1:50072,http://localhost:3000,http://127.0.0.1:3000",
+    ).split(",")
+    if origin.strip()
+]
+
+app.user_middleware.clear()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_ALLOWED_ORIGINS or ["http://localhost:50072"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-API-Key", "X-Request-ID"],
 )
 
-# Combine FastAPI + Socket.IO into a single ASGI app
+sio = socketio.AsyncServer(
+    async_mode="asgi",
+    cors_allowed_origins=_ALLOWED_ORIGINS or ["http://localhost:50072"],
+)
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
 combined_app = socketio.ASGIApp(sio, app)
 
-# ---------------------------------------------------------------------------
-# API-key authentication
-# ---------------------------------------------------------------------------
-_API_KEY: str | None = os.environ.get("BENCHMARK_API_KEY")
-_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+MAX_SNAPSHOT_BYTES = 12 * 1024 * 1024
+SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
 
 
 def require_api_key(key: str | None = Security(_api_key_header)) -> None:
-    """FastAPI dependency — validates X-API-Key header when env var is set."""
     if _API_KEY and key != _API_KEY:
+        audit_event("auth.failed", request_id=current_request_id(), reason="invalid_or_missing_api_key")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing API key",
         )
 
 
-# ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
-
-class ConfigPayload(BaseModel):
-    """Benchmark configuration (mirrors graid-bench.conf keys)."""
-    DUT_IP: Optional[str] = None
-    DUT_PASSWORD: Optional[str] = None
-    DUT_USER: Optional[str] = "root"
-    DUT_PORT: Optional[int] = 22
-    REMOTE_MODE: bool = False
-    NVME_LIST: List[str] = Field(default_factory=list)
-    NVME_INFO: Optional[str] = None
-    RAID_TYPE: List[str] = Field(default_factory=list)
-    RAID_CTRLR: Optional[str] = None
-    VD_NAME: Optional[str] = None
-    PD_RUNTIME: int = 60
-    VD_RUNTIME: int = 60
-    RUN_PD: bool = True
-    RUN_PD_ALL: bool = True
-    RUN_VD: bool = True
-    RUN_MD: bool = False
-    QUICK_TEST: bool = False
-    FIO_BLOCK_SIZES: List[str] = Field(default_factory=list)
-    FIO_MODES: List[str] = Field(default_factory=list)
-    FIO_IODEPTH: List[str] = Field(default_factory=list)
-    FIO_NUMJOBS: List[str] = Field(default_factory=list)
-    FIO_RWMIX: List[str] = Field(default_factory=list)
-    FIO_EXTRA_OPTS: Optional[str] = None
-    USE_BENCH_FIO: bool = True
-
-    class Config:
-        extra = "allow"  # allow unknown keys for forwards-compatibility
+def require_socket_api_key(environ: Dict[str, Any], auth: Optional[Dict[str, Any]] = None) -> None:
+    if not _API_KEY:
+        return
+    candidate = None
+    if isinstance(auth, dict):
+        candidate = auth.get("apiKey")
+    if not candidate:
+        header_value = environ.get("HTTP_X_API_KEY")
+        candidate = header_value
+    if candidate != _API_KEY:
+        audit_event("socket.auth_failed", reason="invalid_or_missing_api_key")
+        raise ConnectionRefusedError("Invalid or missing API key")
 
 
 class ConnectionTestRequest(BaseModel):
@@ -147,7 +126,7 @@ class StartBenchmarkRequest(BaseModel):
 
 
 class StopBenchmarkRequest(BaseModel):
-    session_id: str = "default"
+    run_id: Optional[str] = None
 
 
 class SystemInfoRequest(BaseModel):
@@ -159,19 +138,17 @@ class GraidResetRequest(BaseModel):
 
 
 class SnapshotRequest(BaseModel):
+    run_id: Optional[str] = None
     test_name: str
     output_dir: Optional[str] = None
 
 
 class SaveSnapshotRequest(BaseModel):
-    image: str  # base64-encoded PNG
+    run_id: Optional[str] = None
+    image: str
     test_name: str
     output_dir: Optional[str] = None
 
-
-# ---------------------------------------------------------------------------
-# Helper — unified JSON response
-# ---------------------------------------------------------------------------
 
 def ok(data: Any = None, message: str = "OK") -> Dict[str, Any]:
     payload: Dict[str, Any] = {"success": True, "message": message}
@@ -184,236 +161,543 @@ def err(msg: str, status_code: int = 500) -> None:
     raise HTTPException(status_code=status_code, detail={"success": False, "error": msg})
 
 
-# ---------------------------------------------------------------------------
-# Config endpoints
-# ---------------------------------------------------------------------------
+def current_request_id() -> str:
+    return request_id_ctx.get()
 
-@app.get(
-    "/api/config",
-    summary="Get current benchmark configuration",
-    tags=["Config"],
-    response_model=Dict[str, Any],
-)
+
+def clean_name(value: str, default: str = "item") -> str:
+    cleaned = SAFE_NAME_RE.sub("_", value.strip()).strip("._-")
+    return cleaned[:160] or default
+
+
+def normalize_relative_path(value: str | None) -> str:
+    if not value:
+        return ""
+    normalized = value.replace("\\", "/")
+    for prefix in ("../results/", "./results/", "./"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+            break
+    normalized = normalized.strip("/")
+    if not normalized:
+        return ""
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    if any(part == ".." for part in parts):
+        err("Invalid path", 400)
+    return "/".join(parts)
+
+
+def require_valid_result_name(result_name: str) -> str:
+    if ".." in result_name or result_name.startswith("/"):
+        err("Invalid result name", 400)
+    return result_name
+
+
+def get_effective_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    persisted = ConfigManager.load_config()
+    merged = dict(persisted)
+    if config:
+        merged.update(config)
+    return merged
+
+
+def resolve_saved_state() -> Optional[Dict[str, Any]]:
+    state = BenchmarkState.load()
+    if not state:
+        return None
+    if benchmark_manager.running:
+        return state
+    run_id = state.get("run_id")
+    if not run_id:
+        return state
+    return state
+
+
+def resolve_active_run_id() -> Optional[str]:
+    if benchmark_manager.active_run_id:
+        return benchmark_manager.active_run_id
+    state = resolve_saved_state()
+    return state.get("run_id") if state else None
+
+
+def clear_runtime_state() -> None:
+    benchmark_manager.running = False
+    benchmark_manager.active_run_id = None
+    benchmark_manager.session_id = None
+    benchmark_manager.runtime_config = None
+
+
+def get_result_target(result_name: str) -> Path:
+    require_valid_result_name(result_name)
+    result_path = RESULTS_DIR / result_name
+    if result_path.exists():
+        return result_path
+    for ext in (".tar", ".tar.gz", ".tgz", ".json"):
+        archive = RESULTS_DIR / f"{result_name}{ext}"
+        if archive.exists():
+            return archive
+    model_result = BASE_DIR / "scripts" / f"{result_name}-result" / result_name
+    if model_result.exists():
+        return model_result
+    err("Result not found", 404)
+
+
+def parse_basic_log(content: str) -> Dict[str, str]:
+    result = {"graid_version": "N/A", "os_info": "N/A", "kernel_version": "N/A"}
+    for line in content.splitlines():
+        line = line.strip()
+        if "graidctl version:" in line:
+            result["graid_version"] = line.split(":", 1)[1].strip()
+        elif line.startswith("OS:"):
+            result["os_info"] = line.split(":", 1)[1].strip().replace('"', "")
+        elif "PRETTY_NAME=" in line:
+            result["os_info"] = line.split("=", 1)[1].strip().replace('"', "")
+        elif line.startswith("Kernel version:"):
+            result["kernel_version"] = line.split(":", 1)[1].strip()
+    return result
+
+
+def get_workload_name(row: Dict[str, str]) -> str:
+    filename_col = row.get("filename", "")
+    if "SingleTest" in filename_col:
+        if "01-seqread" in filename_col:
+            return "1M Sequential Read"
+        if "02-seqwrite" in filename_col:
+            return "1M Sequential Write"
+    if "randrw73" in filename_col:
+        return "4k Random Read/Write Mix(70/30)"
+
+    bs_label = row.get("BlockSize", "")
+    try:
+        bs_float = float(bs_label)
+    except Exception:
+        bs_float = 0.0
+
+    if bs_float == 4.0:
+        size_label = "4k"
+    elif bs_float == 1024.0:
+        size_label = "1M"
+    else:
+        size_label = bs_label or "Unknown"
+
+    row_type = (row.get("Type") or "").lower()
+    type_label = {
+        "randread": "Random Read",
+        "read": "Sequential Read",
+        "randwrite": "Random Write",
+        "write": "Sequential Write",
+    }.get(row_type, row_type or "Unknown")
+    return f"{size_label} {type_label}".strip()
+
+
+def parse_csv_rows(content: str, source_name: str, req_type: Optional[str]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    reader = csv.DictReader(content.splitlines())
+    for row in reader:
+        filename_col = row.get("filename") or row.get("file_name") or source_name
+        if req_type == "baseline":
+            if "SingleTest" not in filename_col and "/PD/" not in source_name.upper():
+                continue
+        elif req_type == "graid":
+            if "RAID" not in filename_col and "/VD/" not in source_name.upper() and "/MD/" not in source_name.upper():
+                continue
+
+        row["Workload"] = row.get("Workload") or get_workload_name(row)
+        row["controller"] = "MDADM" if "graid-mdadm" in filename_col else "SupremeRAID"
+        if not row.get("RAID_type") or row.get("RAID_type") in ("N/A", ""):
+            if req_type == "baseline":
+                row["RAID_type"] = "SingleTest"
+            else:
+                for part in filename_col.split("-"):
+                    if part.startswith("RAID"):
+                        row["RAID_type"] = part
+                        break
+        rows.append(row)
+    return rows
+
+
+def collect_result_rows(result_name: str, req_type: Optional[str]) -> List[Dict[str, Any]]:
+    target = get_result_target(result_name)
+    csv_data: List[Dict[str, Any]] = []
+
+    if target.is_dir():
+        csv_files = list(target.rglob("*.csv"))
+        filtered = csv_files
+        if req_type == "baseline":
+            filtered = [f for f in csv_files if "/PD/" in str(f) or "/pd/" in str(f)]
+        elif req_type == "graid":
+            filtered = [f for f in csv_files if "/VD/" in str(f) or "/vd/" in str(f) or "/MD/" in str(f)]
+
+        target_csvs = [f for f in filtered if "fio-test" in f.name or "diskspd-test" in f.name] or filtered
+        summary_csvs = [f for f in target_csvs if re.search(r"fio-test-r-", f.name)]
+        if summary_csvs:
+            target_csvs = summary_csvs
+
+        for csv_file in target_csvs:
+            try:
+                content = csv_file.read_text(errors="ignore")
+                rows = parse_csv_rows(content, str(csv_file), req_type)
+                for row in rows:
+                    if not row.get("RAID_type") or row.get("RAID_type") in ("N/A", ""):
+                        raid = _extract_raid_from_cmd_dir(csv_file.parent.parent)
+                        if raid:
+                            row["RAID_type"] = raid
+                csv_data.extend(rows)
+            except Exception as exc:
+                logger.warning("Error parsing %s: %s", csv_file, exc)
+    elif target.is_file() and target.name.lower().endswith((".tar", ".tar.gz", ".tgz")):
+        with tarfile.open(target, "r") as tar:
+            members = [
+                member for member in tar.getmembers()
+                if member.name.endswith(".csv") and ("fio-test" in member.name or "diskspd-test" in member.name)
+            ]
+            summary = [m for m in members if "result/fio-test-r-" in m.name]
+            if summary:
+                members = summary
+
+            for member in members:
+                extracted = tar.extractfile(member)
+                if not extracted:
+                    continue
+                try:
+                    content = extracted.read().decode("utf-8", errors="ignore")
+                    csv_data.extend(parse_csv_rows(content, member.name, req_type))
+                except Exception as exc:
+                    logger.warning("Error parsing tar member %s: %s", member.name, exc)
+    else:
+        err("No CSV data found", 404)
+
+    if not csv_data:
+        err("No CSV data found", 404)
+    return csv_data
+
+
+def collect_result_info(result_name: str) -> Dict[str, Any]:
+    target = get_result_target(result_name)
+    info_data: Dict[str, Any] = {}
+    if target.is_dir():
+        info_file = target / "system_info.json"
+        if info_file.exists():
+            try:
+                return json.loads(info_file.read_text())
+            except Exception:
+                pass
+        for log_file in target.rglob("basic.log"):
+            try:
+                info_data = parse_basic_log(log_file.read_text(errors="ignore"))
+                if info_data.get("graid_version") != "N/A":
+                    return info_data
+            except Exception:
+                continue
+        return info_data
+
+    if target.is_file() and target.name.lower().endswith((".tar", ".tar.gz", ".tgz")):
+        with tarfile.open(target, "r") as tar:
+            for member in tar.getmembers():
+                if member.name.endswith("system_info.json"):
+                    extracted = tar.extractfile(member)
+                    if extracted:
+                        return json.load(extracted)
+            for member in tar.getmembers():
+                if member.name.endswith("basic.log"):
+                    extracted = tar.extractfile(member)
+                    if extracted:
+                        return parse_basic_log(extracted.read().decode("utf-8", errors="ignore"))
+    return info_data
+
+
+def parse_image_tags(image_path: str) -> Dict[str, str]:
+    filename = Path(image_path).stem
+    tags = {
+        "category": "VD" if "/VD/" in image_path else "MD" if "/MD/" in image_path else "PD" if "/PD/" in image_path else "Other",
+        "raid": "Unknown",
+        "workload": "Unknown",
+        "bs": "Unknown",
+        "status": "Normal",
+    }
+    for part in filename.split("-"):
+        if part.startswith("RAID"):
+            tags["raid"] = part.replace("RAID", "RAID ")
+    if "Rebuild" in filename:
+        tags["status"] = "Rebuild"
+    if "seqwrite" in filename:
+        tags["workload"] = "Seq Write"
+    elif "seqread" in filename:
+        tags["workload"] = "Seq Read"
+    elif "randread" in filename:
+        tags["workload"] = "Rand Read"
+    elif "randwrite" in filename:
+        tags["workload"] = "Rand Write"
+    elif "randrw73" in filename:
+        tags["workload"] = "Mix(70/30)"
+
+    for block_size in ("4k", "8k", "16k", "32k", "64k", "128k", "256k", "512k", "1m", "2m", "4m"):
+        if f"-{block_size}-" in filename or filename.endswith(f"-{block_size}") or f"_{block_size}_" in filename:
+            tags["bs"] = block_size.upper()
+            break
+    if tags["category"] == "PD":
+        tags["raid"] = "BASELINE"
+    return tags
+
+
+def collect_result_images(result_name: str) -> List[Dict[str, Any]]:
+    target = get_result_target(result_name)
+    images: List[Dict[str, Any]] = []
+    if target.is_dir():
+        for image in target.rglob("*"):
+            if image.is_file() and image.suffix.lower() in (".png", ".jpg", ".jpeg") and "report_view" in str(image):
+                rel_path = str(image.relative_to(RESULTS_DIR if str(image).startswith(str(RESULTS_DIR)) else BASE_DIR))
+                images.append({
+                    "name": image.name,
+                    "url": f"/api/result-files/{rel_path}",
+                    "tags": parse_image_tags(str(image)),
+                })
+    elif target.is_file() and target.name.lower().endswith((".tar", ".tar.gz", ".tgz")):
+        cache_dir = CACHE_DIR / clean_name(result_name)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(target, "r") as tar:
+            for member in tar.getmembers():
+                if member.isfile() and member.name.lower().endswith((".png", ".jpg", ".jpeg")) and "report_view" in member.name:
+                    cache_name = clean_name(member.name.replace("/", "_"), "image")
+                    cache_file = cache_dir / cache_name
+                    if not cache_file.exists():
+                        extracted = tar.extractfile(member)
+                        if extracted:
+                            cache_file.write_bytes(extracted.read())
+                    images.append({
+                        "name": cache_name,
+                        "url": f"/api/result-files/.cache/{cache_dir.name}/{cache_name}",
+                        "tags": parse_image_tags(member.name),
+                    })
+    return images
+
+
+def list_result_entries() -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    if not RESULTS_DIR.exists():
+        return results
+    for item in RESULTS_DIR.iterdir():
+        if item.name.startswith("."):
+            continue
+        if item.is_file() and item.name.lower().endswith((".tar", ".tar.gz", ".tgz", ".json")):
+            results.append({
+                "name": item.name,
+                "type": "archive",
+                "created": datetime.fromtimestamp(item.stat().st_mtime).isoformat(),
+                "size": item.stat().st_size,
+            })
+        elif item.is_dir():
+            has_csv = any(item.rglob("*.csv"))
+            is_result_folder = item.name.endswith("-result")
+            if has_csv or is_result_folder:
+                results.append({
+                    "name": item.name,
+                    "type": "folder",
+                    "created": datetime.fromtimestamp(item.stat().st_mtime).isoformat(),
+                    "files": [],
+                })
+    results.sort(key=lambda entry: entry["created"], reverse=True)
+    return results
+
+
+@app.get("/api/config", tags=["Config"])
 def get_config():
-    """Return the current graid-bench.conf as JSON."""
+    config = ConfigManager.load_config()
+    return ok(sanitize_config(config))
+
+
+@app.middleware("http")
+async def audit_requests(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or generate_run_id()
+    token = request_id_ctx.set(request_id)
+    start = time.time()
+    response = None
     try:
-        return ok(ConfigManager.load_config())
-    except Exception as e:
-        err(str(e))
+        response = await call_next(request)
+        return response
+    except HTTPException as exc:
+        audit_event(
+            "http.error",
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            status_code=exc.status_code,
+            client=request.client.host if request.client else None,
+        )
+        detail = exc.detail
+        if isinstance(detail, dict):
+            return JSONResponse(status_code=exc.status_code, content=detail)
+        return JSONResponse(status_code=exc.status_code, content={"success": False, "error": str(detail)})
+    except Exception as exc:
+        audit_event(
+            "http.exception",
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            error=str(exc),
+            client=request.client.host if request.client else None,
+        )
+        return JSONResponse(status_code=500, content={"success": False, "error": "Internal server error"})
+    finally:
+        duration_ms = round((time.time() - start) * 1000, 2)
+        if response is not None:
+            response.headers["X-Request-ID"] = request_id
+            if request.method != "GET" or request.url.path.startswith("/api/benchmark") or request.url.path.startswith("/api/graid"):
+                audit_event(
+                    "http.request",
+                    request_id=request_id,
+                    method=request.method,
+                    path=request.url.path,
+                    status_code=response.status_code,
+                    duration_ms=duration_ms,
+                    client=request.client.host if request.client else None,
+                )
+        request_id_ctx.reset(token)
 
 
-@app.post(
-    "/api/config",
-    summary="Update benchmark configuration",
-    tags=["Config"],
-    response_model=Dict[str, Any],
-    dependencies=[Depends(require_api_key)],
-)
+@app.post("/api/config", tags=["Config"], dependencies=[Depends(require_api_key)])
 def update_config(payload: Dict[str, Any]):
-    """Persist new configuration to graid-bench.conf.
-
-    Send a partial or full config dict.  Unknown keys are stored as-is.
-    """
-    try:
-        ConfigManager.save_config(payload)
-        return ok(message="Config updated")
-    except Exception as e:
-        err(str(e))
+    ConfigManager.save_config(payload)
+    audit_event("config.update", config=public_config(payload))
+    return ok(sanitize_config(ConfigManager.load_config()), message="Config updated")
 
 
-# ---------------------------------------------------------------------------
-# System-info endpoint
-# ---------------------------------------------------------------------------
-
-@app.get(
-    "/api/system-info",
-    summary="Collect hardware inventory and PCIe / GPU status",
-    tags=["System"],
-    response_model=Dict[str, Any],
-)
-@app.post(
-    "/api/system-info",
-    summary="Collect hardware inventory (with custom config)",
-    tags=["System"],
-    response_model=Dict[str, Any],
-)
+@app.get("/api/system-info", tags=["System"])
+@app.post("/api/system-info", tags=["System"])
 def get_system_info(body: Optional[SystemInfoRequest] = None):
-    """
-    Returns CPU, memory, NVMe device list (with PCIe link info), RAID
-    controller info, and GPU performance state.
+    cpu_count = psutil.cpu_count(logical=False)
+    cpu_freq = psutil.cpu_freq()
+    memory = psutil.virtual_memory()
+    config = get_effective_config(body.config if body else None)
+    executor = RemoteExecutor(config)
 
-    POST with `{"config": {...}}` to query a remote DUT.
-    """
+    nvme_info: List[Dict[str, Any]] = []
     try:
-        cpu_count = psutil.cpu_count(logical=False)
-        cpu_freq = psutil.cpu_freq()
-        memory = psutil.virtual_memory()
-
-        config = (body.config if body and body.config else None) or ConfigManager.load_config()
-        executor = RemoteExecutor(config)
-
-        # NVMe devices
-        nvme_info: List[Dict] = []
-        try:
-            res = executor.run(["graidctl", "ls", "nd", "--format", "json"], capture_output=True, text=True)
-            if res.returncode == 0:
-                start = res.stdout.find("{")
-                if start != -1:
-                    nvme_info = json.loads(res.stdout[start:]).get("Result", [])
-        except Exception as e:
-            logger.warning("graidctl nd failed: %s", e)
-
-        # Augment with PCIe link data
-        pcie_map = _collect_nvme_pcie_info(executor)
-        for dev in nvme_info:
-            dev_name = Path(dev.get("DevPath", "")).name
-            dev.update(pcie_map.get(dev_name, {}))
-
-        # RAID controller
-        controller_info: List[Dict] = []
-        try:
-            res = executor.run(["graidctl", "ls", "cx", "--format", "json"], capture_output=True, text=True)
-            if res.returncode == 0:
-                start = res.stdout.find("{")
-                if start != -1:
-                    controller_info = json.loads(res.stdout[start:]).get("Result", [])
-        except Exception as e:
-            logger.warning("graidctl cx failed: %s", e)
-
-        # GPU performance state
-        gpu_perf = _collect_gpu_perf(executor)
-
-        # Hostname
-        hostname = "Unknown"
-        try:
-            res = executor.run(["hostname"], capture_output=True, text=True)
-            if res.returncode == 0:
-                hostname = res.stdout.strip()
-        except Exception:
-            pass
-
-        return ok({
-            "cpu_cores": cpu_count,
-            "cpu_freq": cpu_freq.current if cpu_freq else None,
-            "memory_gb": memory.total / (1024 ** 3),
-            "memory_available_gb": memory.available / (1024 ** 3),
-            "nvme_info": nvme_info,
-            "controller_info": controller_info,
-            "gpu_perf": gpu_perf,
-            "hostname": hostname,
-        })
-    except Exception as e:
-        err(str(e))
-
-
-# ---------------------------------------------------------------------------
-# License info
-# ---------------------------------------------------------------------------
-
-@app.get("/api/license-info", summary="Get GRAID license info", tags=["System"])
-@app.post("/api/license-info", summary="Get GRAID license info (remote)", tags=["System"])
-def get_license_info(body: Optional[SystemInfoRequest] = None):
-    try:
-        config = (body.config if body and body.config else None) or ConfigManager.load_config()
-        executor = RemoteExecutor(config)
-        license_info: Dict = {}
-        try:
-            res = executor.run(["graidctl", "desc", "lic", "--format", "json"], capture_output=True, text=True)
-            if res.returncode == 0:
-                start = res.stdout.find("{")
-                if start != -1:
-                    license_info = json.loads(res.stdout[start:]).get("Result", {})
-        except Exception as e:
-            logger.warning("graidctl lic failed: %s", e)
-        return ok(license_info)
-    except Exception as e:
-        err(str(e))
-
-
-# ---------------------------------------------------------------------------
-# Benchmark control
-# ---------------------------------------------------------------------------
-
-@app.post(
-    "/api/benchmark/test-connection",
-    summary="Test DUT SSH connectivity and check dependencies",
-    tags=["Benchmark"],
-    dependencies=[Depends(require_api_key)],
-)
-def test_connection(body: ConnectionTestRequest):
-    try:
-        executor = RemoteExecutor(body.config)
-        res = executor.run(["echo", "success"], capture_output=True, text=True)
+        res = executor.run(["graidctl", "ls", "nd", "--format", "json"], capture_output=True, text=True)
         if res.returncode == 0:
-            dep_results = executor.check_dependencies()
-            missing = [d for d, present in dep_results.items() if not present]
-            msg = "Connection established and permissions verified."
-            if missing:
-                msg += f" Missing dependencies: {', '.join(missing)}."
-            return ok({"dependencies": dep_results}, message=msg)
-        raise HTTPException(status_code=503, detail=f"Connection test failed: {res.stderr}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        err(str(e))
+            start = res.stdout.find("{")
+            if start != -1:
+                nvme_info = json.loads(res.stdout[start:]).get("Result", [])
+    except Exception as exc:
+        logger.warning("graidctl nd failed: %s", exc)
 
+    pcie_map = _collect_nvme_pcie_info(executor)
+    usage_map = _collect_device_usage(executor)
+    for dev in nvme_info:
+        dev_name = Path(dev.get("DevPath", "")).name
+        dev.update(pcie_map.get(dev_name, {}))
+        reasons = usage_map.get(dev_name)
+        if reasons:
+            dev["in_use"] = True
+            dev["use_reasons"] = reasons
 
-@app.post(
-    "/api/benchmark/setup-dut",
-    summary="Install benchmark dependencies on the remote DUT",
-    tags=["Benchmark"],
-    dependencies=[Depends(require_api_key)],
-)
-def setup_dut(body: ConnectionTestRequest):
+    controller_info: List[Dict[str, Any]] = []
     try:
-        executor = RemoteExecutor(body.config)
-        if not executor.is_remote:
-            raise HTTPException(status_code=400, detail="Target is local — no remote setup needed.")
+        res = executor.run(["graidctl", "ls", "cx", "--format", "json"], capture_output=True, text=True)
+        if res.returncode == 0:
+            start = res.stdout.find("{")
+            if start != -1:
+                controller_info = json.loads(res.stdout[start:]).get("Result", [])
+    except Exception as exc:
+        logger.warning("graidctl cx failed: %s", exc)
 
-        setup_script = BASE_DIR / "scripts" / "setup_env.sh"
-        if not setup_script.exists():
-            raise HTTPException(status_code=500, detail=f"Setup script not found: {setup_script}")
+    hostname = "Unknown"
+    try:
+        res = executor.run(["hostname"], capture_output=True, text=True)
+        if res.returncode == 0:
+            hostname = res.stdout.strip()
+    except Exception:
+        pass
 
-        executor.run(["mkdir", "-p", "/tmp/graid-setup"])
-        executor.sync_to_remote(str(setup_script), "/tmp/graid-setup/setup_env.sh")
-        res = executor.run(["bash", "/tmp/graid-setup/setup_env.sh"], capture_output=True, text=True)
-        if res.returncode != 0:
-            raise HTTPException(status_code=500, detail=res.stderr or "Setup script failed")
-        return ok(message="DUT setup complete")
-    except HTTPException:
-        raise
-    except Exception as e:
-        err(str(e))
+    return ok({
+        "cpu_cores": cpu_count,
+        "cpu_freq": cpu_freq.current if cpu_freq else None,
+        "memory_gb": memory.total / (1024 ** 3),
+        "memory_available_gb": memory.available / (1024 ** 3),
+        "nvme_info": nvme_info,
+        "controller_info": controller_info,
+        "gpu_perf": _collect_gpu_perf(executor),
+        "hostname": hostname,
+    })
 
 
-@app.post(
-    "/api/benchmark/start",
-    summary="Start the benchmark run",
-    tags=["Benchmark"],
-    dependencies=[Depends(require_api_key)],
-)
+@app.get("/api/license-info", tags=["System"])
+@app.post("/api/license-info", tags=["System"])
+def get_license_info(body: Optional[SystemInfoRequest] = None):
+    config = get_effective_config(body.config if body else None)
+    executor = RemoteExecutor(config)
+    license_info: Dict[str, Any] = {}
+    try:
+        res = executor.run(["graidctl", "desc", "lic", "--format", "json"], capture_output=True, text=True)
+        if res.returncode == 0:
+            start = res.stdout.find("{")
+            if start != -1:
+                license_info = json.loads(res.stdout[start:]).get("Result", {})
+    except Exception as exc:
+        logger.warning("graidctl lic failed: %s", exc)
+    return ok(license_info)
+
+
+@app.post("/api/benchmark/test-connection", tags=["Benchmark"], dependencies=[Depends(require_api_key)])
+def test_connection(body: ConnectionTestRequest):
+    executor = RemoteExecutor(body.config)
+    res = executor.run(["echo", "success"], capture_output=True, text=True)
+    if res.returncode != 0:
+        err(f"Connection test failed: {res.stderr}", 503)
+    dep_results = executor.check_dependencies()
+    missing = [name for name, present in dep_results.items() if not present]
+    message = "Connection established and permissions verified."
+    if missing:
+        message += f" Missing dependencies: {', '.join(missing)}."
+    audit_event("dut.test_connection", remote=body.config.get("REMOTE_MODE", False), target=body.config.get("DUT_IP"))
+    return ok({"dependencies": dep_results}, message=message)
+
+
+@app.post("/api/benchmark/setup-dut", tags=["Benchmark"], dependencies=[Depends(require_api_key)])
+def setup_dut(body: ConnectionTestRequest):
+    executor = RemoteExecutor(body.config)
+    if not executor.is_remote:
+        err("Target is local — no remote setup needed.", 400)
+
+    setup_script = BASE_DIR / "scripts" / "setup_env.sh"
+    if not setup_script.exists():
+        err(f"Setup script not found: {setup_script}")
+
+    executor.run(["mkdir", "-p", "/tmp/graid-setup"])
+    executor.sync_to_remote(str(setup_script), "/tmp/graid-setup/setup_env.sh")
+    res = executor.run(["bash", "/tmp/graid-setup/setup_env.sh", "--dut-mode"], capture_output=True, text=True)
+    if res.returncode != 0:
+        audit_event("dut.setup_failed", target=body.config.get("DUT_IP"), stderr=res.stderr)
+        err(res.stderr or "Setup script failed")
+    audit_event("dut.setup_complete", target=body.config.get("DUT_IP"))
+    return ok({"details": res.stdout}, message="DUT setup complete")
+
+
+@app.post("/api/benchmark/start", tags=["Benchmark"], dependencies=[Depends(require_api_key)])
 def start_benchmark(body: StartBenchmarkRequest):
     if benchmark_manager.running:
-        raise HTTPException(status_code=409, detail="Another benchmark is already running")
-    try:
-        thread = threading.Thread(
-            target=benchmark_manager.run_benchmark,
-            args=(body.config, body.session_id),
-            daemon=True,
-        )
-        thread.start()
-        return ok(message="Benchmark started")
-    except Exception as e:
-        err(str(e))
+        err("Another benchmark is already running", 409)
+    run_id = generate_run_id()
+    thread = threading.Thread(
+        target=benchmark_manager.run_benchmark,
+        args=(body.config, body.session_id, run_id),
+        daemon=True,
+    )
+    thread.start()
+    audit_event(
+        "benchmark.start",
+        run_id=run_id,
+        session_id=body.session_id,
+        config=public_config(body.config),
+    )
+    return ok({"run_id": run_id}, message="Benchmark started")
 
 
-@app.post(
-    "/api/benchmark/stop",
-    summary="Stop the running benchmark",
-    tags=["Benchmark"],
-    dependencies=[Depends(require_api_key)],
-)
+@app.post("/api/benchmark/stop", tags=["Benchmark"], dependencies=[Depends(require_api_key)])
 def stop_benchmark(body: StopBenchmarkRequest):
+    active_run_id = resolve_active_run_id()
+    if body.run_id and active_run_id and body.run_id != active_run_id:
+        err("Run ID does not match the active benchmark", 409)
     try:
         if benchmark_manager.process and benchmark_manager.running:
             benchmark_manager.process.terminate()
@@ -421,260 +705,200 @@ def stop_benchmark(body: StopBenchmarkRequest):
             if benchmark_manager.process.poll() is None:
                 benchmark_manager.process.kill()
         BenchmarkState.clear()
-        return ok(message="Benchmark stopped")
-    except Exception as e:
-        err(str(e))
+        audit_event("benchmark.stop", run_id=active_run_id)
+        return ok({"run_id": active_run_id}, message="Benchmark stopped")
     finally:
-        benchmark_manager.running = False
+        clear_runtime_state()
 
 
-@app.get(
-    "/api/benchmark/status",
-    summary="Get current benchmark run status",
-    tags=["Benchmark"],
-)
+@app.get("/api/benchmark/status", tags=["Benchmark"])
 def get_benchmark_status():
-    try:
-        state = BenchmarkState.load()
-        return ok({
-            "running": benchmark_manager.running,
-            "progress": benchmark_manager.latest_progress,
-            "stage": benchmark_manager.current_stage_info,
-            "active_state": state,
-        })
-    except Exception as e:
-        err(str(e))
+    saved_state = resolve_saved_state()
+    return ok({
+        "running": benchmark_manager.running,
+        "run_id": resolve_active_run_id(),
+        "progress": benchmark_manager.latest_progress,
+        "stage_info": benchmark_manager.current_stage_info,
+        "session_id": benchmark_manager.session_id or (saved_state or {}).get("session_id"),
+        "active_state": saved_state,
+    })
 
 
-@app.get(
-    "/api/benchmark/logs",
-    summary="Get recent benchmark log lines",
-    tags=["Benchmark"],
-)
-def get_benchmark_logs(lines: int = 100):
-    try:
-        log_file = None
-        if benchmark_manager.process and benchmark_manager.current_log_file:
-            log_file = benchmark_manager.current_log_file
-        if not log_file and LOGS_DIR.exists():
-            logs = sorted(LOGS_DIR.glob("benchmark_*.log"), key=lambda x: x.stat().st_mtime, reverse=True)
-            if logs:
-                log_file = logs[0]
-        if log_file and Path(log_file).exists():
-            content = Path(log_file).read_text().splitlines()
-            return ok({"logs": [l.strip() for l in content[-lines:]], "log_file": str(log_file)})
-        return ok({"logs": [], "log_file": None})
-    except Exception as e:
-        err(str(e))
+@app.get("/api/benchmark/logs", tags=["Benchmark"])
+def get_benchmark_logs(lines: int = Query(default=100, ge=1, le=500)):
+    log_file = benchmark_manager.current_log_file
+    if not log_file and LOGS_DIR.exists():
+        logs = sorted(LOGS_DIR.glob("benchmark_*.log"), key=lambda item: item.stat().st_mtime, reverse=True)
+        if logs:
+            log_file = logs[0]
+    if log_file and Path(log_file).exists():
+        content = Path(log_file).read_text(errors="replace").splitlines()
+        return {"success": True, "logs": [line.strip() for line in content[-lines:]], "log_file": str(log_file)}
+    return {"success": True, "logs": [], "log_file": None}
 
 
-# ---------------------------------------------------------------------------
-# GRAID resource management
-# ---------------------------------------------------------------------------
-
-@app.get(
-    "/api/graid/check",
-    summary="Check for existing GRAID VDs / DGs / PDs",
-    tags=["GRAID"],
-)
-@app.post("/api/graid/check", summary="Check GRAID resources (remote)", tags=["GRAID"])
+@app.post("/api/graid/check", tags=["GRAID"])
 def check_graid_resources(body: Optional[GraidResetRequest] = None):
-    try:
-        config = (body.config if body and body.config else None) or ConfigManager.load_config()
-        executor = RemoteExecutor(config)
-        has_resources = False
-        findings: List[str] = []
-
-        for resource, label in [("vd", "VDs"), ("dg", "DGs"), ("pd", "PDs")]:
-            res = executor.run(["graidctl", "ls", resource, "--format", "json"], capture_output=True, text=True)
-            if res.returncode == 0:
-                items = parse_graidctl_json(res.stdout).get("Result", [])
-                if items:
-                    has_resources = True
-                    findings.append(f"{len(items)} {label}")
-
-        return ok({"has_resources": has_resources, "findings": findings})
-    except Exception as e:
-        err(str(e))
+    config = get_effective_config(body.config if body else None)
+    executor = RemoteExecutor(config)
+    has_resources = False
+    findings: List[str] = []
+    for resource, label in (("vd", "VDs"), ("dg", "DGs"), ("pd", "PDs")):
+        res = executor.run(["graidctl", "ls", resource, "--format", "json"], capture_output=True, text=True)
+        if res.returncode == 0:
+            items = parse_graidctl_json(res.stdout).get("Result", [])
+            if items:
+                has_resources = True
+                findings.append(f"{len(items)} {label}")
+    return {"success": True, "has_resources": has_resources, "findings": findings}
 
 
-@app.post(
-    "/api/graid/reset",
-    summary="Delete all GRAID VDs, DGs, and PDs",
-    tags=["GRAID"],
-    dependencies=[Depends(require_api_key)],
-)
+@app.post("/api/graid/reset", tags=["GRAID"], dependencies=[Depends(require_api_key)])
 def reset_graid_resources(body: Optional[GraidResetRequest] = None):
-    try:
-        config = (body.config if body and body.config else None) or ConfigManager.load_config()
-        executor = RemoteExecutor(config)
-        deleted: List[str] = []
-
-        # Delete VDs first, then DGs, then PDs
-        for cmd_args, label in [
-            (["graidctl", "del", "vd", "--all", "--force"], "VDs"),
-            (["graidctl", "del", "dg", "--all", "--force"], "DGs"),
-            (["graidctl", "del", "pd", "--all", "--force"], "PDs"),
-        ]:
-            res = executor.run(cmd_args, capture_output=True, text=True)
-            if res.returncode == 0:
-                deleted.append(label)
-
-        return ok({"deleted": deleted}, message=f"Deleted: {', '.join(deleted) or 'nothing'}")
-    except Exception as e:
-        err(str(e))
+    if benchmark_manager.running:
+        err("Cannot reset while benchmark is running", 400)
+    config = get_effective_config(body.config if body else None)
+    executor = RemoteExecutor(config)
+    deleted: List[str] = []
+    for cmd_args, label in (
+        (["graidctl", "del", "vd", "--all", "--force"], "VDs"),
+        (["graidctl", "del", "dg", "--all", "--force"], "DGs"),
+        (["graidctl", "del", "pd", "--all", "--force"], "PDs"),
+    ):
+        res = executor.run(cmd_args, capture_output=True, text=True)
+        if res.returncode == 0:
+            deleted.append(label)
+    audit_event("graid.reset", target=config.get("DUT_IP"), deleted=deleted)
+    return ok({"deleted": deleted}, message=f"Deleted: {', '.join(deleted) or 'nothing'}")
 
 
-# ---------------------------------------------------------------------------
-# Results browsing
-# ---------------------------------------------------------------------------
-
-@app.get(
-    "/api/results",
-    summary="List available benchmark result directories",
-    tags=["Results"],
-)
+@app.get("/api/results", tags=["Results"])
 def list_results():
-    try:
-        results = []
-        temp_data = RESULTS_DIR / ".test-temp-data"
-        scan_dirs = [temp_data] if temp_data.exists() else [RESULTS_DIR]
-
-        for scan_dir in scan_dirs:
-            for d in sorted(scan_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
-                if d.is_dir() and not d.name.startswith("."):
-                    results.append({
-                        "name": d.name,
-                        "path": str(d.relative_to(RESULTS_DIR)),
-                        "modified": datetime.fromtimestamp(d.stat().st_mtime).isoformat(),
-                    })
-        return ok(results)
-    except Exception as e:
-        err(str(e))
+    return ok(list_result_entries())
 
 
-@app.get(
-    "/api/results/{result_name}/data",
-    summary="Get parsed benchmark result data",
-    tags=["Results"],
-)
-def get_result_data(result_name: str):
-    """Return structured benchmark metrics for a result directory."""
-    # Security: block path traversal
-    if ".." in result_name or result_name.startswith("/"):
-        raise HTTPException(status_code=400, detail="Invalid result name")
-    try:
-        temp_data = RESULTS_DIR / ".test-temp-data"
-        result_dir = (temp_data / result_name) if (temp_data / result_name).exists() else (RESULTS_DIR / result_name)
-        if not result_dir.exists():
-            raise HTTPException(status_code=404, detail=f"Result '{result_name}' not found")
-
-        # Walk the result tree and collect all JSON data files
-        data: Dict[str, Any] = {"result_name": result_name, "tests": []}
-        for json_file in sorted(result_dir.rglob("*.json")):
-            try:
-                payload = json.loads(json_file.read_text())
-                rel = json_file.relative_to(result_dir)
-                data["tests"].append({"path": str(rel), "data": payload})
-            except Exception:
-                pass
-        return ok(data)
-    except HTTPException:
-        raise
-    except Exception as e:
-        err(str(e))
+@app.get("/api/results/{result_name}/info", tags=["Results"])
+def get_result_info(result_name: str):
+    return ok(collect_result_info(result_name))
 
 
-@app.get(
-    "/api/results/{result_name}/download",
-    summary="Download result directory as .tar.gz",
-    tags=["Results"],
-)
+@app.get("/api/results/{result_name}/data", tags=["Results"])
+def get_result_data(result_name: str, type: Optional[str] = Query(default=None)):
+    return ok(collect_result_rows(result_name, type))
+
+
+@app.get("/api/results/{result_name}/images", tags=["Results"])
+def get_result_images(result_name: str):
+    return {"success": True, "images": collect_result_images(result_name)}
+
+
+@app.post("/api/results/{result_name}/clear-cache", tags=["Results"], dependencies=[Depends(require_api_key)])
+def clear_result_cache(result_name: str):
+    target = CACHE_DIR / clean_name(result_name)
+    if target.exists():
+        import shutil
+
+        shutil.rmtree(target)
+    audit_event("results.clear_cache", result_name=result_name)
+    return ok()
+
+
+@app.get("/api/results/{result_name}/download", tags=["Results"])
 def download_result(result_name: str):
-    if ".." in result_name or result_name.startswith("/"):
-        raise HTTPException(status_code=400, detail="Invalid result name")
-    import tarfile, tempfile
-
-    temp_data = RESULTS_DIR / ".test-temp-data"
-    result_dir = (temp_data / result_name) if (temp_data / result_name).exists() else (RESULTS_DIR / result_name)
-    if not result_dir.exists():
-        raise HTTPException(status_code=404, detail="Result not found")
+    target = get_result_target(result_name)
+    if target.is_file():
+        return FileResponse(target, filename=target.name)
 
     tmp = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)
-    try:
-        with tarfile.open(tmp.name, "w:gz") as tar:
-            tar.add(result_dir, arcname=result_name)
-        return FileResponse(tmp.name, media_type="application/gzip", filename=f"{result_name}.tar.gz")
-    except Exception as e:
-        err(str(e))
+    with tarfile.open(tmp.name, "w:gz") as tar:
+        tar.add(target, arcname=target.name)
+    return FileResponse(tmp.name, media_type="application/gzip", filename=f"{target.name}.tar.gz")
 
 
-# ---------------------------------------------------------------------------
-# Snapshot endpoints (called by frontend chart capture)
-# ---------------------------------------------------------------------------
+@app.get("/api/result-files/{filename:path}", tags=["Results"])
+def get_result_file(filename: str):
+    normalized = normalize_relative_path(filename)
+    candidates = [
+        (RESULTS_DIR / normalized).resolve(),
+        (BASE_DIR / normalized).resolve(),
+        (CACHE_DIR.parent / normalized).resolve(),
+    ]
+    allowed_roots = [RESULTS_DIR.resolve(), CACHE_DIR.resolve(), BASE_DIR.resolve()]
+    target = next((candidate for candidate in candidates if candidate.exists()), None)
+    if target is None:
+        err("Result file not found", 404)
+    if not any(str(target).startswith(str(root)) for root in allowed_roots) or not target.exists():
+        err("Result file not found", 404)
+    return FileResponse(target)
 
-@app.post("/api/benchmark/trigger_snapshot", summary="Request a chart snapshot", tags=["Benchmark"])
+
+@app.post("/api/benchmark/trigger_snapshot", tags=["Benchmark"], dependencies=[Depends(require_api_key)])
 async def trigger_snapshot(body: SnapshotRequest):
-    await sio.emit("snapshot_request", {"test_name": body.test_name, "output_dir": body.output_dir or ""})
+    active_run_id = resolve_active_run_id()
+    if body.run_id and active_run_id and body.run_id != active_run_id:
+        err("Run ID does not match the active benchmark", 409)
+    await sio.emit(
+        "snapshot_request",
+        {
+            "run_id": body.run_id or active_run_id,
+            "test_name": clean_name(body.test_name, "snapshot"),
+            "output_dir": normalize_relative_path(body.output_dir),
+        },
+        room=benchmark_manager.session_id or "default",
+    )
+    audit_event("snapshot.trigger", run_id=body.run_id or active_run_id)
     return ok(message="Snapshot requested")
 
 
-@app.post("/api/benchmark/save_snapshot", summary="Save a base64-encoded chart snapshot", tags=["Benchmark"])
+@app.post("/api/benchmark/save_snapshot", tags=["Benchmark"], dependencies=[Depends(require_api_key)])
 def save_snapshot(body: SaveSnapshotRequest):
-    try:
-        encoded = body.image.split(",", 1)[1] if "," in body.image else body.image
-        image_binary = base64.b64decode(encoded)
+    active_run_id = resolve_active_run_id()
+    if body.run_id and active_run_id and body.run_id != active_run_id:
+        err("Run ID does not match the active benchmark", 409)
 
-        output_dir = body.output_dir or ""
-        if ".." in output_dir:
-            raise HTTPException(status_code=400, detail="Invalid path")
-        for prefix in ("../results/", "./results/", "./"):
-            if output_dir.startswith(prefix):
-                output_dir = output_dir[len(prefix):]
-                break
+    encoded = body.image.split(",", 1)[1] if "," in body.image else body.image
+    image_binary = base64.b64decode(encoded)
+    if len(image_binary) > MAX_SNAPSHOT_BYTES:
+        err("Snapshot too large", 413)
 
-        save_dir = (RESULTS_DIR / output_dir / "report_view") if output_dir else (RESULTS_DIR / "report_view")
-        save_dir.mkdir(parents=True, exist_ok=True)
-        out_path = save_dir / f"{body.test_name}_report_view.png"
-        out_path.write_bytes(image_binary)
-        return ok({"saved_path": str(out_path)}, message="Snapshot saved")
-    except HTTPException:
-        raise
-    except Exception as e:
-        err(str(e))
+    output_dir = normalize_relative_path(body.output_dir)
+    save_dir = (RESULTS_DIR / output_dir / "report_view") if output_dir else (RESULTS_DIR / "report_view")
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = f"{clean_name(body.test_name, 'snapshot')}_report_view.png"
+    out_path = save_dir / filename
+    out_path.write_bytes(image_binary)
+    audit_event("snapshot.save", run_id=body.run_id or active_run_id, path=str(out_path.relative_to(RESULTS_DIR)))
+    return ok({"saved_path": str(out_path)}, message="Snapshot saved")
 
 
-# ---------------------------------------------------------------------------
-# Log file browsing
-# ---------------------------------------------------------------------------
-
-@app.get("/api/logs", summary="List available benchmark log files", tags=["Logs"])
+@app.get("/api/logs", tags=["Logs"])
 def list_logs():
-    try:
-        logs = sorted(LOGS_DIR.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True)
-        return ok([{"name": l.name, "size_kb": round(l.stat().st_size / 1024, 1),
-                    "modified": datetime.fromtimestamp(l.stat().st_mtime).isoformat()} for l in logs])
-    except Exception as e:
-        err(str(e))
+    logs = sorted(LOGS_DIR.glob("*.log"), key=lambda item: item.stat().st_mtime, reverse=True)
+    return ok([
+        {
+            "name": log_file.name,
+            "size_kb": round(log_file.stat().st_size / 1024, 1),
+            "modified": datetime.fromtimestamp(log_file.stat().st_mtime).isoformat(),
+        }
+        for log_file in logs
+    ])
 
 
-@app.get("/api/logs/{log_name}", summary="Get contents of a log file", tags=["Logs"])
-def get_log(log_name: str, tail: int = 200):
+@app.get("/api/logs/{log_name}", tags=["Logs"])
+def get_log(log_name: str, tail: int = Query(default=200, ge=1, le=2000)):
     if ".." in log_name or log_name.startswith("/"):
-        raise HTTPException(status_code=400, detail="Invalid log name")
+        err("Invalid log name", 400)
     log_path = LOGS_DIR / log_name
     if not log_path.exists():
-        raise HTTPException(status_code=404, detail="Log file not found")
+        err("Log file not found", 404)
     lines = log_path.read_text(errors="replace").splitlines()
     return ok({"log_name": log_name, "lines": lines[-tail:], "total_lines": len(lines)})
 
 
-# ---------------------------------------------------------------------------
-# Socket.IO event handlers
-# ---------------------------------------------------------------------------
-
 @sio.event
-async def connect(sid, environ):
+async def connect(sid, environ, auth):
+    require_socket_api_key(environ, auth)
     logger.info("Socket.IO client connected: %s", sid)
 
 
@@ -683,24 +907,40 @@ async def disconnect(sid):
     logger.info("Socket.IO client disconnected: %s", sid)
 
 
-@sio.event
-async def join(sid, data):
-    """Client sends {'session_id': '...'} to subscribe to benchmark events."""
+async def _join_room(sid: str, data: Dict[str, Any]):
     session_id = data.get("session_id", "default")
     await sio.enter_room(sid, session_id)
     logger.info("Client %s joined room %s", sid, session_id)
 
 
-# ---------------------------------------------------------------------------
-# Entry point for direct execution
-# ---------------------------------------------------------------------------
+@sio.event
+async def join(sid, data):
+    await _join_room(sid, data)
+
+
+@sio.event
+async def join_session(sid, data):
+    await _join_room(sid, data)
+
+
+@app.on_event("startup")
+def on_startup():
+    state = BenchmarkState.load()
+    if state:
+        try:
+            benchmark_manager.recover_state(state)
+            audit_event("benchmark.recover_attempt", run_id=state.get("run_id"), session_id=state.get("session_id"))
+        except Exception as exc:
+            logger.warning("Benchmark state recovery failed: %s", exc)
+
+
 if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
         "fastapi_app:combined_app",
         host="0.0.0.0",
-        port=50073,
+        port=50071,
         reload=False,
         log_level="info",
     )

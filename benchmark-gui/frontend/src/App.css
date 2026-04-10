@@ -178,6 +178,16 @@ body,
   gap: 20px;
 }
 
+.api-key-badge {
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  white-space: nowrap;
+}
+
 .language-switcher,
 .lang-btn {
   display: none;
@@ -256,6 +266,19 @@ body,
   color: #2ecc71;
   font-weight: bold;
   font-style: normal;
+}
+
+.api-key-panel {
+  margin-top: 12px;
+  background: rgba(255, 255, 255, 0.03);
+  padding: 15px;
+  border-radius: 8px;
+}
+
+.api-key-actions {
+  display: flex;
+  gap: 10px;
+  align-items: end;
 }
 
 @keyframes pulse {

@@ -27,14 +27,22 @@ A web-based GUI for benchmarking SupremeRAID performance, featuring real-time mo
     cd graid-benchmarking-gui/benchmark-gui
     ```
 
-2.  **Build and Run with Docker Compose**:
+2.  **Create environment settings**:
+    ```bash
+    cp .env.example .env
+    ```
+    Set `BENCHMARK_API_KEY` to a strong random value.
+    If the frontend will be accessed from a non-localhost URL, update `BENCHMARK_ALLOWED_ORIGINS` as well.
+
+3.  **Build and Run with Docker Compose**:
     ```bash
     docker-compose up --build -d
     ```
 
-3.  **Access the Web Interface**:
+4.  **Access the Web Interface**:
     Open your browser and navigate to `http://<server-ip>:50072` (Frontend).
     The backend runs on port `50071`.
+    Open the UI, go to **Config management**, and paste the same `BENCHMARK_API_KEY` into the **API Access** section.
 
 ## Usage
 
@@ -58,8 +66,9 @@ A web-based GUI for benchmarking SupremeRAID performance, featuring real-time mo
 ## Development
 
 ### Backend
-The backend is a Flask application located in `backend/`.
--   `app.py`: Main application logic and API endpoints.
+The backend is a FastAPI application located in `backend/`.
+-   `fastapi_app.py`: Main API entrypoint and Socket.IO integration.
+-   `app.py`: Shared benchmark execution, recovery, and remote-execution logic.
 -   `scripts/`: Benchmarking scripts (`graid-bench.sh`).
 
 ### Frontend
@@ -71,4 +80,6 @@ The frontend is a React application located in `frontend/`.
 
 -   **Real-time data not showing**: Ensure `giostat` is installed and accessible in the system path. Check the backend logs for errors.
 -   **Benchmark fails to start**: Check the UI for specific error messages (e.g., "Device not found"). Check `logs/` for detailed logs. Ensure you have root privileges (Docker container runs as privileged).
-
+-   **Protected actions fail with 401 / Unauthorized**: Verify the API key in the UI matches `BENCHMARK_API_KEY` in `.env`.
+-   **Frontend cannot connect after deployment behind another hostname**: Add that frontend origin to `BENCHMARK_ALLOWED_ORIGINS` and rebuild the containers.
+-   **Need an audit trail**: Check `logs/audit.log` for request IDs, auth failures, benchmark start/stop events, and recovery attempts.

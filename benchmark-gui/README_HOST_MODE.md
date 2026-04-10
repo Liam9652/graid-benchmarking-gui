@@ -47,7 +47,7 @@ The backend serves the API and can also serve the static frontend files if built
 ```bash
 cd backend
 pip3 install -r requirements.txt
-python3 app.py
+BENCHMARK_API_KEY=change-this python3 fastapi_app.py
 ```
 *The backend will start on port 50071.*
 
@@ -72,4 +72,5 @@ To benchmark a remote server (DUT) from this Host Mode instance:
 2. Go to **Config** > **DUT Settings**.
 3. Enable **Remote Mode**.
 4. Enter the **IP**, **User**, and **Password** of the machine with the SupremeRAID™ card.
-5. Save and Start Benchmark.
+5. Enter the same API key in the UI **API Access** section if the backend is protected.
+6. Save and Start Benchmark.
