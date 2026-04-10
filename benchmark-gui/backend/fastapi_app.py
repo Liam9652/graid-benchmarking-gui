@@ -761,17 +761,65 @@ def reset_graid_resources(body: Optional[GraidResetRequest] = None):
         err("Cannot reset while benchmark is running", 400)
     config = get_effective_config(body.config if body else None)
     executor = RemoteExecutor(config)
-    deleted: List[str] = []
-    for cmd_args, label in (
-        (["graidctl", "del", "vd", "--all", "--force"], "VDs"),
-        (["graidctl", "del", "dg", "--all", "--force"], "DGs"),
-        (["graidctl", "del", "pd", "--all", "--force"], "PDs"),
-    ):
-        res = executor.run(cmd_args, capture_output=True, text=True)
-        if res.returncode == 0:
-            deleted.append(label)
-    audit_event("graid.reset", target=config.get("DUT_IP"), deleted=deleted)
-    return ok({"deleted": deleted}, message=f"Deleted: {', '.join(deleted) or 'nothing'}")
+    details: List[str] = []
+
+    # 1. Delete VDs
+    res = executor.run(["graidctl", "ls", "vd", "--format", "json"], capture_output=True, text=True)
+    if res.returncode == 0:
+        try:
+            vds = parse_graidctl_json(res.stdout).get("Result", [])
+            for vd in vds:
+                dg_id = vd.get("DgId")
+                vd_id = vd.get("VdId")
+                if dg_id is not None and vd_id is not None:
+                    del_res = executor.run(
+                        ["graidctl", "del", "vd", str(dg_id), str(vd_id), "--confirm-to-delete"],
+                        capture_output=True, text=True,
+                    )
+                    logger.info("VD %s/%s delete rc=%s: %s", dg_id, vd_id, del_res.returncode,
+                                del_res.stdout.strip() or del_res.stderr.strip())
+                    details.append(f"VD dg={dg_id} vd={vd_id}")
+        except Exception as exc:
+            logger.error("VD delete error: %s", exc)
+
+    # 2. Delete DGs
+    res = executor.run(["graidctl", "ls", "dg", "--format", "json"], capture_output=True, text=True)
+    if res.returncode == 0:
+        try:
+            dgs = parse_graidctl_json(res.stdout).get("Result", [])
+            for dg in dgs:
+                dg_id = dg.get("DgId")
+                if dg_id is not None:
+                    del_res = executor.run(
+                        ["graidctl", "del", "dg", str(dg_id), "--confirm-to-delete"],
+                        capture_output=True, text=True,
+                    )
+                    logger.info("DG %s delete rc=%s: %s", dg_id, del_res.returncode,
+                                del_res.stdout.strip() or del_res.stderr.strip())
+                    details.append(f"DG dg={dg_id}")
+        except Exception as exc:
+            logger.error("DG delete error: %s", exc)
+
+    # 3. Delete PDs
+    res = executor.run(["graidctl", "ls", "pd", "--format", "json"], capture_output=True, text=True)
+    if res.returncode == 0:
+        try:
+            pds = parse_graidctl_json(res.stdout).get("Result", [])
+            pd_ids = [p.get("PdId") for p in pds if p.get("PdId") is not None]
+            if pd_ids:
+                pd_range = f"{min(pd_ids)}-{max(pd_ids)}"
+                del_res = executor.run(
+                    ["graidctl", "del", "pd", pd_range],
+                    capture_output=True, text=True,
+                )
+                logger.info("PD range %s delete rc=%s: %s", pd_range, del_res.returncode,
+                            del_res.stdout.strip() or del_res.stderr.strip())
+                details.append(f"PDs {pd_range}")
+        except Exception as exc:
+            logger.error("PD delete error: %s", exc)
+
+    audit_event("graid.reset", target=config.get("DUT_IP"), details=details)
+    return ok({"details": details}, message=f"Reset complete: {', '.join(details) or 'nothing to delete'}")
 
 
 @app.get("/api/results", tags=["Results"])
