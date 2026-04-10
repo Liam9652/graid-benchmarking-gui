@@ -1022,7 +1022,25 @@ async def join_session(sid, data):
 
 
 @app.on_event("startup")
-def on_startup():
+async def on_startup():
+    import asyncio
+    import app as _app_module
+
+    # Bridge: replace app.py's Flask-SocketIO instance with an adapter that
+    # forwards emit() calls to the real python-socketio AsyncServer (sio).
+    # Benchmark threads call socketio.emit(...) synchronously; this adapter
+    # schedules the coroutine on the running asyncio event loop.
+    loop = asyncio.get_running_loop()
+
+    class _SioAdapter:
+        def emit(self, event, data=None, room=None, **kwargs):
+            asyncio.run_coroutine_threadsafe(
+                sio.emit(event, data, room=room),
+                loop,
+            )
+
+    _app_module.socketio = _SioAdapter()
+
     state = BenchmarkState.load()
     if state:
         try:
