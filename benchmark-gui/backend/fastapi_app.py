@@ -10,12 +10,13 @@ import json
 import logging
 import os
 import re
+import secrets
 import tarfile
 import tempfile
 import threading
 import time
 from contextvars import ContextVar
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -84,11 +85,21 @@ app.add_middleware(
 
 sio = socketio.AsyncServer(
     async_mode="asgi",
-    cors_allowed_origins=_ALLOWED_ORIGINS or ["http://localhost:50072"],
+    cors_allowed_origins="*" if _ALLOW_ALL_ORIGINS else (_ALLOWED_ORIGINS or ["http://localhost:50072"]),
 )
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 combined_app = socketio.ASGIApp(sio, app)
+
+# --- In-memory credential session store ---
+_SESSION_TTL = timedelta(hours=24)
+_credential_sessions: Dict[str, Dict] = {}  # token → {config, created_at}
+
+def _purge_expired_sessions() -> None:
+    cutoff = datetime.utcnow() - _SESSION_TTL
+    expired = [t for t, s in _credential_sessions.items() if s["created_at"] < cutoff]
+    for t in expired:
+        del _credential_sessions[t]
 
 MAX_SNAPSHOT_BYTES = 12 * 1024 * 1024
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -137,6 +148,10 @@ class SystemInfoRequest(BaseModel):
 
 class GraidResetRequest(BaseModel):
     config: Optional[Dict[str, Any]] = None
+
+
+class SessionRestoreRequest(BaseModel):
+    token: str
 
 
 class SnapshotRequest(BaseModel):
@@ -652,7 +667,40 @@ def test_connection(body: ConnectionTestRequest):
     if missing:
         message += f" Missing dependencies: {', '.join(missing)}."
     audit_event("dut.test_connection", remote=body.config.get("REMOTE_MODE", False), target=body.config.get("DUT_IP"))
-    return ok({"dependencies": dep_results}, message=message)
+    # Issue a session token so the frontend can restore credentials on page refresh
+    _purge_expired_sessions()
+    session_token = secrets.token_urlsafe(32)
+    _credential_sessions[session_token] = {
+        "config": dict(body.config),
+        "created_at": datetime.utcnow(),
+    }
+    return ok({"dependencies": dep_results, "session_token": session_token}, message=message)
+
+
+@app.post("/api/session/restore", tags=["Session"], dependencies=[Depends(require_api_key)])
+def restore_session(body: SessionRestoreRequest):
+    _purge_expired_sessions()
+    session = _credential_sessions.get(body.token)
+    if not session:
+        err("Session expired or invalid", 401)
+    config = session["config"]
+    executor = RemoteExecutor(config)
+    try:
+        res = executor.run(["echo", "ok"], capture_output=True, text=True)
+        if res.returncode != 0:
+            raise ConnectionError("SSH echo check failed")
+    except Exception as e:
+        _credential_sessions.pop(body.token, None)
+        err(f"Session invalid: {e}", 401)
+    # Refresh TTL on successful restore
+    session["created_at"] = datetime.utcnow()
+    dep_results = executor.check_dependencies()
+    missing = [name for name, present in dep_results.items() if not present]
+    message = "Session restored."
+    if missing:
+        message += f" Missing dependencies: {', '.join(missing)}."
+    audit_event("session.restore", target=config.get("DUT_IP"))
+    return ok({"config": config, "dependencies": dep_results}, message=message)
 
 
 @app.post("/api/benchmark/setup-dut", tags=["Benchmark"], dependencies=[Depends(require_api_key)])

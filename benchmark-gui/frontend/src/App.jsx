@@ -599,6 +599,43 @@ function App() {
         await loadConfig();
       }
 
+      // Try to restore SSH session via backend token (password never stored in browser)
+      const token = localStorage.getItem('connectionToken');
+      if (token) {
+        try {
+          const res = await apiFetch('/api/session/restore', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token }),
+          });
+          const data = await res.json();
+          if (data.success) {
+            // Restore full config (incl. password) into React state only — not any storage
+            setConfig(prev => ({ ...prev, ...data.data.config }));
+            const restoredStatus = {
+              loading: false,
+              success: true,
+              message: data.message,
+              dependencies: data.data.dependencies,
+            };
+            setConnectionStatus(restoredStatus);
+            localStorage.setItem('connectionStatus', JSON.stringify(restoredStatus));
+          } else {
+            localStorage.removeItem('connectionToken');
+            localStorage.removeItem('connectionStatus');
+            setConnectionStatus({ loading: false, success: null, message: '', dependencies: null });
+          }
+        } catch {
+          localStorage.removeItem('connectionToken');
+          localStorage.removeItem('connectionStatus');
+          setConnectionStatus({ loading: false, success: null, message: '', dependencies: null });
+        }
+      } else {
+        // No token — clear any stale "Connected" badge
+        localStorage.removeItem('connectionStatus');
+        setConnectionStatus({ loading: false, success: null, message: '', dependencies: null });
+      }
+
       const status = await checkBenchmarkStatus();
       if (status && status.running) {
         setActiveTab('benchmark');
@@ -788,6 +825,10 @@ function App() {
         };
         setConnectionStatus(newStatus);
         localStorage.setItem('connectionStatus', JSON.stringify(newStatus));
+        // Store session token (not the password) for auto-reconnect on page refresh
+        if (data.data?.session_token) {
+          localStorage.setItem('connectionToken', data.data.session_token);
+        }
         // Success! Reload info from the remote DUT
         await loadSystemInfo(config);
         await loadLicenseInfo(config);
@@ -795,9 +836,11 @@ function App() {
         const newStatus = { loading: false, success: false, message: data.error };
         setConnectionStatus(newStatus);
         localStorage.removeItem('connectionStatus');
+        localStorage.removeItem('connectionToken');
       }
     } catch (error) {
       setConnectionStatus({ loading: false, success: false, message: error.message });
+      localStorage.removeItem('connectionToken');
     }
   };
 
@@ -865,6 +908,7 @@ function App() {
       if (key === 'REMOTE_MODE' && value === false) {
         setConnectionStatus({ loading: false, success: null, message: '', dependencies: null });
         localStorage.removeItem('connectionStatus');
+        localStorage.removeItem('connectionToken');
         loadSystemInfo(newConfig);
         loadLicenseInfo(newConfig);
       }
