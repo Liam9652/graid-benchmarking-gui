@@ -63,14 +63,16 @@ app = FastAPI(
 )
 
 _API_KEY: str | None = os.environ.get("BENCHMARK_API_KEY")
-_ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in os.environ.get(
-        "BENCHMARK_ALLOWED_ORIGINS",
-        "http://localhost:50072,http://127.0.0.1:50072,http://localhost:3000,http://127.0.0.1:3000",
-    ).split(",")
-    if origin.strip()
-]
+_raw_origins = os.environ.get(
+    "BENCHMARK_ALLOWED_ORIGINS",
+    "http://localhost:50072,http://127.0.0.1:50072,http://localhost:3000,http://127.0.0.1:3000",
+)
+_ALLOW_ALL_ORIGINS = _raw_origins.strip() == "*"
+_ALLOWED_ORIGINS = (
+    ["*"]
+    if _ALLOW_ALL_ORIGINS
+    else [o.strip() for o in _raw_origins.split(",") if o.strip()]
+)
 
 app.user_middleware.clear()
 app.add_middleware(
@@ -897,7 +899,7 @@ def get_log(log_name: str, tail: int = Query(default=200, ge=1, le=2000)):
 
 
 @sio.event
-async def connect(sid, environ, auth):
+async def connect(sid, environ, auth=None):
     require_socket_api_key(environ, auth)
     logger.info("Socket.IO client connected: %s", sid)
 
@@ -909,7 +911,7 @@ async def disconnect(sid):
 
 async def _join_room(sid: str, data: Dict[str, Any]):
     session_id = data.get("session_id", "default")
-    await sio.enter_room(sid, session_id)
+    sio.enter_room(sid, session_id)
     logger.info("Client %s joined room %s", sid, session_id)
 
 
