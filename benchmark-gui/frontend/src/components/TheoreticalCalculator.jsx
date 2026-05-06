@@ -19,36 +19,12 @@ const TheoreticalCalculator = ({ language }) => {
         platformBaselineIOPS: 20000000 // 20M
     });
 
-    const [version, setVersion] = useState('1.7.x'); // '1.7.x' or '2.0'
     const [cardModel, setCardModel] = useState('SR1010');
 
     // New System Parameters
     const [ramPerCpu, setRamPerCpu] = useState(1);
     const [cpuCores, setCpuCores] = useState(32);
     const [ddrType, setDdrType] = useState('DDR5');
-
-    // Filter card models based on version
-    const getVisibleModels = () => {
-        const allModels = Object.keys(CARD_LIMITS);
-        const v2OnlyModels = ['SR-PAM2', 'SR-UAD2', 'SR-CAM2'];
-
-        if (version === '2.0') {
-            return allModels;
-        } else {
-            return allModels.filter(m => !v2OnlyModels.includes(m));
-        }
-    };
-
-    const handleVersionChange = (newVersion) => {
-        setVersion(newVersion);
-        if (newVersion === '1.7.x') {
-            const v2OnlyModels = ['SR-PAM2', 'SR-UAD2', 'SR-CAM2'];
-            if (v2OnlyModels.includes(cardModel)) {
-                setCardModel('SR1010');
-            }
-        }
-    };
-
 
     const handleChange = (e, key, multiplier = 1) => {
         setInputs(prev => ({
@@ -199,7 +175,7 @@ const TheoreticalCalculator = ({ language }) => {
             mixedIOPS: inputs.iopsMixed4k,
             readBW: inputs.randRead64k,
             writeBW: inputs.randWrite64k
-        }, inputs.platformBaselineIOPS, version, cardModel, {
+        }, inputs.platformBaselineIOPS, '2.0', cardModel, {
             ramPerCpu,
             cpuCores,
             ddrType
@@ -211,20 +187,6 @@ const TheoreticalCalculator = ({ language }) => {
         <div className="calculator-container">
             <div className="calc-header-row">
                 <h2>Theoretical Performance Calculator</h2>
-                <div className="version-toggle">
-                    <button
-                        className={`toggle-btn ${version === '1.7.x' ? 'active' : ''}`}
-                        onClick={() => handleVersionChange('1.7.x')}
-                    >
-                        Linux V1
-                    </button>
-                    <button
-                        className={`toggle-btn ${version === '2.0' ? 'active' : ''}`}
-                        onClick={() => handleVersionChange('2.0')}
-                    >
-                        Linux V2
-                    </button>
-                </div>
             </div>
 
 
@@ -237,7 +199,7 @@ const TheoreticalCalculator = ({ language }) => {
                 <div className="input-group">
                     <label>Graid Card Model:</label>
                     <select value={cardModel} onChange={(e) => setCardModel(e.target.value)}>
-                        {getVisibleModels().map(model => (
+                        {Object.keys(CARD_LIMITS).map(model => (
                             <option key={model} value={model}>{model}</option>
                         ))}
                     </select>
