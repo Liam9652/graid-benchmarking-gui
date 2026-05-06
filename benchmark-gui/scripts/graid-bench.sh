@@ -2,6 +2,10 @@
 
 export LC_ALL=C
 
+# Anchor cwd to script dir so all "./" / "../results" paths resolve correctly
+# regardless of how the script is invoked (absolute path, ssh remote exec, etc.)
+cd "$(dirname "$0")" || exit 1
+
 # Separate debug trace (set -x) to debug.log instead of mixing with audit log
 DEBUG_LOG_FILE="./debug.log"
 LOG_FILE="./output.log"
@@ -601,7 +605,7 @@ main() {
     KERNEL_VER=$(uname -r)
     OS_INFO=$(cat /etc/os-release | grep "PRETTY_NAME" | cut -d= -f2 | tr -d '"')
     
-    cat <<EOF > "$NVME_INFO-result/system_info.json"
+    cat <<EOF > "../results/.test-temp-data/$NVME_INFO-result/system_info.json"
 {
     "graid_version": "$GRAID_VER",
     "os_info": "$OS_INFO",

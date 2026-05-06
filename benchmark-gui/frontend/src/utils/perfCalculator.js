@@ -21,6 +21,11 @@ export const CARD_LIMITS = {
         RAID5: { randReadIOPS: 30_000_000, randWriteIOPS: 6_000_000, seqReadBW: 280_000, seqWriteBW: 125_000 },
         RAID6: { randReadIOPS: 30_000_000, randWriteIOPS: 5_000_000, seqReadBW: 280_000, seqWriteBW: 120_000 },
         RAID10: { randReadIOPS: 22_000_000, randWriteIOPS: 11_000_000, seqReadBW: 280_000, seqWriteBW: 80_000 },
+    },
+    'SR-AE': {
+        RAID5: { randReadIOPS: 10_000_000, randWriteIOPS: 2_900_000, seqReadBW: 140_000, seqWriteBW: 65_000 },
+        RAID6: { randReadIOPS: 10_000_000, randWriteIOPS: 2_300_000, seqReadBW: 140_000, seqWriteBW: 60_000 },
+        RAID10: { randReadIOPS: 10_000_000, randWriteIOPS: 6_000_000, seqReadBW: 140_000, seqWriteBW: 40_000 },
     }
 };
 

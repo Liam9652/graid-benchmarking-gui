@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import csv
 import io
@@ -11,12 +12,13 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import tarfile
 import tempfile
 import threading
 import time
 from contextvars import ContextVar
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -25,6 +27,7 @@ import socketio
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.background import BackgroundTask
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field
 
@@ -49,7 +52,7 @@ from app import (
 )
 
 
-logger = logging.getLogger("fastapi-benchmark")
+logger = logging.getLogger("graid-bench.api")
 
 app = FastAPI(
     title="GRAID Benchmark GUI API",
@@ -63,19 +66,12 @@ app = FastAPI(
     license_info={"name": "Proprietary"},
 )
 
-_API_KEY: str | None = os.environ.get("BENCHMARK_API_KEY")
-_raw_origins = os.environ.get(
-    "BENCHMARK_ALLOWED_ORIGINS",
-    "http://localhost:50072,http://127.0.0.1:50072,http://localhost:3000,http://127.0.0.1:3000",
-)
-_ALLOW_ALL_ORIGINS = _raw_origins.strip() == "*"
-_ALLOWED_ORIGINS = (
-    ["*"]
-    if _ALLOW_ALL_ORIGINS
-    else [o.strip() for o in _raw_origins.split(",") if o.strip()]
-)
+from settings import settings
 
-app.user_middleware.clear()
+_API_KEY: str | None = settings.api_key
+_ALLOW_ALL_ORIGINS = settings.allow_all_origins
+_ALLOWED_ORIGINS = settings.allowed_origins
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS or ["http://localhost:50072"],
@@ -94,12 +90,18 @@ combined_app = socketio.ASGIApp(sio, app)
 # --- In-memory credential session store ---
 _SESSION_TTL = timedelta(hours=24)
 _credential_sessions: Dict[str, Dict] = {}  # token → {config, created_at}
+# Serializes mutations from concurrent /test-connection, /session/restore, and
+# /test-connection/clear callers. Single-process-only — multi-worker uvicorn
+# deployments still need an out-of-process store (see B10 in AUDIT.md).
+_credential_sessions_lock = threading.Lock()
+
 
 def _purge_expired_sessions() -> None:
-    cutoff = datetime.utcnow() - _SESSION_TTL
-    expired = [t for t, s in _credential_sessions.items() if s["created_at"] < cutoff]
-    for t in expired:
-        del _credential_sessions[t]
+    cutoff = datetime.now(timezone.utc) - _SESSION_TTL
+    with _credential_sessions_lock:
+        expired = [t for t, s in _credential_sessions.items() if s["created_at"] < cutoff]
+        for t in expired:
+            _credential_sessions.pop(t, None)
 
 MAX_SNAPSHOT_BYTES = 12 * 1024 * 1024
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -219,15 +221,7 @@ def get_effective_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, A
 
 
 def resolve_saved_state() -> Optional[Dict[str, Any]]:
-    state = BenchmarkState.load()
-    if not state:
-        return None
-    if benchmark_manager.running:
-        return state
-    run_id = state.get("run_id")
-    if not run_id:
-        return state
-    return state
+    return BenchmarkState.load()
 
 
 def resolve_active_run_id() -> Optional[str]:
@@ -235,13 +229,6 @@ def resolve_active_run_id() -> Optional[str]:
         return benchmark_manager.active_run_id
     state = resolve_saved_state()
     return state.get("run_id") if state else None
-
-
-def clear_runtime_state() -> None:
-    benchmark_manager.running = False
-    benchmark_manager.active_run_id = None
-    benchmark_manager.session_id = None
-    benchmark_manager.runtime_config = None
 
 
 def get_result_target(result_name: str) -> Path:
@@ -274,15 +261,28 @@ def parse_basic_log(content: str) -> Dict[str, str]:
     return result
 
 
+def _qd_nj_suffix(row: Dict[str, str]) -> str:
+    # bench-fio sweeps multiple (qd, nj) per workload type. Without this suffix
+    # the frontend's aggregateBaseline collapses all combos into one bar and
+    # double/triple-counts. Suffix is only added when both values are numeric
+    # so legacy bench.sh rows (which carry N/A) keep their short labels.
+    try:
+        qd = int(float(row.get("Queue Depth", "")))
+        nj = int(float(row.get("Threads", "")))
+    except (TypeError, ValueError):
+        return ""
+    return f" (qd{qd} J{nj})"
+
+
 def get_workload_name(row: Dict[str, str]) -> str:
     filename_col = row.get("filename", "")
     if "SingleTest" in filename_col:
         if "01-seqread" in filename_col:
-            return "1M Sequential Read"
+            return "1M Sequential Read" + _qd_nj_suffix(row)
         if "02-seqwrite" in filename_col:
-            return "1M Sequential Write"
+            return "1M Sequential Write" + _qd_nj_suffix(row)
     if "randrw73" in filename_col:
-        return "4k Random Read/Write Mix(70/30)"
+        return "4k Random Read/Write Mix(70/30)" + _qd_nj_suffix(row)
 
     bs_label = row.get("BlockSize", "")
     try:
@@ -304,7 +304,7 @@ def get_workload_name(row: Dict[str, str]) -> str:
         "randwrite": "Random Write",
         "write": "Sequential Write",
     }.get(row_type, row_type or "Unknown")
-    return f"{size_label} {type_label}".strip()
+    return f"{size_label} {type_label}".strip() + _qd_nj_suffix(row)
 
 
 def parse_csv_rows(content: str, source_name: str, req_type: Optional[str]) -> List[Dict[str, Any]]:
@@ -331,6 +331,25 @@ def parse_csv_rows(content: str, source_name: str, req_type: Optional[str]) -> L
                         break
         rows.append(row)
     return rows
+
+
+def _extract_raid_from_tar_siblings(all_member_names: List[str], csv_member_name: str) -> Optional[str]:
+    # Tar-archive analogue of _extract_raid_from_cmd_dir. The dir version walks
+    # the filesystem at `csv_file.parent.parent / {cmd|raid_config}`; here we
+    # match member names that live under that same logical path inside the tar.
+    csv_path = Path(csv_member_name)
+    if len(csv_path.parts) < 3:
+        return None
+    grandparent = "/".join(csv_path.parts[:-2])
+    for subdir in ("cmd", "raid_config"):
+        prefix = f"{grandparent}/{subdir}/"
+        for name in all_member_names:
+            if not name.startswith(prefix):
+                continue
+            match = re.search(r"(RAID\d+)", Path(name).name)
+            if match:
+                return match.group(1)
+    return None
 
 
 def collect_result_rows(result_name: str, req_type: Optional[str]) -> List[Dict[str, Any]]:
@@ -364,10 +383,21 @@ def collect_result_rows(result_name: str, req_type: Optional[str]) -> List[Dict[
                 logger.warning("Error parsing %s: %s", csv_file, exc)
     elif target.is_file() and target.name.lower().endswith((".tar", ".tar.gz", ".tgz")):
         with tarfile.open(target, "r") as tar:
-            members = [
-                member for member in tar.getmembers()
-                if member.name.endswith(".csv") and ("fio-test" in member.name or "diskspd-test" in member.name)
-            ]
+            all_member_names = [m.name for m in tar.getmembers()]
+            csv_members = [m for m in tar.getmembers() if m.name.endswith(".csv")]
+            # Mirror the dir-branch filter order (line 329-338): apply the
+            # type → fio-test → summary funnel so the per-archive summary CSV
+            # at `result/fio-test-r-*.csv` (which lives outside /PD/ or /VD/)
+            # only short-circuits the per-disk PD/VD CSVs when those exist
+            # in the same scope. Otherwise summary CSVs leak through and
+            # parse_csv_rows drops every row because source_name lacks /PD/.
+            filtered = csv_members
+            if req_type == "baseline":
+                filtered = [m for m in csv_members if "/PD/" in m.name or "/pd/" in m.name]
+            elif req_type == "graid":
+                filtered = [m for m in csv_members if "/VD/" in m.name or "/vd/" in m.name or "/MD/" in m.name]
+
+            members = [m for m in filtered if "fio-test" in m.name or "diskspd-test" in m.name] or filtered
             summary = [m for m in members if "result/fio-test-r-" in m.name]
             if summary:
                 members = summary
@@ -378,7 +408,17 @@ def collect_result_rows(result_name: str, req_type: Optional[str]) -> List[Dict[
                     continue
                 try:
                     content = extracted.read().decode("utf-8", errors="ignore")
-                    csv_data.extend(parse_csv_rows(content, member.name, req_type))
+                    rows = parse_csv_rows(content, member.name, req_type)
+                    # Mirror dir-branch fallback (line 344-348): VD/MD CSVs ship
+                    # with RAID_type=N/A; recover it from sibling raid_config/cmd
+                    # filenames (e.g. graid-...-RAID5-...log) under the parent
+                    # `Normal/` dir of the result CSV.
+                    for row in rows:
+                        if not row.get("RAID_type") or row.get("RAID_type") in ("N/A", ""):
+                            raid = _extract_raid_from_tar_siblings(all_member_names, member.name)
+                            if raid:
+                                row["RAID_type"] = raid
+                    csv_data.extend(rows)
                 except Exception as exc:
                     logger.warning("Error parsing tar member %s: %s", member.name, exc)
     else:
@@ -431,27 +471,46 @@ def parse_image_tags(image_path: str) -> Dict[str, str]:
         "workload": "Unknown",
         "bs": "Unknown",
         "status": "Normal",
+        "qd": "Unknown",
+        "nj": "Unknown",
     }
     for part in filename.split("-"):
         if part.startswith("RAID"):
             tags["raid"] = part.replace("RAID", "RAID ")
     if "Rebuild" in filename:
         tags["status"] = "Rebuild"
-    if "seqwrite" in filename:
-        tags["workload"] = "Seq Write"
-    elif "seqread" in filename:
-        tags["workload"] = "Seq Read"
+    # Order matters: check randrw/rand* before plain read/write since
+    # "randread" contains "read" as a substring. bench.sh emitted seqread/
+    # seqwrite, bench-fio (and the new fio_plot_renderer PNGs) emit plain
+    # read/write — both must be detected.
+    if "randrw73" in filename:
+        tags["workload"] = "Mix(70/30)"
     elif "randread" in filename:
         tags["workload"] = "Rand Read"
     elif "randwrite" in filename:
         tags["workload"] = "Rand Write"
-    elif "randrw73" in filename:
-        tags["workload"] = "Mix(70/30)"
+    elif "seqread" in filename:
+        tags["workload"] = "Seq Read"
+    elif "seqwrite" in filename:
+        tags["workload"] = "Seq Write"
+    elif re.search(r"[_-]read(?:[_-]|$)", filename):
+        tags["workload"] = "Seq Read"
+    elif re.search(r"[_-]write(?:[_-]|$)", filename):
+        tags["workload"] = "Seq Write"
 
     for block_size in ("4k", "8k", "16k", "32k", "64k", "128k", "256k", "512k", "1m", "2m", "4m"):
         if f"-{block_size}-" in filename or filename.endswith(f"-{block_size}") or f"_{block_size}_" in filename:
             tags["bs"] = block_size.upper()
             break
+
+    # Queue Depth and numjobs. Two filename conventions in this codebase:
+    #   bench.sh / report_view PNGs : ..._qd<QD>_<NJ>J_...   (e.g. qd64_24J)
+    #   fio_plot_renderer PNGs      : ..._qd<QD>nj<NJ>_...   (e.g. qd64nj8)
+    qd_match = re.search(r"qd(\d+)(?:_(\d+)J|nj(\d+))", filename)
+    if qd_match:
+        tags["qd"] = qd_match.group(1)
+        tags["nj"] = qd_match.group(2) or qd_match.group(3) or "Unknown"
+
     if tags["category"] == "PD":
         tags["raid"] = "BASELINE"
     return tags
@@ -472,8 +531,13 @@ def collect_result_images(result_name: str) -> List[Dict[str, Any]]:
     elif target.is_file() and target.name.lower().endswith((".tar", ".tar.gz", ".tgz")):
         cache_dir = CACHE_DIR / clean_name(result_name)
         cache_dir.mkdir(parents=True, exist_ok=True)
+        inner_root = None  # First path component (e.g. "EPW5970-3200GB-result").
         with tarfile.open(target, "r") as tar:
             for member in tar.getmembers():
+                if inner_root is None:
+                    head = member.name.split("/", 1)[0]
+                    if head and head not in (".", ".."):
+                        inner_root = head
                 if member.isfile() and member.name.lower().endswith((".png", ".jpg", ".jpeg")) and "report_view" in member.name:
                     cache_name = clean_name(member.name.replace("/", "_"), "image")
                     cache_file = cache_dir / cache_name
@@ -485,6 +549,28 @@ def collect_result_images(result_name: str) -> List[Dict[str, Any]]:
                         "name": cache_name,
                         "url": f"/api/result-files/.cache/{cache_dir.name}/{cache_name}",
                         "tags": parse_image_tags(member.name),
+                    })
+        # Q3a fallback: snapshot PNGs are written by the browser to the backend's
+        # local `RESULTS_DIR/.test-temp-data/<inner-root>/.../report_view/` path,
+        # but the tarball is built on the remote SUT and never sees them. If the
+        # archive came in empty-of-PNGs, surface those loose files.
+        if not images and inner_root:
+            loose_root = RESULTS_DIR / ".test-temp-data" / inner_root
+            if loose_root.is_dir():
+                seen = set()
+                for image in loose_root.rglob("*"):
+                    if not (image.is_file() and image.suffix.lower() in (".png", ".jpg", ".jpeg")):
+                        continue
+                    if "report_view" not in str(image):
+                        continue
+                    if image.name in seen:
+                        continue
+                    seen.add(image.name)
+                    rel_path = str(image.relative_to(RESULTS_DIR))
+                    images.append({
+                        "name": image.name,
+                        "url": f"/api/result-files/{rel_path}",
+                        "tags": parse_image_tags(str(image)),
                     })
     return images
 
@@ -525,7 +611,7 @@ def get_config():
 
 @app.middleware("http")
 async def audit_requests(request: Request, call_next):
-    request_id = request.headers.get("X-Request-ID") or generate_run_id()
+    request_id = request.headers.get("X-Request-ID") or f"req-{secrets.token_urlsafe(8)}"
     token = request_id_ctx.set(request_id)
     start = time.time()
     response = None
@@ -570,6 +656,26 @@ async def audit_requests(request: Request, call_next):
                     client=request.client.host if request.client else None,
                 )
         request_id_ctx.reset(token)
+
+
+@app.get("/api/auth/verify", tags=["Auth"], dependencies=[Depends(require_api_key)])
+def verify_api_key():
+    """Lightweight probe for the frontend "Verify API Key" button (FE-9).
+
+    Returns 200 when the X-API-Key header matches BENCHMARK_API_KEY, 401
+    otherwise via require_api_key. No side effects, no SSH activity.
+    """
+    return ok({"verified": True}, message="API key accepted")
+
+
+@app.get("/api/auth/required", tags=["Auth"])
+def auth_required():
+    """Public probe so the frontend knows whether BENCHMARK_API_KEY is set
+    on the backend. When False, the UI suppresses the "API key required"
+    warning that would otherwise appear on dev/single-user deployments.
+    (FE-7 in AUDIT.md.)
+    """
+    return ok({"required": bool(_API_KEY)})
 
 
 @app.post("/api/config", tags=["Config"], dependencies=[Depends(require_api_key)])
@@ -670,17 +776,19 @@ def test_connection(body: ConnectionTestRequest):
     # Issue a session token so the frontend can restore credentials on page refresh
     _purge_expired_sessions()
     session_token = secrets.token_urlsafe(32)
-    _credential_sessions[session_token] = {
-        "config": dict(body.config),
-        "created_at": datetime.utcnow(),
-    }
+    with _credential_sessions_lock:
+        _credential_sessions[session_token] = {
+            "config": dict(body.config),
+            "created_at": datetime.now(timezone.utc),
+        }
     return ok({"dependencies": dep_results, "session_token": session_token}, message=message)
 
 
 @app.post("/api/session/restore", tags=["Session"], dependencies=[Depends(require_api_key)])
 def restore_session(body: SessionRestoreRequest):
     _purge_expired_sessions()
-    session = _credential_sessions.get(body.token)
+    with _credential_sessions_lock:
+        session = _credential_sessions.get(body.token)
     if not session:
         err("Session expired or invalid", 401)
     config = session["config"]
@@ -690,10 +798,13 @@ def restore_session(body: SessionRestoreRequest):
         if res.returncode != 0:
             raise ConnectionError("SSH echo check failed")
     except Exception as e:
-        _credential_sessions.pop(body.token, None)
+        with _credential_sessions_lock:
+            _credential_sessions.pop(body.token, None)
         err(f"Session invalid: {e}", 401)
-    # Refresh TTL on successful restore
-    session["created_at"] = datetime.utcnow()
+    # Refresh TTL on successful restore (locked since the read may race
+    # with _purge_expired_sessions on a different thread).
+    with _credential_sessions_lock:
+        session["created_at"] = datetime.now(timezone.utc)
     dep_results = executor.check_dependencies()
     missing = [name for name, present in dep_results.items() if not present]
     message = "Session restored."
@@ -725,15 +836,10 @@ def setup_dut(body: ConnectionTestRequest):
 
 @app.post("/api/benchmark/start", tags=["Benchmark"], dependencies=[Depends(require_api_key)])
 def start_benchmark(body: StartBenchmarkRequest):
-    if benchmark_manager.running:
-        err("Another benchmark is already running", 409)
     run_id = generate_run_id()
-    thread = threading.Thread(
-        target=benchmark_manager.run_benchmark,
-        args=(body.config, body.session_id, run_id),
-        daemon=True,
-    )
-    thread.start()
+    thread = benchmark_manager.try_start(body.config, body.session_id, run_id)
+    if thread is None:
+        err("Another benchmark is already running", 409)
     audit_event(
         "benchmark.start",
         run_id=run_id,
@@ -748,17 +854,9 @@ def stop_benchmark(body: StopBenchmarkRequest):
     active_run_id = resolve_active_run_id()
     if body.run_id and active_run_id and body.run_id != active_run_id:
         err("Run ID does not match the active benchmark", 409)
-    try:
-        if benchmark_manager.process and benchmark_manager.running:
-            benchmark_manager.process.terminate()
-            time.sleep(1)
-            if benchmark_manager.process.poll() is None:
-                benchmark_manager.process.kill()
-        BenchmarkState.clear()
-        audit_event("benchmark.stop", run_id=active_run_id)
-        return ok({"run_id": active_run_id}, message="Benchmark stopped")
-    finally:
-        clear_runtime_state()
+    stopped_run_id = benchmark_manager.stop_benchmark()
+    audit_event("benchmark.stop", run_id=stopped_run_id or active_run_id)
+    return ok({"run_id": stopped_run_id or active_run_id}, message="Benchmark stopped")
 
 
 @app.get("/api/benchmark/status", tags=["Benchmark"])
@@ -894,8 +992,6 @@ def get_result_images(result_name: str):
 def clear_result_cache(result_name: str):
     target = CACHE_DIR / clean_name(result_name)
     if target.exists():
-        import shutil
-
         shutil.rmtree(target)
     audit_event("results.clear_cache", result_name=result_name)
     return ok()
@@ -908,9 +1004,22 @@ def download_result(result_name: str):
         return FileResponse(target, filename=target.name)
 
     tmp = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)
+    tmp.close()
     with tarfile.open(tmp.name, "w:gz") as tar:
         tar.add(target, arcname=target.name)
-    return FileResponse(tmp.name, media_type="application/gzip", filename=f"{target.name}.tar.gz")
+
+    def _cleanup_tmp(path=tmp.name):
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            logger.debug("download_result temp cleanup skipped: %s", exc)
+
+    return FileResponse(
+        tmp.name,
+        media_type="application/gzip",
+        filename=f"{target.name}.tar.gz",
+        background=BackgroundTask(_cleanup_tmp),
+    )
 
 
 @app.get("/api/result-files/{filename:path}", tags=["Results"])
@@ -967,6 +1076,23 @@ def save_snapshot(body: SaveSnapshotRequest):
     out_path = save_dir / filename
     out_path.write_bytes(image_binary)
     audit_event("snapshot.save", run_id=body.run_id or active_run_id, path=str(out_path.relative_to(RESULTS_DIR)))
+
+    # Q3b: When the benchmark runs on a remote SUT, the tar packaging step in
+    # graid-bench.sh:615 runs there and only sees files under the remote's
+    # `<base>/results/.test-temp-data/...`. Push the freshly written snapshot
+    # to the same relative path on the remote so it gets included in the
+    # archive. Best-effort — local save is the source of truth.
+    runtime_config = benchmark_manager.runtime_config
+    if runtime_config and runtime_config.get("REMOTE_MODE"):
+        try:
+            executor = RemoteExecutor(runtime_config)
+            try:
+                executor.sync_to_remote(str(out_path), str(out_path))
+            finally:
+                executor.close()
+        except Exception as exc:
+            logger.warning("snapshot remote sync skipped: %s", exc)
+
     return ok({"saved_path": str(out_path)}, message="Snapshot saved")
 
 
@@ -1023,23 +1149,38 @@ async def join_session(sid, data):
 
 @app.on_event("startup")
 async def on_startup():
-    import asyncio
-    import app as _app_module
-
-    # Bridge: replace app.py's Flask-SocketIO instance with an adapter that
-    # forwards emit() calls to the real python-socketio AsyncServer (sio).
-    # Benchmark threads call socketio.emit(...) synchronously; this adapter
-    # schedules the coroutine on the running asyncio event loop.
+    # Bridge: replace config.py's `socketio` no-op placeholder with an adapter
+    # that forwards emit() calls to the real python-socketio AsyncServer
+    # (sio). Benchmark threads call config.socketio.emit(...) synchronously;
+    # the adapter schedules the coroutine on the running asyncio event loop.
+    # Must patch config (the source) — manager.py and monitor.py read
+    # `config.socketio` dynamically so the patch propagates.
+    import config as _config_module
+    # Touch app module so the re-export shim still loads (kept for any
+    # third-party importer that does `from app import socketio`).
+    import app  # noqa: F401
     loop = asyncio.get_running_loop()
 
     class _SioAdapter:
         def emit(self, event, data=None, room=None, **kwargs):
-            asyncio.run_coroutine_threadsafe(
-                sio.emit(event, data, room=room),
-                loop,
-            )
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    sio.emit(event, data, room=room),
+                    loop,
+                )
+            except RuntimeError as exc:
+                # Loop has been closed (e.g., during shutdown); drop emit.
+                logger.warning("Socket.IO emit %s dropped: %s", event, exc)
+                return
 
-    _app_module.socketio = _SioAdapter()
+            def _on_done(f: "asyncio.Future") -> None:
+                exc = f.exception()
+                if exc is not None:
+                    logger.warning("Socket.IO emit %s failed: %s", event, exc)
+
+            fut.add_done_callback(_on_done)
+
+    _config_module.socketio = _SioAdapter()
 
     state = BenchmarkState.load()
     if state:

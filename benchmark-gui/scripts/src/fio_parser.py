@@ -1107,31 +1107,83 @@ def collect_bench_fio_results(bench_fio_root, output_prefix, result_dir):
     stage      = "N/A"
     controller = "N/A"
     model      = output_prefix
+    device     = output_prefix
+    write_cache = "N/A"
+    tasks_number = "N/A"
 
-    # Try to parse from output_prefix
-    # Regex 1: Find RAID type (RAID0, RAID1, RAID5, RAID10, etc.)
-    m = re.search(r"(RAID\d+)", output_prefix, re.I)
-    if m:
-        raid_type = m.group(1).upper()
-    else:
-        # Check if it's a SingleTest (usually Linear/RAW)
-        if "SingleTest" in output_prefix:
-            raid_type = "Linear"
+    # bench-fio writes per-job cmd files under <bench_fio_root>/cmd/, named with the
+    # full OUTPUT_NAME_NEW pattern (e.g. graid-SR-RAW-RAID5-1VD-6PD-S-EPW5970-3200GB-D-Normal-...).
+    # Reuse the legacy `parser_filename` to recover RAID/PD/controller/stage/jobs/wc fidelity.
+    cmd_dir = bench_fio_root / "cmd"
+    cmd_sample = None
+    if cmd_dir.is_dir():
+        for f in cmd_dir.iterdir():
+            if f.is_file():
+                cmd_sample = f
+                break
+    if cmd_sample is not None:
+        try:
+            # parser_filename returns: [device, status, RAID_type, PD_count, stage,
+            #                           fio_type, Jobs, wt, controller, model]
+            parsed = parser_filename(cmd_sample)
+            if parsed[0] not in ("N/A", ""):
+                device = parsed[0]
+            if parsed[2] not in ("N/A", ""):
+                raid_type = parsed[2]
+            if parsed[3] not in ("N/A", ""):
+                pd_count = parsed[3]
+            if parsed[4] not in ("N/A", ""):
+                stage = parsed[4]
+            if parsed[6] not in ("N/A", ""):
+                tasks_number = parsed[6]
+            if parsed[7] not in ("N/A", ""):
+                write_cache = parsed[7]
+            if parsed[8] not in ("N/A", ""):
+                controller = parsed[8]
+            if parsed[9] not in ("N/A", ""):
+                model = parsed[9]
+        except Exception as exc:
+            print(f"collect_bench_fio_results: parser_filename({cmd_sample}) failed: {exc}")
 
-    # Regex 2: Find PD count (e.g., 4PD, 8PD)
-    m = re.search(r"(\d+)PD", output_prefix, re.I)
-    if m:
-        pd_count = m.group(1)
+    # Fallback 1: Find RAID type from output_prefix
+    if raid_type == "N/A":
+        m = re.search(r"(RAID\d+)", output_prefix, re.I)
+        if m:
+            raid_type = m.group(1).upper()
+        elif "SingleTest" in output_prefix:
+            # PD baseline runs — match `parse_image_tags` which tags PD as BASELINE.
+            raid_type = "BASELINE"
+
+    # Fallback 2: scan cmd/ filenames for RAIDx token (parser_filename can miss
+    # if FS token is absent or atypical OUTPUT_NAME layout).
+    if raid_type == "N/A" and cmd_dir.is_dir():
+        for f in cmd_dir.iterdir():
+            m = re.search(r"(RAID\d+)", f.name, re.I)
+            if m:
+                raid_type = m.group(1).upper()
+                break
+
+    # PD count fallback from output_prefix
+    if pd_count == "N/A":
+        m = re.search(r"(\d+)PD", output_prefix, re.I)
+        if m:
+            pd_count = m.group(1)
     # Stage from path
-    for p in dir_parts[::-1]:
-        if p in ("Normal", "Rebuild", "afterdiscard", "afterprecondition", "aftersustain"):
-            stage = p
-            break
-    # Controller from path (PD / VD / MD)
+    if stage == "N/A":
+        for p in dir_parts[::-1]:
+            if p in ("Normal", "Rebuild", "afterdiscard", "afterprecondition", "aftersustain"):
+                stage = p
+                break
+    # Controller from path (PD / VD / MD) — overrides parser_filename when path is canonical
     for p in dir_parts[::-1]:
         if p in ("VD", "PD", "MD"):
             controller = p
             break
+
+    # PD baseline → BASELINE (matches `parse_image_tags`). `parser_filename` may have
+    # returned "SingleTest" (the OUTPUT_NAME token) or "Linear"; both mean baseline here.
+    if controller == "PD" and raid_type in ("N/A", "Linear", "SingleTest"):
+        raid_type = "BASELINE"
 
     rows = []
     # Recursively find all JSON files. 
@@ -1159,12 +1211,12 @@ def collect_bench_fio_results(bench_fio_root, output_prefix, result_dir):
             "Model":               model,
             "controller":          controller,
             "fio-version":         metrics["fio-version"],
-            "SSD":                 output_prefix,
+            "SSD":                 device,
             "Ben_type":            "bench-fio",
             "Type":                metrics["Type"],
             "RAID_status":         stage,
-            "WriteCache":          "N/A",
-            "Tasks_number":        "N/A",
+            "WriteCache":          write_cache,
+            "Tasks_number":        tasks_number,
             "RAID_type":           raid_type,
             "PD_count":            pd_count,
             "stage":               stage,
@@ -1271,6 +1323,12 @@ if __name__ == '__main__':
 
     if bench_fio_dirs_converted:
         print(f"fio_parser: converted {bench_fio_dirs_converted} bench-fio output dir(s) to CSV.")
+        try:
+            from fio_plot_renderer import render_fioplot_comparisons
+            n_png = render_fioplot_comparisons(Path(parse_file))
+            print(f"fio_parser: rendered {n_png} fio-plot comparison PNG(s).")
+        except Exception as exc:
+            print(f"fio_parser: fio-plot rendering skipped: {exc}")
 
 
     # Process legacy .log files
