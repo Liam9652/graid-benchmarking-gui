@@ -47,3 +47,11 @@ test_*.py
 benchmark-gui/repro_error.py
 benchmark-gui/scripts/mock_bench.sh
 **/__pycache__/
+
+# Local tool/agent state
+.claude/
+.codex
+
+# Local-only docs (kept out of repo by request)
+AUDIT.md
+benchmark-gui/deployment_guide.md
