@@ -108,7 +108,17 @@ function raid_cleanup(){
 # Function to determine the CPU count
 function get_cpu_count() {
     cout=$(lscpu | grep ^Socket | uniq | awk '{print $4}')
-    cpus_counts=`lscpu | grep ^Core | uniq |  awk '{print $4}'`
+    local cores_per_socket
+    cores_per_socket=$(lscpu | grep ^Core | uniq | awk '{print $4}')
+    # cpus_counts must reflect TOTAL physical cores across all sockets so that
+    # `MAX` numjobs on dual-socket systems doesn't get capped at a single NUMA's
+    # core count (e.g. EPYC 9224 dual: 2 sockets × 24 cores = 48, not 24).
+    if [[ "$cout" =~ ^[0-9]+$ && "$cores_per_socket" =~ ^[0-9]+$ ]]; then
+        cpus_counts=$(( cout * cores_per_socket ))
+    else
+        # Fallback: count physical cores from /proc/cpuinfo
+        cpus_counts=$(get_physical_cores)
+    fi
 }
 
 # Get the total number of physical cores in the system
