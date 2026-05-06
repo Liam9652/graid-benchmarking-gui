@@ -13,18 +13,45 @@ import {
 } from 'recharts';
 import { calculatePerformance } from '../utils/perfCalculator';
 
-const WORKLOADS_OF_INTEREST = [
+// Prefixes — the backend appends a "(qd<X> J<Y>)" suffix per bench-fio sweep so
+// each (iodepth, numjobs) combo is its own Workload. Prefix-match here so the
+// default selection picks all sweep variants (e.g. both qd64 J8 and qd64 J24).
+const WORKLOAD_PREFIXES_OF_INTEREST = [
     '4k Random Read',
     '4k Random Write',
     '1M Sequential Read',
     '1M Sequential Write'
 ];
 
+const matchesWorkloadPrefix = (wl, prefix) =>
+    wl === prefix || wl.startsWith(prefix + ' (');
+
+// Baseline = "no RAID, all PDs in parallel". For metrics that scale with disk
+// count (throughput, IOPS) we sum across PDs; for per-IO measurements (latency,
+// CPU%) we average. Anything unlisted falls through to mean as a safe default.
+const SUM_METRICS = new Set([
+    'IOPS(K)',
+    'Bandwidth (GB/s)',
+    'Bandwidth (GiB/s)',
+    'BlockSize',
+]);
+
+const aggregateBaseline = (items, metric) => {
+    const nums = items
+        .map(d => parseFloat(d[metric]))
+        .filter(v => !isNaN(v));
+    if (nums.length === 0) return 0;
+    if (SUM_METRICS.has(metric)) {
+        return nums.reduce((a, b) => a + b, 0);
+    }
+    return nums.reduce((a, b) => a + b, 0) / nums.length;
+};
+
 const ComparisonDashboard = ({ baselineData, graidData, baselineMetadata, graidMetadata, systemInfo }) => {
     const [availableMetrics, setAvailableMetrics] = React.useState([]);
     const [availableWorkloads, setAvailableWorkloads] = React.useState([]);
     const [selectedMetrics, setSelectedMetrics] = React.useState(['IOPS(K)', 'Bandwidth (GB/s)']);
-    const [selectedWorkloads, setSelectedWorkloads] = React.useState(WORKLOADS_OF_INTEREST);
+    const [selectedWorkloads, setSelectedWorkloads] = React.useState([]);
 
     // BLUE COLOR SCALE for RAID bars
     const RAID_COLORS = ['#00BBED', '#00779E', '#33D1FF', '#004C66', '#B3F0FF'];
@@ -49,27 +76,35 @@ const ComparisonDashboard = ({ baselineData, graidData, baselineMetadata, graidM
         const graidWorkloads = new Set((graidData || []).map(d => d.Workload));
 
         // Extract Workloads (excluding SingleTest/Baseline as it will be in RAID types)
+        const HIDDEN_PREFIXES = [
+            '32k Sequential Read',
+            '32.00 Sequential Read',
+            '128.00 Sequential Read',
+            '128.00 Sequential Write',
+            '4k randrw',  // Hide default mixed (randrw55)
+        ];
         const workloads = Array.from(new Set(allData.map(d => d.Workload)))
             .filter(Boolean)
             .filter(wl => {
                 if (wl === 'SingleTest' || wl === 'Baseline') return false;
-                // Hiding Logic:
-                if (wl === '32k Sequential Read') return false;
-                if (wl === '32.00 Sequential Read') return false;
-                if (wl === '128.00 Sequential Read') return false;
-                if (wl === '128.00 Sequential Write') return false;
-                if (wl === '4k randrw') return false; // Hide default mixed (randrw55)
-
-                // Conditional Logic:
-                if (wl === '4k Random Read/Write Mix(70/30)') {
-                    return graidWorkloads.has(wl);
+                if (HIDDEN_PREFIXES.some(p => matchesWorkloadPrefix(wl, p))) return false;
+                if (matchesWorkloadPrefix(wl, '4k Random Read/Write Mix(70/30)')) {
+                    return Array.from(graidWorkloads).some(g => matchesWorkloadPrefix(g, '4k Random Read/Write Mix(70/30)'));
                 }
-
                 return true;
             })
             .sort();
 
         setAvailableWorkloads(workloads);
+
+        // Default selection: all variants whose label starts with one of the
+        // interesting prefixes. Each (qd, nj) sweep becomes its own bar.
+        setSelectedWorkloads(prev => {
+            if (prev.length > 0) return prev;
+            return workloads.filter(wl =>
+                WORKLOAD_PREFIXES_OF_INTEREST.some(p => matchesWorkloadPrefix(wl, p))
+            );
+        });
 
         // Extract RAID Types (Only actual RAID levels from Graid data)
         const raidTypes = Array.from(new Set((graidData || [])
@@ -192,16 +227,11 @@ const ComparisonDashboard = ({ baselineData, graidData, baselineMetadata, graidM
                 const searchWl = workload === 'Baseline' ? 'SingleTest' : workload;
 
                 const bItems = (baselineData || []).filter(d => d.Workload === searchWl);
-                const bItem = bItems.reduce((prev, current) => {
-                    const prevVal = parseFloat(prev['IOPS(K)'] || 0);
-                    const currVal = parseFloat(current['IOPS(K)'] || 0);
-                    return currVal > prevVal ? current : prev;
-                }, {});
 
                 const chartData = selectedMetrics.map(metric => {
                     const dataPoint = {
                         name: metric,
-                        Baseline: showBaseline ? parseFloat(bItem[metric] || 0) : 0,
+                        Baseline: showBaseline ? aggregateBaseline(bItems, metric) : 0,
                     };
 
                     selectedControllers.forEach(controller => {

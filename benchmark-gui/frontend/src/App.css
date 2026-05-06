@@ -1430,6 +1430,14 @@ label .hint {
   background: #13c2c2;
 }
 
+.tag-qd {
+  background: #2f54eb;
+}
+
+.tag-nj {
+  background: #fa541c;
+}
+
 /* Reset Overlay */
 .reset-overlay {
   position: fixed;

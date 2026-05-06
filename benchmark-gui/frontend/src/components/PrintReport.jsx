@@ -136,7 +136,11 @@ const PrintReport = ({ comparisonData, systemInfo, reportImages }) => {
                     {sortedImages.map((img, idx) => (
                         <div key={idx} className="print-gallery-item">
                             <img src={img.url} alt={img.name} />
-                            <div className="img-caption">{img.tags.raid} {img.tags.status} - {img.tags.workload} ({img.tags.bs})</div>
+                            <div className="img-caption">
+                                {img.tags.raid} {img.tags.status} - {img.tags.workload} ({img.tags.bs})
+                                {img.tags.qd && img.tags.qd !== 'Unknown' && ` QD${img.tags.qd}`}
+                                {img.tags.nj && img.tags.nj !== 'Unknown' && ` J${img.tags.nj}`}
+                            </div>
                         </div>
                     ))}
                 </div>
