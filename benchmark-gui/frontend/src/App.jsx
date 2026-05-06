@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useSyncExternalStore } from 'react';
 import html2canvas from 'html2canvas';
 import './App.css';
 import RealTimeDashboard from './components/RealTimeDashboard';
@@ -7,7 +7,7 @@ import TheoreticalCalculator from './components/TheoreticalCalculator';
 import HelpButton from './components/HelpButton';
 import PrintReport from './components/PrintReport';
 import { helpContent } from './utils/helpContent';
-import { API_BASE_URL, apiClient, apiFetch, apiUrl, createSocketClient, getApiKey, setApiKey } from './api';
+import { API_BASE_URL, apiClient, apiFetch, apiUrl, createSocketClient, getApiKey, setApiKey, subscribeApiKey } from './api';
 
 const HIDDEN_PARAMS = [
   'storcli_command',
@@ -117,8 +117,18 @@ function App() {
   const [showAdvancedLog, setShowAdvancedLog] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [activeRunId, setActiveRunId] = useState(() => localStorage.getItem('activeRunId') || '');
+  // Stay in sync with localStorage / cross-tab writes so the input field never
+  // drifts from the actual stored key (FE-8 in AUDIT.md).
+  const apiKey = useSyncExternalStore(subscribeApiKey, getApiKey, () => '');
   const [apiKeyInput, setApiKeyInput] = useState(() => getApiKey());
-  const [socketAuthVersion, setSocketAuthVersion] = useState(0);
+  useEffect(() => {
+    setApiKeyInput(apiKey);
+  }, [apiKey]);
+  // null = unknown (probe in flight); true/false set after /api/auth/required.
+  // The backend may run with BENCHMARK_API_KEY unset (dev/local), in which
+  // case we suppress the "key required" warning rather than misleading the
+  // user. (FE-7 in AUDIT.md)
+  const [authRequired, setAuthRequired] = useState(null);
   const [galleryFilters, setGalleryFilters] = useState({ raid: 'All', status: 'All', type: 'All' });
   const [fioStatus, setFioStatus] = useState("");
   // { device: string, timestamp: string }[] — cleared when benchmark ends
@@ -166,10 +176,44 @@ function App() {
   };
 
   const handleSaveApiKey = () => {
-    setApiKey(apiKeyInput);
-    setSocketAuthVersion(prev => prev + 1);
-    setStatus(apiKeyInput.trim() ? '🔐 API key saved for this browser.' : '🔓 API key cleared.');
+    const trimmed = (apiKeyInput || '').trim();
+    setApiKey(trimmed);
+    // Keep the controlled input aligned with the canonical stored value so
+    // hasApiKey / future setApiKey callers stay in sync. (FE-8 in AUDIT.md)
+    setApiKeyInput(trimmed);
+    // The socket-lifecycle effect re-fires automatically because subscribeApiKey
+    // notifies useSyncExternalStore, which causes [apiKey] to change. (FE-5)
+    setStatus(trimmed ? '🔐 API key saved for this browser.' : '🔓 API key cleared.');
     setTimeout(() => setStatus(''), 3000);
+  };
+
+  // FE-9: an explicit "verify" round-trip so the user can confirm the key is
+  // accepted without having to start a benchmark first. Hits a lightweight
+  // protected endpoint (the runtime-state probe) which only requires the API
+  // key — a 200 confirms the key, a 401 confirms it is wrong.
+  const handleVerifyApiKey = async () => {
+    const trimmed = (apiKeyInput || '').trim();
+    if (!trimmed) {
+      setError('🔐 Enter an API key first, then press Verify.');
+      return;
+    }
+    setError('');
+    try {
+      const res = await fetch(apiUrl('/api/auth/verify'), {
+        method: 'GET',
+        headers: { 'X-API-Key': trimmed },
+      });
+      if (res.ok) {
+        setStatus('🔐 API key verified — backend accepted it.');
+        setTimeout(() => setStatus(''), 3000);
+      } else if (res.status === 401) {
+        setError('🔐 Backend rejected this API key (401). Check BENCHMARK_API_KEY on the server.');
+      } else {
+        setError(`Backend responded with ${res.status} during verification.`);
+      }
+    } catch (err) {
+      setError(`Verification failed: ${err?.message || err}`);
+    }
   };
 
   const SortButton = ({ columnKey, currentConfig }) => {
@@ -489,7 +533,16 @@ function App() {
   }, [handleSnapshot]);
 
   useEffect(() => {
+    // Skip socket creation when the user has no API key configured.
+    // The handshake would fail, socket.io-client would retry forever, and the
+    // user would see "🔐 connect_error" toasts before they ever reach the
+    // input box. The effect re-runs when subscribeApiKey() notifies the
+    // useSyncExternalStore subscriber and [apiKey] changes. (FE-5)
     const newSocket = createSocketClient();
+    if (!newSocket) {
+      setSocket(null);
+      return undefined;
+    }
     setSocket(newSocket);
 
     newSocket.on('connect', () => {
@@ -507,7 +560,7 @@ function App() {
       if (data.run_id) {
         setActiveRunId(data.run_id);
       }
-      if (data.status === 'completed' || data.status === 'failed') {
+      if (data.status === 'completed' || data.status === 'failed' || data.status === 'stopped') {
         setBenchmarkRunning(false);
         setCurrentStage(null);
         currentStageRef.current = null;
@@ -582,6 +635,23 @@ function App() {
       });
     });
 
+    // Strip listeners + disconnect explicitly. The next effect runs immediately
+    // after this cleanup, so without removeAllListeners the just-disposed socket
+    // could still deliver a queued event into the new socket's React state and
+    // double-process logs / progress / device events. (FE-6 in AUDIT.md)
+    return () => {
+      newSocket.removeAllListeners();
+      newSocket.disconnect();
+      newSocket.close();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiKey]);
+
+  // Run the one-time bootstrap (loadConfig / restore SSH session / check
+  // running benchmark) on page mount only. Previously this was bundled into
+  // the socket-lifecycle effect, which meant Save API Key would re-run
+  // loadConfig() and clobber any unsaved Config-tab edits. (FE-3 in AUDIT.md)
+  useEffect(() => {
     const fetchLogs = async () => {
       try {
         const res = await apiClient.get(apiUrl('/api/benchmark/logs'));
@@ -599,7 +669,10 @@ function App() {
         await loadConfig();
       }
 
-      // Try to restore SSH session via backend token (password never stored in browser)
+      // Try to restore SSH session via backend token (password never stored
+      // in browser). Pass skipAuthErrorHandler so a session-expired 401 does
+      // not redirect the user to Config tab with an "API key" message.
+      // (FE-2 in AUDIT.md — restore_session 401 != API key invalid.)
       const token = localStorage.getItem('connectionToken');
       if (token) {
         try {
@@ -607,6 +680,7 @@ function App() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ token }),
+            skipAuthErrorHandler: true,
           });
           const data = await res.json();
           if (data.success) {
@@ -645,8 +719,24 @@ function App() {
 
     init();
 
-    return () => newSocket.close();
-  }, [socketAuthVersion]);
+    // Probe whether the backend actually requires an API key — public
+    // endpoint, no headers needed. Result drives the conditional warning
+    // below the API key input.
+    (async () => {
+      try {
+        const res = await fetch(apiUrl('/api/auth/required'));
+        if (res.ok) {
+          const data = await res.json();
+          setAuthRequired(Boolean(data?.data?.required));
+        } else {
+          setAuthRequired(true);
+        }
+      } catch {
+        setAuthRequired(true);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Save activeTab to localStorage
   useEffect(() => {
@@ -1310,9 +1400,14 @@ function App() {
                   <h3>🔐 API Access</h3>
                   <p className="section-desc">Protected actions use an API key stored in this browser only. It is not written into the benchmark config.</p>
                   <p className="section-desc">Generate this key on the backend first, for example with <code>openssl rand -hex 32</code>, set it as <code>BENCHMARK_API_KEY</code>, then paste the exact same value here.</p>
-                  {!hasApiKey && (
+                  {!hasApiKey && authRequired !== false && (
                     <div className="connection-message error" style={{ marginBottom: '12px' }}>
                       Protected actions such as save, connect, setup, start, stop, reset, and snapshot will fail until an API key is configured.
+                    </div>
+                  )}
+                  {authRequired === false && (
+                    <div className="connection-message info" style={{ marginBottom: '12px' }}>
+                      Backend reports BENCHMARK_API_KEY is not set; protected actions will succeed without a key on this deployment.
                     </div>
                   )}
                   <div className="remote-setup-grid grid-2-cols api-key-panel">
@@ -1331,10 +1426,17 @@ function App() {
                       </button>
                       <button
                         className="btn btn-secondary"
+                        onClick={handleVerifyApiKey}
+                        disabled={!(apiKeyInput || '').trim()}
+                        title="Send a test request with this key"
+                      >
+                        ✅ Verify
+                      </button>
+                      <button
+                        className="btn btn-secondary"
                         onClick={() => {
                           setApiKeyInput('');
                           setApiKey('');
-                          setSocketAuthVersion(prev => prev + 1);
                           setStatus('🔓 API key cleared.');
                           setTimeout(() => setStatus(''), 3000);
                         }}
@@ -2195,6 +2297,12 @@ function App() {
                                 <span className="tag tag-status">{img.tags.status}</span>
                                 <span className="tag tag-workload">{img.tags.workload}</span>
                                 <span className="tag tag-bs">{img.tags.bs}</span>
+                                {img.tags.qd && img.tags.qd !== 'Unknown' && (
+                                  <span className="tag tag-qd">QD {img.tags.qd}</span>
+                                )}
+                                {img.tags.nj && img.tags.nj !== 'Unknown' && (
+                                  <span className="tag tag-nj">J {img.tags.nj}</span>
+                                )}
                               </div>
                             </div>
                           ))}
