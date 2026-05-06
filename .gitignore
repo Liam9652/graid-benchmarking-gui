@@ -55,3 +55,7 @@ benchmark-gui/scripts/mock_bench.sh
 # Local-only docs (kept out of repo by request)
 AUDIT.md
 benchmark-gui/deployment_guide.md
+
+# Local-only pytest suite (kept out of repo by request)
+benchmark-gui/backend/pytest.ini
+benchmark-gui/backend/tests/
