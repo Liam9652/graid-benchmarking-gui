@@ -1,6 +1,5 @@
-Flask==3.0.0
-Flask-CORS==4.0.0
-Flask-SocketIO==5.3.5
+# Socket.IO server is provided by python-socketio (used by fastapi_app);
+# Flask / Flask-CORS / Flask-SocketIO retired in A1.
 python-socketio==5.9.0
 python-engineio==4.7.1
 psutil==5.9.6
@@ -12,3 +11,6 @@ scp
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 python-multipart>=0.0.9
+# Test dependencies (A4 in AUDIT.md)
+pytest>=8.0
+

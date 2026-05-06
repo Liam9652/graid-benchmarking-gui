@@ -44,8 +44,14 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
+COPY config.py .
+COPY state.py .
+COPY executor.py .
+COPY parsers.py .
+COPY monitor.py .
+COPY manager.py .
+COPY settings.py .
 COPY fastapi_app.py .
-COPY templates ./templates
 RUN mkdir -p /app/scripts /app/results /app/logs
 
 EXPOSE 50071

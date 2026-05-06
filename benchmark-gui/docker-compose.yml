@@ -13,6 +13,13 @@ services:
       - ./results:/app/results
       - ./logs:/app/logs
       - ./backend/app.py:/app/app.py
+      - ./backend/config.py:/app/config.py
+      - ./backend/state.py:/app/state.py
+      - ./backend/executor.py:/app/executor.py
+      - ./backend/parsers.py:/app/parsers.py
+      - ./backend/monitor.py:/app/monitor.py
+      - ./backend/manager.py:/app/manager.py
+      - ./backend/settings.py:/app/settings.py
       - ./backend/fastapi_app.py:/app/fastapi_app.py
       - ./graid-bench.conf:/app/graid-bench.conf
       - /dev:/dev
