@@ -1,1 +1,3 @@
 pandas
+fio-plot
+matplotlib>=3.3
